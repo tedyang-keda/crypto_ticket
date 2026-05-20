@@ -60,7 +60,14 @@ function persistSelection() {
 
 function formatTs(ts) {
   if (!ts) return "-";
-  const ms = ts > 1e12 ? ts : ts * 1000;
+  if (typeof ts === "string" && !/^\d+(\.\d+)?$/.test(ts.trim())) {
+    const parsedDate = new Date(ts.replace(" ", "T"));
+    if (Number.isNaN(parsedDate.getTime())) return ts;
+    return fmt.format(parsedDate);
+  }
+  const parsed = Number(ts);
+  if (!Number.isFinite(parsed)) return String(ts);
+  const ms = parsed > 1e12 ? parsed : parsed * 1000;
   return fmt.format(new Date(ms));
 }
 
