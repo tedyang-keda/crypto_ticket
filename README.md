@@ -9,7 +9,7 @@ Crypto tick collector for OKX and Binance.
 - A rolling aggregator builds `1m` first, then rolls into higher frames.
 - Final bars are archived by `exchange/timeframe/week` under `data/archive/`.
 - Redis keeps current bar state and symbol universe snapshots.
-- MySQL stores symbol metadata and finalized bar checkpoints; tick-level writes are disabled by default.
+- MySQL stores symbol metadata, latest finalized checkpoints, and an indexed `bar_history` hot table for dashboard queries; tick-level writes are disabled by default.
 
 ## Timeframes
 
@@ -28,4 +28,10 @@ source .venv/bin/activate
 pip install -e .[dev]
 python -m crypto_ticket run
 python -m crypto_ticket web --host 127.0.0.1 --port 8088
+```
+
+Backfill existing archive bars into the MySQL hot table:
+
+```bash
+python -m crypto_ticket backfill-history --exchange binance --timeframe 1m --max-files 4
 ```

@@ -363,7 +363,14 @@ class CryptoTicketService:
             return
         await asyncio.gather(*(self.archive.submit(bar) for bar in bars))
         if self.mysql:
-            await asyncio.to_thread(self.mysql.upsert_bar_checkpoints, bars)
+            await asyncio.to_thread(self._write_mysql_bars, bars)
+
+    def _write_mysql_bars(self, bars: list[BarEvent]) -> None:
+        if not self.mysql:
+            return
+        self.mysql.upsert_bar_checkpoints(bars)
+        if self.config.mysql_bar_history_enabled:
+            self.mysql.upsert_bar_history(bars)
 
     def _tick_from_stream_fields(self, exchange: str, fields: dict[str, str]) -> Optional[TickEvent]:
         try:

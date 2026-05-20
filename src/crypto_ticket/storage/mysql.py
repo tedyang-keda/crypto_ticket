@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 from decimal import Decimal
@@ -175,6 +174,25 @@ class MySQLHotStore:
     def upsert_bar_checkpoint(self, bar: BarEvent) -> None:
         self.upsert_bar_checkpoints([bar])
 
+    def list_recent_bars(self, exchange: str, symbol: str, timeframe: str, *, limit: int = 400) -> list[dict[str, Any]]:
+        row_limit = max(1, min(int(limit), 5000))
+        sql = """
+            SELECT exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, last_tick_ms, is_final, created_at, updated_at
+            FROM bar_history FORCE INDEX (PRIMARY)
+            WHERE exchange = %s AND symbol = %s AND timeframe = %s
+            ORDER BY start_ms DESC
+            LIMIT %s
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (exchange, symbol, timeframe, row_limit))
+                rows = cursor.fetchall()
+                columns = [column[0] for column in cursor.description or []]
+        normalized = [self._row_to_dict(columns, row) for row in rows]
+        normalized.reverse()
+        return normalized
+
     def upsert_bar_checkpoints(self, bars: Iterable[BarEvent], *, batch_size: int = 500) -> int:
         rows = [self._bar_checkpoint_row(bar) for bar in bars or []]
         if not rows:
@@ -187,6 +205,39 @@ class MySQLHotStore:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
               start_ms = VALUES(start_ms),
+              end_ms = VALUES(end_ms),
+              open_price = VALUES(open_price),
+              high_price = VALUES(high_price),
+              low_price = VALUES(low_price),
+              close_price = VALUES(close_price),
+              volume = VALUES(volume),
+              quote_volume = VALUES(quote_volume),
+              trade_count = VALUES(trade_count),
+              last_tick_ms = VALUES(last_tick_ms),
+              is_final = VALUES(is_final),
+              raw_json = VALUES(raw_json)
+        """
+        chunk_size = max(1, int(batch_size))
+        total_rows = 0
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                for index in range(0, len(rows), chunk_size):
+                    chunk = rows[index : index + chunk_size]
+                    cursor.executemany(sql, chunk)
+                    total_rows += len(chunk)
+        return total_rows
+
+    def upsert_bar_history(self, bars: Iterable[BarEvent], *, batch_size: int = 1000) -> int:
+        rows = [self._bar_checkpoint_row(bar) for bar in bars or []]
+        if not rows:
+            return 0
+
+        sql = """
+            INSERT INTO bar_history
+            (exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
+             volume, quote_volume, trade_count, last_tick_ms, is_final, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
               end_ms = VALUES(end_ms),
               open_price = VALUES(open_price),
               high_price = VALUES(high_price),

@@ -65,6 +65,7 @@ class AppConfig:
     reconnect_max_delay_seconds: float
     enable_mysql: bool
     mysql_tick_writes_enabled: bool
+    mysql_bar_history_enabled: bool
     mysql_host: str
     mysql_port: int
     mysql_user: str
@@ -115,6 +116,7 @@ def load_config() -> AppConfig:
         reconnect_max_delay_seconds=env_float("RECONNECT_MAX_DELAY_SECONDS", 60.0),
         enable_mysql=env_bool("ENABLE_MYSQL", False),
         mysql_tick_writes_enabled=env_bool("MYSQL_TICK_WRITES_ENABLED", False),
+        mysql_bar_history_enabled=env_bool("MYSQL_BAR_HISTORY_ENABLED", True),
         mysql_host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         mysql_port=env_int("MYSQL_PORT", 3306),
         mysql_user=os.getenv("MYSQL_USER", "root"),

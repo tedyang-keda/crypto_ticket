@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import threading
 from functools import cached_property
@@ -14,6 +15,9 @@ from ..config import AppConfig
 from ..storage.mysql import MySQLHotStore
 from ..timeframes import TIMEFRAME_ORDER
 from .history import load_archive_bars
+
+
+logger = logging.getLogger(__name__)
 
 
 class DashboardRepository:
@@ -54,6 +58,13 @@ class DashboardRepository:
         }
 
     def load_bars(self, exchange: str, symbol: str, timeframe: str, *, limit: int = 400) -> list[dict[str, Any]]:
+        if self.mysql:
+            try:
+                bars = self.mysql.list_recent_bars(exchange, symbol, timeframe, limit=limit)
+                if bars:
+                    return bars
+            except Exception as exc:
+                logger.warning("failed to load bars from mysql hot history: %s", exc)
         return load_archive_bars(self.config.archive_root, exchange, timeframe, symbol, limit=limit)
 
 
