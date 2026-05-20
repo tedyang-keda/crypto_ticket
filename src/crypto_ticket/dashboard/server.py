@@ -94,6 +94,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if path == "/styles.css":
                 self._serve_file(self.static_dir / "styles.css", "text/css; charset=utf-8")
                 return
+            if path == "/favicon.ico":
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.end_headers()
+                return
             if path == "/api/meta":
                 self._json(
                     {
@@ -180,4 +184,3 @@ def run_dashboard(config: AppConfig, *, host: str = "127.0.0.1", port: int = 808
         pass
     finally:
         server.server_close()
-

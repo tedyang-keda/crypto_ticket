@@ -92,20 +92,26 @@ function createChart() {
     },
   });
 
-  const candleSeries = chart.addCandlestickSeries({
+  const candleOptions = {
     upColor: "#57d69d",
     downColor: "#ff7b7b",
     borderVisible: false,
     wickUpColor: "#57d69d",
     wickDownColor: "#ff7b7b",
-  });
+  };
+  const candleSeries = chart.addCandlestickSeries
+    ? chart.addCandlestickSeries(candleOptions)
+    : chart.addSeries(LightweightCharts.CandlestickSeries, candleOptions);
 
-  const volumeSeries = chart.addHistogramSeries({
+  const volumeOptions = {
     color: "#76a7ff66",
     priceFormat: { type: "volume" },
     priceScaleId: "",
     scaleMargins: { top: 0.85, bottom: 0 },
-  });
+  };
+  const volumeSeries = chart.addHistogramSeries
+    ? chart.addHistogramSeries(volumeOptions)
+    : chart.addSeries(LightweightCharts.HistogramSeries, volumeOptions);
 
   const resize = () => chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
   new ResizeObserver(resize).observe(container);
