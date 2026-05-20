@@ -109,6 +109,13 @@ class MySQLHotStore:
                 )
 
     def upsert_bar_checkpoint(self, bar: BarEvent) -> None:
+        self.upsert_bar_checkpoints([bar])
+
+    def upsert_bar_checkpoints(self, bars: Iterable[BarEvent], *, batch_size: int = 500) -> int:
+        rows = [self._bar_checkpoint_row(bar) for bar in bars or []]
+        if not rows:
+            return 0
+
         sql = """
             INSERT INTO bar_checkpoint
             (exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
@@ -128,29 +135,35 @@ class MySQLHotStore:
               is_final = VALUES(is_final),
               raw_json = VALUES(raw_json)
         """
-        payload = json.dumps(bar.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        chunk_size = max(1, int(batch_size))
+        total_rows = 0
         with self.connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    sql,
-                    (
-                        bar.exchange,
-                        bar.symbol,
-                        bar.timeframe,
-                        int(bar.start_ms),
-                        int(bar.end_ms),
-                        bar.open_price,
-                        bar.high_price,
-                        bar.low_price,
-                        bar.close_price,
-                        bar.volume,
-                        bar.quote_volume,
-                        bar.trade_count,
-                        bar.last_tick_ms,
-                        1 if bar.is_final else 0,
-                        payload,
-                    ),
-                )
+                for index in range(0, len(rows), chunk_size):
+                    chunk = rows[index : index + chunk_size]
+                    cursor.executemany(sql, chunk)
+                    total_rows += len(chunk)
+        return total_rows
+
+    def _bar_checkpoint_row(self, bar: BarEvent) -> tuple:
+        payload = json.dumps(bar.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        return (
+            bar.exchange,
+            bar.symbol,
+            bar.timeframe,
+            int(bar.start_ms),
+            int(bar.end_ms),
+            bar.open_price,
+            bar.high_price,
+            bar.low_price,
+            bar.close_price,
+            bar.volume,
+            bar.quote_volume,
+            bar.trade_count,
+            bar.last_tick_ms,
+            1 if bar.is_final else 0,
+            payload,
+        )
 
     def upsert_archive_manifest(
         self,
@@ -187,4 +200,3 @@ class MySQLHotStore:
                         int(bar_count),
                     ),
                 )
-

@@ -9,6 +9,7 @@ Crypto tick collector for OKX and Binance.
 - A rolling aggregator builds `1m` first, then rolls into higher frames.
 - Final bars are archived by `exchange/timeframe/week` under `data/archive/`.
 - Redis keeps current bar state and symbol universe snapshots.
+- MySQL stores symbol metadata and finalized bar checkpoints; tick-level writes are disabled by default.
 
 ## Timeframes
 

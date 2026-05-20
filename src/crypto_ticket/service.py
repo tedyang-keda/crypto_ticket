@@ -211,7 +211,7 @@ class CryptoTicketService:
                     runtime.last_tick_at = time.time()
                     runtime.last_message_at = time.time()
                     await self.redis.xadd_tick(f"ticks:{runtime.config.name}", tick)
-                    if self.mysql:
+                    if self.mysql and self.config.mysql_tick_writes_enabled:
                         await asyncio.to_thread(self.mysql.upsert_latest_quote, tick)
                 last_heartbeat = time.time()
                 if time.time() - last_sync >= 5:
@@ -363,8 +363,7 @@ class CryptoTicketService:
             return
         await asyncio.gather(*(self.archive.submit(bar) for bar in bars))
         if self.mysql:
-            for bar in bars:
-                await asyncio.to_thread(self.mysql.upsert_bar_checkpoint, bar)
+            await asyncio.to_thread(self.mysql.upsert_bar_checkpoints, bars)
 
     def _tick_from_stream_fields(self, exchange: str, fields: dict[str, str]) -> Optional[TickEvent]:
         try:
