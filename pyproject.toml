@@ -13,6 +13,7 @@ dependencies = [
   "websockets>=12.0",
   "tenacity>=8.2",
   "pymysql>=1.1",
+  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
@@ -26,4 +27,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
