@@ -8,15 +8,25 @@ from .timeframes import (
     TIMEFRAME_ORDER,
     bucket_end_ms,
     floor_bucket_start_ms,
+    next_bucket_start_ms,
     normalize_timeframe,
     timeframe_index,
-    timeframe_to_ms,
 )
 
 
 @dataclass(slots=True)
 class AggregationResult:
     emitted_bars: list[BarEvent]
+
+
+@dataclass(slots=True)
+class RollupUpdate:
+    finalized_bars: list[BarEvent]
+    current_bars: list[BarEvent]
+
+    @property
+    def bars_for_history(self) -> list[BarEvent]:
+        return [*self.finalized_bars, *self.current_bars]
 
 
 class MultiTimeframeAggregator:
@@ -86,13 +96,12 @@ class MultiTimeframeAggregator:
         self.states[key] = RollingBarState.from_tick(tick, base_tf, bucket_start, bucket_end)
         return finalized
 
-    def _fill_gap_bars(self, previous_state: RollingBarState, next_bucket_start_ms: int) -> list[BarEvent]:
+    def _fill_gap_bars(self, previous_state: RollingBarState, next_bucket_start: int) -> list[BarEvent]:
         gap_bars: list[BarEvent] = []
         previous_close = previous_state.close_price
-        gap_duration_ms = timeframe_to_ms(previous_state.timeframe)
-        gap_start = previous_state.start_ms + gap_duration_ms
-        while gap_start < next_bucket_start_ms:
-            gap_end = gap_start + gap_duration_ms - 1
+        gap_start = next_bucket_start_ms(previous_state.start_ms, previous_state.timeframe)
+        while gap_start < next_bucket_start:
+            gap_end = bucket_end_ms(gap_start, previous_state.timeframe)
             gap_bar = BarEvent(
                 exchange=previous_state.exchange,
                 symbol=previous_state.symbol,
@@ -111,7 +120,7 @@ class MultiTimeframeAggregator:
                 reason="gap",
             )
             gap_bars.append(gap_bar)
-            gap_start += gap_duration_ms
+            gap_start = next_bucket_start_ms(gap_start, previous_state.timeframe)
         return gap_bars
 
     def _roll_up(self, bars: list[BarEvent]) -> list[BarEvent]:
@@ -154,6 +163,93 @@ class MultiTimeframeAggregator:
         emitted.extend(self._fill_gap_bars(state, bucket_start))
         self.states[key] = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
         return emitted
+
+    def _finalize_state(self, state: RollingBarState, closed_at_ms: int) -> BarEvent:
+        state.mark_closed(closed_at_ms)
+        return state.to_bar(is_final=True, reason="close")
+
+
+class MinuteBarRollupAggregator:
+    def __init__(self, timeframes: Iterable[str] = TIMEFRAME_ORDER):
+        frames = [normalize_timeframe(tf) for tf in timeframes]
+        frames.sort(key=timeframe_index)
+        if frames[0] != "1m":
+            raise ValueError("minute rollups must include 1m as the base timeframe")
+        self.timeframes = [tf for tf in frames if tf != "1m"]
+        self.states: dict[tuple[str, str, str], RollingBarState] = {}
+
+    def on_1m_bar(self, bar: BarEvent) -> RollupUpdate:
+        if normalize_timeframe(bar.timeframe) != "1m":
+            raise ValueError(f"rollup source must be 1m, got {bar.timeframe}")
+
+        finalized: list[BarEvent] = []
+        current: list[BarEvent] = []
+        for timeframe in self.timeframes:
+            for emitted in self._apply_1m_bar_to_timeframe(bar, timeframe):
+                if emitted.is_final:
+                    finalized.append(emitted)
+                else:
+                    current.append(emitted)
+        return RollupUpdate(finalized_bars=finalized, current_bars=current)
+
+    def _apply_1m_bar_to_timeframe(self, bar: BarEvent, timeframe: str) -> list[BarEvent]:
+        key = (bar.exchange, bar.symbol, timeframe)
+        bucket_start = floor_bucket_start_ms(bar.start_ms, timeframe)
+        bucket_end = bucket_end_ms(bucket_start, timeframe)
+        state = self.states.get(key)
+        emitted: list[BarEvent] = []
+
+        if state is None:
+            state = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
+            self.states[key] = state
+        elif bucket_start < state.start_ms:
+            return []
+        elif bucket_start == state.start_ms:
+            if state.is_closed:
+                return []
+            state.update_with_bar(bar)
+        else:
+            if not state.is_closed:
+                emitted.append(self._finalize_state(state, bar.last_tick_ms or bar.end_ms))
+            emitted.extend(self._fill_gap_bars(state, bucket_start))
+            state = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
+            self.states[key] = state
+
+        if state.is_closed:
+            return emitted
+        if bar.end_ms >= state.end_ms:
+            emitted.append(self._finalize_state(state, bar.last_tick_ms or bar.end_ms))
+        else:
+            emitted.append(state.to_bar(is_final=False, reason="update"))
+        return emitted
+
+    def _fill_gap_bars(self, previous_state: RollingBarState, next_bucket_start: int) -> list[BarEvent]:
+        gap_bars: list[BarEvent] = []
+        previous_close = previous_state.close_price
+        gap_start = next_bucket_start_ms(previous_state.start_ms, previous_state.timeframe)
+        while gap_start < next_bucket_start:
+            gap_end = bucket_end_ms(gap_start, previous_state.timeframe)
+            gap_bars.append(
+                BarEvent(
+                    exchange=previous_state.exchange,
+                    symbol=previous_state.symbol,
+                    timeframe=previous_state.timeframe,
+                    start_ms=gap_start,
+                    end_ms=gap_end,
+                    open_price=previous_close,
+                    high_price=previous_close,
+                    low_price=previous_close,
+                    close_price=previous_close,
+                    volume=0.0,
+                    quote_volume=0.0,
+                    trade_count=0,
+                    last_tick_ms=previous_state.end_ms,
+                    is_final=True,
+                    reason="gap",
+                )
+            )
+            gap_start = next_bucket_start_ms(gap_start, previous_state.timeframe)
+        return gap_bars
 
     def _finalize_state(self, state: RollingBarState, closed_at_ms: int) -> BarEvent:
         state.mark_closed(closed_at_ms)

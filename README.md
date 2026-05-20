@@ -6,10 +6,11 @@ Crypto tick collector for OKX and Binance.
 
 - WebSocket collectors ingest trade ticks.
 - Redis Streams buffer the live feed.
-- A rolling aggregator builds `1m` first, then rolls into higher frames.
-- Final bars are archived by `exchange/timeframe/week` under `data/archive/`.
+- A minute aggregator builds finalized `1m` bars from ticks.
+- After `1m` bars are written to MySQL, a second rollup aggregator updates the latest open higher-timeframe bars.
+- Final `1m` bars are archived by `exchange/timeframe/week` under `data/archive/`.
 - Redis keeps current bar state and symbol universe snapshots.
-- MySQL stores symbol metadata, latest finalized checkpoints, and a lean indexed `bar_history` hot table for dashboard queries; tick-level writes are disabled by default.
+- MySQL stores symbol metadata, latest checkpoints, and a lean partitioned `bar_history` hot table for dashboard queries; tick-level writes are disabled by default.
 
 ## Timeframes
 

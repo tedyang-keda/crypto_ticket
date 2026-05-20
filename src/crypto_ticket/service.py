@@ -12,7 +12,7 @@ from typing import Any, Optional
 import httpx
 import websockets
 
-from .aggregation import MultiTimeframeAggregator
+from .aggregation import MinuteBarRollupAggregator, MultiTimeframeAggregator
 from .archive import WeeklyArchiveWriter
 from .config import AppConfig, ExchangeConfig
 from .logging import configure_logging
@@ -47,7 +47,8 @@ class CryptoTicketService:
         self.redis = RedisStore(config.redis_url, stream_maxlen=config.redis_stream_maxlen)
         self.archive = WeeklyArchiveWriter(config.archive_root)
         self.notifier = FeishuNotifier(config.feishu_webhook_url)
-        self.aggregator = MultiTimeframeAggregator(TIMEFRAME_ORDER)
+        self.minute_aggregator = MultiTimeframeAggregator(("1m",))
+        self.rollup_aggregator = MinuteBarRollupAggregator(TIMEFRAME_ORDER)
         self.mysql = None
         if config.enable_mysql:
             self.mysql = MySQLHotStore(
@@ -288,7 +289,7 @@ class CryptoTicketService:
         while not self._stop.is_set():
             now_monotonic = time.monotonic()
             if now_monotonic - last_due_check >= 1.0:
-                due_bars = self.aggregator.close_due_bars(
+                due_bars = self.minute_aggregator.close_due_bars(
                     int(time.time() * 1000),
                     self.config.bar_close_grace_seconds * 1000,
                 )
@@ -308,7 +309,7 @@ class CryptoTicketService:
                     if tick is None:
                         ack_ids.append(entry_id)
                         continue
-                    bars = self.aggregator.on_tick(tick)
+                    bars = self.minute_aggregator.on_tick(tick)
                     for bar in bars:
                         pending_flush.append(bar)
                     ack_ids.append(entry_id)
@@ -361,9 +362,22 @@ class CryptoTicketService:
     async def _flush_bars(self, bars: list[BarEvent]) -> None:
         if not bars:
             return
-        await asyncio.gather(*(self.archive.submit(bar) for bar in bars))
+        one_minute_bars = [bar for bar in bars if bar.timeframe == "1m"]
+        if not one_minute_bars:
+            return
+        await asyncio.gather(*(self.archive.submit(bar) for bar in one_minute_bars))
         if self.mysql:
-            await asyncio.to_thread(self._write_mysql_bars, bars)
+            await asyncio.to_thread(self._write_mysql_bars, one_minute_bars)
+            rollup_bars = self._roll_up_from_one_minute_bars(one_minute_bars)
+            if rollup_bars:
+                await asyncio.to_thread(self._write_mysql_bars, rollup_bars)
+
+    def _roll_up_from_one_minute_bars(self, bars: list[BarEvent]) -> list[BarEvent]:
+        rollup_bars: list[BarEvent] = []
+        for bar in sorted(bars, key=lambda item: (item.exchange, item.symbol, item.start_ms)):
+            update = self.rollup_aggregator.on_1m_bar(bar)
+            rollup_bars.extend(update.bars_for_history)
+        return rollup_bars
 
     def _write_mysql_bars(self, bars: list[BarEvent]) -> None:
         if not self.mysql:
