@@ -35,4 +35,5 @@ Backfill existing archive bars into the MySQL hot table:
 
 ```bash
 python -m crypto_ticket backfill-history --exchange binance --timeframe 1m --max-files 4
+python -m crypto_ticket rebuild-rollups --exchange binance
 ```

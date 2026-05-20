@@ -5,7 +5,7 @@ import asyncio
 import os
 
 from .config import load_config
-from .history_backfill import backfill_bar_history
+from .history_backfill import backfill_bar_history, rebuild_rollups_from_history
 from .logging import configure_logging
 from .service import CryptoTicketService
 from .dashboard.server import run_dashboard
@@ -26,6 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_parser.add_argument("--symbol")
     backfill_parser.add_argument("--max-files", type=int)
     backfill_parser.add_argument("--batch-size", type=int, default=1000)
+    rebuild_parser = subparsers.add_parser("rebuild-rollups", help="rebuild higher timeframe bars from stored 1m history")
+    rebuild_parser.add_argument("--exchange")
+    rebuild_parser.add_argument("--symbol")
+    rebuild_parser.add_argument("--batch-size", type=int, default=1000)
     return parser
 
 
@@ -62,6 +66,26 @@ def main() -> None:
             batch_size=args.batch_size,
         )
         print(f"backfilled rows={stats.rows} files={stats.files} skipped={stats.skipped}")
+        return
+    if args.command == "rebuild-rollups":
+        if not config.enable_mysql:
+            raise SystemExit("ENABLE_MYSQL=true is required for rebuild-rollups")
+        mysql = MySQLHotStore(
+            host=config.mysql_host,
+            port=config.mysql_port,
+            user=config.mysql_user,
+            password=config.mysql_password,
+            database=config.mysql_database,
+            schema_path=str(config.schema_path) if config.schema_path else None,
+        )
+        mysql.ensure_schema()
+        stats = rebuild_rollups_from_history(
+            mysql,
+            exchange=args.exchange,
+            symbol=args.symbol,
+            batch_size=args.batch_size,
+        )
+        print(f"rebuilt rollup rows={stats.rows}")
         return
     service = CryptoTicketService(config)
     asyncio.run(service.run())

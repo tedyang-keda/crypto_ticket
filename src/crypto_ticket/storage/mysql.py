@@ -4,7 +4,7 @@ import json
 from datetime import date, datetime
 from pathlib import Path
 from decimal import Decimal
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import pymysql
 
@@ -193,6 +193,35 @@ class MySQLHotStore:
         normalized.reverse()
         return normalized
 
+    def iter_history_bars(
+        self,
+        *,
+        timeframe: str = "1m",
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ) -> Iterator[BarEvent]:
+        filters = ["timeframe = %s"]
+        params: list[Any] = [timeframe]
+        if exchange:
+            filters.append("exchange = %s")
+            params.append(exchange)
+        if symbol:
+            filters.append("symbol = %s")
+            params.append(symbol)
+
+        sql = f"""
+            SELECT exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, last_tick_ms, is_final
+            FROM bar_history FORCE INDEX (PRIMARY)
+            WHERE {' AND '.join(filters)}
+            ORDER BY exchange, symbol, start_ms
+        """
+        with self.connect() as conn:
+            with conn.cursor(pymysql.cursors.SSCursor) as cursor:
+                cursor.execute(sql, params)
+                for row in cursor:
+                    yield self._bar_event_from_history_row(row)
+
     def upsert_bar_checkpoints(self, bars: Iterable[BarEvent], *, batch_size: int = 500) -> int:
         rows = [self._bar_checkpoint_row(bar) for bar in bars or []]
         if not rows:
@@ -295,6 +324,26 @@ class MySQLHotStore:
             bar.trade_count,
             bar.last_tick_ms,
             1 if bar.is_final else 0,
+        )
+
+    def _bar_event_from_history_row(self, row: tuple[Any, ...]) -> BarEvent:
+        return BarEvent(
+            exchange=str(row[0]),
+            symbol=str(row[1]),
+            timeframe=str(row[2]),
+            start_ms=int(row[3]),
+            end_ms=int(row[4]),
+            open_price=float(row[5]),
+            high_price=float(row[6]),
+            low_price=float(row[7]),
+            close_price=float(row[8]),
+            volume=float(row[9] or 0),
+            quote_volume=float(row[10] or 0),
+            trade_count=int(row[11] or 0),
+            last_tick_ms=int(row[12] or row[4]),
+            is_final=bool(row[13]),
+            source="mysql",
+            reason="rebuild",
         )
 
     def _row_to_dict(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:

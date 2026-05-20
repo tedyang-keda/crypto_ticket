@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from .aggregation import MinuteBarRollupAggregator
 from .models import BarEvent
 from .storage.mysql import MySQLHotStore
-from .timeframes import normalize_timeframe
+from .timeframes import TIMEFRAME_ORDER, normalize_timeframe
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,30 @@ def backfill_bar_history(
         except OSError as exc:
             stats.skipped += 1
             logger.warning("failed to read archive file %s: %s", file_path, exc)
+
+    if batch:
+        stats.rows += mysql.upsert_bar_history(batch, batch_size=chunk_size)
+    return stats
+
+
+def rebuild_rollups_from_history(
+    mysql: MySQLHotStore,
+    *,
+    exchange: Optional[str] = None,
+    symbol: Optional[str] = None,
+    batch_size: int = 1000,
+) -> BackfillStats:
+    stats = BackfillStats()
+    rollup = MinuteBarRollupAggregator(TIMEFRAME_ORDER)
+    batch: list[BarEvent] = []
+    chunk_size = max(1, int(batch_size))
+
+    for one_minute_bar in mysql.iter_history_bars(timeframe="1m", exchange=exchange, symbol=symbol):
+        update = rollup.on_1m_bar(one_minute_bar)
+        batch.extend(update.bars_for_history)
+        if len(batch) >= chunk_size:
+            stats.rows += mysql.upsert_bar_history(batch, batch_size=chunk_size)
+            batch.clear()
 
     if batch:
         stats.rows += mysql.upsert_bar_history(batch, batch_size=chunk_size)
