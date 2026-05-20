@@ -139,6 +139,7 @@ def test_upsert_bar_history_batches_rows():
     sql, rows = fake_conn.cursor_obj.executemany_calls[0]
     assert "INSERT INTO bar_history" in sql
     assert len(rows) == 1
+    assert len(rows[0]) == 14
 
 
 def test_list_recent_bars_uses_primary_index_and_returns_ascending():

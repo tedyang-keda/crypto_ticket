@@ -228,15 +228,15 @@ class MySQLHotStore:
         return total_rows
 
     def upsert_bar_history(self, bars: Iterable[BarEvent], *, batch_size: int = 1000) -> int:
-        rows = [self._bar_checkpoint_row(bar) for bar in bars or []]
+        rows = [self._bar_history_row(bar) for bar in bars or []]
         if not rows:
             return 0
 
         sql = """
             INSERT INTO bar_history
             (exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
-             volume, quote_volume, trade_count, last_tick_ms, is_final, raw_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             volume, quote_volume, trade_count, last_tick_ms, is_final)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
               end_ms = VALUES(end_ms),
               open_price = VALUES(open_price),
@@ -247,8 +247,7 @@ class MySQLHotStore:
               quote_volume = VALUES(quote_volume),
               trade_count = VALUES(trade_count),
               last_tick_ms = VALUES(last_tick_ms),
-              is_final = VALUES(is_final),
-              raw_json = VALUES(raw_json)
+              is_final = VALUES(is_final)
         """
         chunk_size = max(1, int(batch_size))
         total_rows = 0
@@ -278,6 +277,24 @@ class MySQLHotStore:
             bar.last_tick_ms,
             1 if bar.is_final else 0,
             payload,
+        )
+
+    def _bar_history_row(self, bar: BarEvent) -> tuple:
+        return (
+            bar.exchange,
+            bar.symbol,
+            bar.timeframe,
+            int(bar.start_ms),
+            int(bar.end_ms),
+            bar.open_price,
+            bar.high_price,
+            bar.low_price,
+            bar.close_price,
+            bar.volume,
+            bar.quote_volume,
+            bar.trade_count,
+            bar.last_tick_ms,
+            1 if bar.is_final else 0,
         )
 
     def _row_to_dict(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
