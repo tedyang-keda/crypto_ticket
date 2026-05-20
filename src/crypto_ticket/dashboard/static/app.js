@@ -1,7 +1,7 @@
 const state = {
   meta: null,
   exchange: null,
-  timeframe: "15m",
+  timeframe: "1m",
   symbol: null,
   symbols: [],
   filteredSymbols: [],
@@ -47,7 +47,7 @@ function loadStoredSelection() {
   return {
     exchange: params.get("exchange") || localStorage.getItem("dashboard_exchange"),
     symbol: params.get("symbol") || localStorage.getItem("dashboard_symbol"),
-    timeframe: params.get("timeframe") || localStorage.getItem("dashboard_timeframe") || "15m",
+    timeframe: params.get("timeframe") || localStorage.getItem("dashboard_timeframe") || "1m",
   };
 }
 
@@ -376,7 +376,7 @@ async function bootstrap() {
     state.exchange = exchanges[0] || "binance";
   }
   if (!state.timeframe || !timeframes.includes(state.timeframe)) {
-    state.timeframe = timeframes[0] || "15m";
+    state.timeframe = timeframes[0] || "1m";
   }
   await loadSymbols();
   renderTimeframeTabs();
