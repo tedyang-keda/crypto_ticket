@@ -51,7 +51,7 @@ class BinanceFuturesAdapter(ExchangeAdapter):
         return symbols
 
     def symbol_to_stream(self, symbol: str) -> str:
-        suffix = "@aggTrade" if self.market_type == "um_futures" else "@trade"
+        suffix = "@trade"
         return f"{symbol.lower()}{suffix}"
 
     def build_subscribe_payload(self, symbols: Sequence[str], request_id: int) -> str:
@@ -92,4 +92,3 @@ class BinanceFuturesAdapter(ExchangeAdapter):
                 raw=data,
             )
         ]
-
