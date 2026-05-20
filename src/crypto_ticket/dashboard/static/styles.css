@@ -69,6 +69,34 @@ body {
   flex-wrap: wrap;
 }
 
+.timezone-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(17, 26, 36, 0.82);
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+
+.timezone-select select {
+  min-width: 154px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+
+.timezone-select select option {
+  background: #0d141c;
+  color: var(--text);
+}
+
 .meta-pill,
 .pill {
   display: inline-flex;
@@ -323,6 +351,60 @@ input[type="search"]:focus {
   justify-content: flex-end;
 }
 
+.market-readout {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.35fr) repeat(7, minmax(76px, 0.74fr)) minmax(160px, 1fr) minmax(82px, 0.65fr);
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+  overflow-x: auto;
+}
+
+.readout-cell {
+  min-width: 76px;
+  min-height: 54px;
+  display: grid;
+  gap: 5px;
+  align-content: center;
+  padding: 9px 11px;
+  background: rgba(13, 20, 28, 0.98);
+}
+
+.readout-cell.wide {
+  min-width: 160px;
+}
+
+.readout-cell.state {
+  min-width: 82px;
+}
+
+.readout-label {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.readout-cell strong {
+  min-width: 0;
+  color: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.readout-cell.positive strong {
+  color: var(--good);
+}
+
+.readout-cell.negative strong {
+  color: var(--danger);
+}
+
 .chart {
   width: 100%;
   height: min(68vh, 760px);
@@ -412,6 +494,18 @@ input[type="search"]:focus {
 
   .pill-row {
     justify-content: flex-start;
+  }
+
+  .timezone-select {
+    width: 100%;
+  }
+
+  .timezone-select select {
+    flex: 1;
+  }
+
+  .market-readout {
+    grid-template-columns: repeat(10, minmax(110px, 1fr));
   }
 
   .chart {

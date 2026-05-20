@@ -5,6 +5,9 @@ const state = {
   symbol: null,
   symbols: [],
   filteredSymbols: [],
+  timezone: "Asia/Shanghai",
+  currentBars: [],
+  barByTime: new Map(),
   chart: null,
   candleSeries: null,
   volumeSeries: null,
@@ -12,14 +15,42 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
-const fmt = new Intl.DateTimeFormat("zh-CN", {
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-});
+const LOCAL_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+const TIMEZONE_OPTIONS = [
+  ["Asia/Shanghai", "Shanghai UTC+8"],
+  ["UTC", "UTC"],
+  ["local", `Local ${LOCAL_TIMEZONE}`],
+  ["America/New_York", "New York"],
+  ["Europe/London", "London"],
+  ["Asia/Tokyo", "Tokyo"],
+];
+
+const dateFormatterCache = new Map();
+
+function effectiveTimezone() {
+  return state.timezone === "local" ? LOCAL_TIMEZONE : state.timezone;
+}
+
+function getDateFormatter(options = {}) {
+  const timezone = effectiveTimezone();
+  const key = JSON.stringify([timezone, options]);
+  if (!dateFormatterCache.has(key)) {
+    dateFormatterCache.set(
+      key,
+      new Intl.DateTimeFormat("zh-CN", {
+        timeZone: timezone === "local" ? undefined : timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: options.seconds === false ? undefined : "2-digit",
+        hour12: false,
+      })
+    );
+  }
+  return dateFormatterCache.get(key);
+}
 
 const num = (value, digits = 2) => {
   const parsed = Number(value);
@@ -38,6 +69,8 @@ function setQueryParams() {
   else params.delete("symbol");
   if (state.timeframe) params.set("timeframe", state.timeframe);
   else params.delete("timeframe");
+  if (state.timezone) params.set("tz", state.timezone);
+  else params.delete("tz");
   const query = params.toString();
   history.replaceState(null, "", query ? `${window.location.pathname}?${query}` : window.location.pathname);
 }
@@ -48,6 +81,7 @@ function loadStoredSelection() {
     exchange: params.get("exchange") || localStorage.getItem("dashboard_exchange"),
     symbol: params.get("symbol") || localStorage.getItem("dashboard_symbol"),
     timeframe: params.get("timeframe") || localStorage.getItem("dashboard_timeframe") || "1m",
+    timezone: params.get("tz") || localStorage.getItem("dashboard_timezone") || "Asia/Shanghai",
   };
 }
 
@@ -55,6 +89,7 @@ function persistSelection() {
   if (state.exchange) localStorage.setItem("dashboard_exchange", state.exchange);
   if (state.symbol) localStorage.setItem("dashboard_symbol", state.symbol);
   if (state.timeframe) localStorage.setItem("dashboard_timeframe", state.timeframe);
+  if (state.timezone) localStorage.setItem("dashboard_timezone", state.timezone);
   setQueryParams();
 }
 
@@ -63,12 +98,65 @@ function formatTs(ts) {
   if (typeof ts === "string" && !/^\d+(\.\d+)?$/.test(ts.trim())) {
     const parsedDate = new Date(ts.replace(" ", "T"));
     if (Number.isNaN(parsedDate.getTime())) return ts;
-    return fmt.format(parsedDate);
+    return getDateFormatter().format(parsedDate);
   }
   const parsed = Number(ts);
   if (!Number.isFinite(parsed)) return String(ts);
   const ms = parsed > 1e12 ? parsed : parsed * 1000;
-  return fmt.format(new Date(ms));
+  return getDateFormatter().format(new Date(ms));
+}
+
+function formatChartTime(time, options = {}) {
+  const value = typeof time === "object" ? Date.UTC(time.year, time.month - 1, time.day) : Number(time) * 1000;
+  if (!Number.isFinite(value)) return "";
+  return getDateFormatter({ seconds: options.seconds !== false }).format(new Date(value));
+}
+
+function timezoneOffsetLabel() {
+  try {
+    const zoneName = new Intl.DateTimeFormat("en-US", {
+      timeZone: effectiveTimezone(),
+      timeZoneName: "shortOffset",
+    })
+      .formatToParts(new Date())
+      .find((part) => part.type === "timeZoneName")?.value;
+    return (zoneName || "").replace("GMT", "UTC") || effectiveTimezone();
+  } catch {
+    return effectiveTimezone();
+  }
+}
+
+function renderTimezoneSelect() {
+  const select = el("timezoneSelect");
+  select.innerHTML = "";
+  for (const [value, label] of TIMEZONE_OPTIONS) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  select.value = TIMEZONE_OPTIONS.some(([value]) => value === state.timezone) ? state.timezone : "Asia/Shanghai";
+  state.timezone = select.value;
+  updateTimezoneDisplay();
+}
+
+function updateTimezoneDisplay() {
+  const label = state.timezone === "local" ? LOCAL_TIMEZONE : state.timezone;
+  el("metaTimezone").textContent = `${label} ${timezoneOffsetLabel()}`;
+  applyChartTimezone();
+}
+
+function applyChartTimezone() {
+  if (!state.chart) return;
+  state.chart.applyOptions({
+    localization: {
+      priceFormatter: (price) => num(price, 4),
+      timeFormatter: (time) => formatChartTime(time, { seconds: true }),
+    },
+    timeScale: {
+      tickMarkFormatter: (time) => formatChartTime(time, { seconds: false }),
+    },
+  });
 }
 
 function createChart() {
@@ -123,10 +211,16 @@ function createChart() {
   const resize = () => chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
   new ResizeObserver(resize).observe(container);
   resize();
+  chart.subscribeCrosshairMove((param) => {
+    const rawTime = typeof param.time === "object" ? Date.UTC(param.time.year, param.time.month - 1, param.time.day) / 1000 : param.time;
+    const bar = rawTime ? state.barByTime.get(Number(rawTime)) : null;
+    renderHoverBar(bar || state.currentBars[state.currentBars.length - 1] || null);
+  });
 
   state.chart = chart;
   state.candleSeries = candleSeries;
   state.volumeSeries = volumeSeries;
+  applyChartTimezone();
 }
 
 function renderChips(container, items, activeValue, onClick) {
@@ -240,6 +334,50 @@ function formatValue(value) {
   return String(value);
 }
 
+function setReadoutValue(id, value) {
+  el(id).textContent = value ?? "-";
+}
+
+function setReadoutDirection(bar) {
+  const closeCell = el("hoverClose").parentElement;
+  closeCell.classList.remove("positive", "negative");
+  if (!bar) return;
+  if (Number(bar.close_price) >= Number(bar.open_price)) closeCell.classList.add("positive");
+  else closeCell.classList.add("negative");
+}
+
+function renderHoverBar(bar) {
+  setReadoutDirection(bar);
+  if (!bar) {
+    for (const id of [
+      "hoverTime",
+      "hoverOpen",
+      "hoverHigh",
+      "hoverLow",
+      "hoverClose",
+      "hoverVolume",
+      "hoverQuoteVolume",
+      "hoverTrades",
+      "hoverLastTick",
+      "hoverState",
+    ]) {
+      setReadoutValue(id, "-");
+    }
+    return;
+  }
+
+  setReadoutValue("hoverTime", `${formatTs(bar.start_ms)} - ${formatTs(bar.end_ms)}`);
+  setReadoutValue("hoverOpen", num(bar.open_price, 4));
+  setReadoutValue("hoverHigh", num(bar.high_price, 4));
+  setReadoutValue("hoverLow", num(bar.low_price, 4));
+  setReadoutValue("hoverClose", num(bar.close_price, 4));
+  setReadoutValue("hoverVolume", num(bar.volume, 4));
+  setReadoutValue("hoverQuoteVolume", num(bar.quote_volume, 2));
+  setReadoutValue("hoverTrades", num(bar.trade_count, 0));
+  setReadoutValue("hoverLastTick", formatTs(bar.last_tick_ms));
+  setReadoutValue("hoverState", Number(bar.is_final) ? "final" : "live");
+}
+
 function updateHeadline(snapshot) {
   const title = `${state.exchange.toUpperCase()} / ${state.symbol} / ${state.timeframe}`;
   el("currentTitle").textContent = title;
@@ -258,6 +396,7 @@ function updateHeadline(snapshot) {
     [state.exchange.toUpperCase(), "exchange"],
     [state.timeframe, "timeframe"],
     [String(snapshot?.bar_count ?? 0), "bars"],
+    [timezoneOffsetLabel(), "tz"],
   ];
   for (const [text, label] of items) {
     const pill = document.createElement("div");
@@ -307,6 +446,8 @@ async function loadSnapshotAndBars() {
   ]);
 
   const rawBars = barsPayload.bars || [];
+  state.currentBars = rawBars;
+  state.barByTime = new Map(rawBars.map((bar) => [Math.floor(Number(bar.start_ms) / 1000), bar]));
   snapshot.bar_count = rawBars.length;
   snapshot.first_bar = rawBars[0] || null;
   snapshot.last_bar = rawBars[rawBars.length - 1] || null;
@@ -352,6 +493,7 @@ async function loadSnapshotAndBars() {
   state.candleSeries.setData(bars);
   state.volumeSeries.setData(volumes);
   state.chart.timeScale().fitContent();
+  renderHoverBar(rawBars[rawBars.length - 1] || null);
 }
 
 async function refreshAll() {
@@ -364,6 +506,13 @@ function bindEvents() {
   el("activeOnly").addEventListener("change", renderSymbols);
   el("refreshAll").addEventListener("click", refreshAll);
   el("refreshSymbols").addEventListener("click", loadSymbols);
+  el("timezoneSelect").addEventListener("change", async (event) => {
+    state.timezone = event.target.value;
+    persistSelection();
+    updateTimezoneDisplay();
+    renderHoverBar(state.currentBars[state.currentBars.length - 1] || null);
+    if (state.symbol) await loadSnapshotAndBars();
+  });
 }
 
 async function bootstrap() {
@@ -373,6 +522,8 @@ async function bootstrap() {
   state.exchange = stored.exchange;
   state.symbol = stored.symbol;
   state.timeframe = stored.timeframe;
+  state.timezone = TIMEZONE_OPTIONS.some(([value]) => value === stored.timezone) ? stored.timezone : "Asia/Shanghai";
+  renderTimezoneSelect();
   await loadMeta();
   const exchanges = state.meta?.exchanges || [];
   const timeframes = state.meta?.timeframes || [];

@@ -18,8 +18,13 @@
         <h1>Symbol Console</h1>
       </div>
       <div class="topbar-meta">
+        <label class="timezone-select" title="Display timezone">
+          <span>TZ</span>
+          <select id="timezoneSelect" aria-label="Display timezone"></select>
+        </label>
         <div class="meta-pill" id="metaExchange">exchange</div>
         <div class="meta-pill" id="metaTimeframe">timeframe</div>
+        <div class="meta-pill" id="metaTimezone">timezone</div>
         <button class="icon-btn" id="refreshAll" type="button" title="Refresh">
           <span aria-hidden="true">↻</span>
         </button>
@@ -71,6 +76,48 @@
               <div id="currentSubtitle" class="chart-subtitle">Loading market universe...</div>
             </div>
             <div id="statusPills" class="pill-row"></div>
+          </div>
+          <div class="market-readout" id="marketReadout">
+            <div class="readout-cell wide">
+              <span class="readout-label">Time</span>
+              <strong id="hoverTime">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">O</span>
+              <strong id="hoverOpen">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">H</span>
+              <strong id="hoverHigh">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">L</span>
+              <strong id="hoverLow">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">C</span>
+              <strong id="hoverClose">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">Vol</span>
+              <strong id="hoverVolume">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">Quote</span>
+              <strong id="hoverQuoteVolume">-</strong>
+            </div>
+            <div class="readout-cell">
+              <span class="readout-label">Trades</span>
+              <strong id="hoverTrades">-</strong>
+            </div>
+            <div class="readout-cell wide">
+              <span class="readout-label">Last Tick</span>
+              <strong id="hoverLastTick">-</strong>
+            </div>
+            <div class="readout-cell state">
+              <span class="readout-label">State</span>
+              <strong id="hoverState">-</strong>
+            </div>
           </div>
           <div id="chart" class="chart"></div>
         </section>
