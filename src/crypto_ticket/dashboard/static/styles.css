@@ -373,6 +373,10 @@ input[type="search"]:focus {
   grid-column: span 2;
 }
 
+.readout-cell.xwide {
+  grid-column: span 3;
+}
+
 .readout-cell.state {
   min-width: 82px;
 }
