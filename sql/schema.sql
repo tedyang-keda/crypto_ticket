@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS latest_quote (
 CREATE TABLE IF NOT EXISTS bar_checkpoint (
   exchange VARCHAR(16) NOT NULL,
   symbol VARCHAR(64) NOT NULL,
-  timeframe VARCHAR(8) NOT NULL,
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   start_ms BIGINT NOT NULL,
   end_ms BIGINT NOT NULL,
   open_price DECIMAL(28, 12) NOT NULL,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS bar_checkpoint (
 CREATE TABLE IF NOT EXISTS bar_history (
   exchange VARCHAR(16) NOT NULL,
   symbol VARCHAR(64) NOT NULL,
-  timeframe VARCHAR(8) NOT NULL,
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   start_ms BIGINT NOT NULL,
   end_ms BIGINT NOT NULL,
   open_price DECIMAL(28, 12) NOT NULL,
@@ -99,7 +99,7 @@ PARTITION BY RANGE COLUMNS(exchange, start_ms) (
 
 CREATE TABLE IF NOT EXISTS archive_manifest (
   exchange VARCHAR(16) NOT NULL,
-  timeframe VARCHAR(8) NOT NULL,
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   partition_key VARCHAR(32) NOT NULL,
   file_path TEXT NOT NULL,
   start_ms BIGINT NOT NULL,
