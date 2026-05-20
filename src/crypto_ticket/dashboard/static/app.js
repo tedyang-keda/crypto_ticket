@@ -1,0 +1,375 @@
+const state = {
+  meta: null,
+  exchange: null,
+  timeframe: "15m",
+  symbol: null,
+  symbols: [],
+  filteredSymbols: [],
+  chart: null,
+  candleSeries: null,
+  volumeSeries: null,
+};
+
+const el = (id) => document.getElementById(id);
+
+const fmt = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+
+const num = (value, digits = 2) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "-";
+  return parsed.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+};
+
+function setQueryParams() {
+  const params = new URLSearchParams(window.location.search);
+  if (state.exchange) params.set("exchange", state.exchange);
+  else params.delete("exchange");
+  if (state.symbol) params.set("symbol", state.symbol);
+  else params.delete("symbol");
+  if (state.timeframe) params.set("timeframe", state.timeframe);
+  else params.delete("timeframe");
+  const query = params.toString();
+  history.replaceState(null, "", query ? `${window.location.pathname}?${query}` : window.location.pathname);
+}
+
+function loadStoredSelection() {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    exchange: params.get("exchange") || localStorage.getItem("dashboard_exchange"),
+    symbol: params.get("symbol") || localStorage.getItem("dashboard_symbol"),
+    timeframe: params.get("timeframe") || localStorage.getItem("dashboard_timeframe") || "15m",
+  };
+}
+
+function persistSelection() {
+  if (state.exchange) localStorage.setItem("dashboard_exchange", state.exchange);
+  if (state.symbol) localStorage.setItem("dashboard_symbol", state.symbol);
+  if (state.timeframe) localStorage.setItem("dashboard_timeframe", state.timeframe);
+  setQueryParams();
+}
+
+function formatTs(ts) {
+  if (!ts) return "-";
+  const ms = ts > 1e12 ? ts : ts * 1000;
+  return fmt.format(new Date(ms));
+}
+
+function createChart() {
+  const container = el("chart");
+  const chart = LightweightCharts.createChart(container, {
+    layout: {
+      background: { type: "solid", color: "transparent" },
+      textColor: "#dbe5ef",
+      fontFamily: '"IBM Plex Sans", system-ui, sans-serif',
+    },
+    grid: {
+      vertLines: { color: "rgba(255,255,255,0.04)" },
+      horzLines: { color: "rgba(255,255,255,0.05)" },
+    },
+    rightPriceScale: {
+      borderColor: "#243244",
+    },
+    timeScale: {
+      borderColor: "#243244",
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+    },
+    localization: {
+      priceFormatter: (price) => num(price, 4),
+    },
+  });
+
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: "#57d69d",
+    downColor: "#ff7b7b",
+    borderVisible: false,
+    wickUpColor: "#57d69d",
+    wickDownColor: "#ff7b7b",
+  });
+
+  const volumeSeries = chart.addHistogramSeries({
+    color: "#76a7ff66",
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    scaleMargins: { top: 0.85, bottom: 0 },
+  });
+
+  const resize = () => chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+  new ResizeObserver(resize).observe(container);
+  resize();
+
+  state.chart = chart;
+  state.candleSeries = candleSeries;
+  state.volumeSeries = volumeSeries;
+}
+
+function renderChips(container, items, activeValue, onClick) {
+  container.innerHTML = "";
+  for (const item of items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `chip${item.value === activeValue ? " active" : ""}`;
+    button.textContent = item.label;
+    button.addEventListener("click", () => onClick(item.value));
+    container.appendChild(button);
+  }
+}
+
+function renderExchangeTabs() {
+  const exchanges = (state.meta?.exchanges || []).map((item) => ({ label: item.toUpperCase(), value: item }));
+  renderChips(el("exchangeTabs"), exchanges, state.exchange, async (exchange) => {
+    state.exchange = exchange;
+    state.symbol = null;
+    persistSelection();
+    await loadSymbols();
+  });
+  el("exchangeCount").textContent = `${exchanges.length} markets`;
+  el("metaExchange").textContent = state.exchange ? state.exchange.toUpperCase() : "exchange";
+}
+
+function renderTimeframeTabs() {
+  const timeframes = (state.meta?.timeframes || []).map((item) => ({ label: item, value: item }));
+  renderChips(el("timeframeTabs"), timeframes, state.timeframe, async (timeframe) => {
+    state.timeframe = timeframe;
+    persistSelection();
+    await loadSnapshotAndBars();
+  });
+  el("metaTimeframe").textContent = state.timeframe || "timeframe";
+}
+
+function renderSymbols() {
+  const activeOnly = el("activeOnly").checked;
+  const query = el("symbolSearch").value.trim().toLowerCase();
+  state.filteredSymbols = state.symbols.filter((item) => {
+    if (activeOnly && !item.is_active) return false;
+    if (query && !String(item.symbol || "").toLowerCase().includes(query)) return false;
+    return true;
+  });
+
+  const container = el("symbolList");
+  container.innerHTML = "";
+
+  for (const item of state.filteredSymbols) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `symbol-item${item.symbol === state.symbol ? " active" : ""}`;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(item.symbol === state.symbol));
+
+    const dot = document.createElement("span");
+    dot.className = `symbol-dot${item.is_active ? " on" : ""}`;
+    button.appendChild(dot);
+
+    const main = document.createElement("div");
+    main.className = "symbol-main";
+
+    const code = document.createElement("div");
+    code.className = "symbol-code";
+    code.textContent = item.symbol;
+    main.appendChild(code);
+
+    const meta = document.createElement("div");
+    meta.className = "symbol-meta";
+    meta.innerHTML = `<span>${item.market_type}</span><span>${item.is_active ? "live" : "inactive"}</span>`;
+    main.appendChild(meta);
+
+    const badge = document.createElement("span");
+    badge.className = `symbol-badge${item.is_active ? " live" : ""}`;
+    badge.textContent = item.is_active ? "active" : item.last_status || "stale";
+
+    button.appendChild(main);
+    button.appendChild(badge);
+    button.addEventListener("click", async () => {
+      state.symbol = item.symbol;
+      persistSelection();
+      renderSymbols();
+      await loadSnapshotAndBars();
+    });
+    container.appendChild(button);
+  }
+
+  el("symbolCount").textContent = `${state.filteredSymbols.length}/${state.symbols.length}`;
+}
+
+function renderDetails(target, data, keys) {
+  const container = el(target);
+  container.innerHTML = "";
+  for (const [key, label, formatter] of keys) {
+    const item = document.createElement("div");
+    item.className = "kv-item";
+    const value = data && Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null;
+    item.innerHTML = `
+      <div class="kv-key">${label}</div>
+      <div class="kv-val">${formatter ? formatter(value, data) : formatValue(value)}</div>
+    `;
+    container.appendChild(item);
+  }
+}
+
+function formatValue(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return num(value, Number.isInteger(value) ? 0 : 2);
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function updateHeadline(snapshot) {
+  const title = `${state.exchange.toUpperCase()} / ${state.symbol} / ${state.timeframe}`;
+  el("currentTitle").textContent = title;
+
+  const symbolRow = snapshot?.symbol_row;
+  const checkpoint = snapshot?.checkpoint;
+  const registryBits = [];
+  if (symbolRow) registryBits.push(`status ${symbolRow.last_status || "-"}`);
+  if (checkpoint) registryBits.push(`checkpoint ${checkpoint.is_final ? "final" : "live"}`);
+  if (snapshot?.bar_count !== undefined) registryBits.push(`bars ${snapshot.bar_count}`);
+  el("currentSubtitle").textContent = registryBits.join(" · ") || "No data loaded yet";
+
+  const pills = el("statusPills");
+  pills.innerHTML = "";
+  const items = [
+    [state.exchange.toUpperCase(), "exchange"],
+    [state.timeframe, "timeframe"],
+    [String(snapshot?.bar_count ?? 0), "bars"],
+  ];
+  for (const [text, label] of items) {
+    const pill = document.createElement("div");
+    pill.className = "pill";
+    pill.textContent = `${label}: ${text}`;
+    pills.appendChild(pill);
+  }
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${text}`);
+  }
+  return response.json();
+}
+
+async function loadMeta() {
+  state.meta = await fetchJson("/api/meta");
+  renderExchangeTabs();
+  renderTimeframeTabs();
+}
+
+async function loadSymbols() {
+  if (!state.exchange) return;
+  const payload = await fetchJson(`/api/symbols?exchange=${encodeURIComponent(state.exchange)}`);
+  state.symbols = payload.symbols || [];
+  const selected = state.symbols.find((item) => item.symbol === state.symbol);
+  if (!selected) {
+    const preferred = state.symbols.find((item) => item.is_active) || state.symbols[0];
+    state.symbol = preferred ? preferred.symbol : null;
+  }
+  persistSelection();
+  renderExchangeTabs();
+  renderSymbols();
+  if (state.symbol) {
+    await loadSnapshotAndBars();
+  }
+}
+
+async function loadSnapshotAndBars() {
+  if (!state.exchange || !state.symbol || !state.timeframe) return;
+  const [snapshot, barsPayload] = await Promise.all([
+    fetchJson(`/api/snapshot?exchange=${encodeURIComponent(state.exchange)}&symbol=${encodeURIComponent(state.symbol)}&timeframe=${encodeURIComponent(state.timeframe)}`),
+    fetchJson(`/api/bars?exchange=${encodeURIComponent(state.exchange)}&symbol=${encodeURIComponent(state.symbol)}&timeframe=${encodeURIComponent(state.timeframe)}&limit=500`),
+  ]);
+
+  updateHeadline(snapshot);
+  renderDetails("registryDetails", snapshot?.symbol_row || {}, [
+    ["exchange", "Exchange"],
+    ["symbol", "Symbol"],
+    ["market_type", "Market"],
+    ["is_active", "Active", (value) => (value ? "true" : "false")],
+    ["last_status", "Last Status"],
+    ["first_seen_at_ms", "First Seen", (value) => formatTs(value)],
+    ["last_seen_at_ms", "Last Seen", (value) => formatTs(value)],
+    ["updated_at", "Updated At", (value) => formatTs(value)],
+  ]);
+
+  renderDetails("checkpointDetails", snapshot?.checkpoint || {}, [
+    ["timeframe", "Timeframe"],
+    ["start_ms", "Start", (value) => formatTs(value)],
+    ["end_ms", "End", (value) => formatTs(value)],
+    ["open_price", "Open"],
+    ["high_price", "High"],
+    ["low_price", "Low"],
+    ["close_price", "Close"],
+    ["volume", "Volume"],
+    ["quote_volume", "Quote Vol"],
+    ["trade_count", "Trades"],
+    ["last_tick_ms", "Last Tick", (value) => formatTs(value)],
+    ["is_final", "Final", (value) => (value ? "true" : "false")],
+  ]);
+
+  const bars = (barsPayload.bars || []).map((bar) => ({
+    time: Math.floor(Number(bar.start_ms) / 1000),
+    open: Number(bar.open_price),
+    high: Number(bar.high_price),
+    low: Number(bar.low_price),
+    close: Number(bar.close_price),
+  }));
+  const volumes = (barsPayload.bars || []).map((bar) => ({
+    time: Math.floor(Number(bar.start_ms) / 1000),
+    value: Number(bar.volume || 0),
+    color: Number(bar.close_price) >= Number(bar.open_price) ? "rgba(87, 214, 157, 0.55)" : "rgba(255, 123, 123, 0.55)",
+  }));
+  state.candleSeries.setData(bars);
+  state.volumeSeries.setData(volumes);
+  state.chart.timeScale().fitContent();
+}
+
+async function refreshAll() {
+  await loadMeta();
+  await loadSymbols();
+}
+
+function bindEvents() {
+  el("symbolSearch").addEventListener("input", renderSymbols);
+  el("activeOnly").addEventListener("change", renderSymbols);
+  el("refreshAll").addEventListener("click", refreshAll);
+  el("refreshSymbols").addEventListener("click", loadSymbols);
+}
+
+async function bootstrap() {
+  createChart();
+  bindEvents();
+  const stored = loadStoredSelection();
+  state.exchange = stored.exchange;
+  state.symbol = stored.symbol;
+  state.timeframe = stored.timeframe;
+  await loadMeta();
+  const exchanges = state.meta?.exchanges || [];
+  const timeframes = state.meta?.timeframes || [];
+  if (!state.exchange || !exchanges.includes(state.exchange)) {
+    state.exchange = exchanges[0] || "binance";
+  }
+  if (!state.timeframe || !timeframes.includes(state.timeframe)) {
+    state.timeframe = timeframes[0] || "15m";
+  }
+  await loadSymbols();
+  renderTimeframeTabs();
+}
+
+bootstrap().catch((err) => {
+  console.error(err);
+  el("currentSubtitle").textContent = `Failed to load dashboard: ${err.message}`;
+});

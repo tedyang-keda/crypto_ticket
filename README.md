@@ -27,4 +27,5 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
 python -m crypto_ticket run
+python -m crypto_ticket web --host 127.0.0.1 --port 8088
 ```

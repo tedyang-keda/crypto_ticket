@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crypto Ticket Symbol Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-kicker">crypto_ticket</div>
+        <h1>Symbol Console</h1>
+      </div>
+      <div class="topbar-meta">
+        <div class="meta-pill" id="metaExchange">exchange</div>
+        <div class="meta-pill" id="metaTimeframe">timeframe</div>
+        <button class="icon-btn" id="refreshAll" type="button" title="Refresh">
+          <span aria-hidden="true">↻</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="rail">
+        <section class="panel">
+          <div class="panel-head">
+            <span>CEX</span>
+            <span class="muted" id="exchangeCount"></span>
+          </div>
+          <div id="exchangeTabs" class="chip-group"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <span>Timeframe</span>
+            <span class="muted">archive</span>
+          </div>
+          <div id="timeframeTabs" class="chip-group compact"></div>
+        </section>
+
+        <section class="panel panel-fill">
+          <div class="panel-head">
+            <span>Symbols</span>
+            <span class="muted" id="symbolCount"></span>
+          </div>
+          <div class="search-row">
+            <input id="symbolSearch" type="search" placeholder="Search symbol" autocomplete="off" />
+            <button class="icon-btn" id="refreshSymbols" type="button" title="Refresh symbols">
+              <span aria-hidden="true">⟳</span>
+            </button>
+          </div>
+          <label class="toggle-row">
+            <input id="activeOnly" type="checkbox" checked />
+            <span>Active only</span>
+          </label>
+          <div id="symbolList" class="symbol-list" role="listbox" aria-label="Symbols"></div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <section class="panel chart-panel">
+          <div class="chart-toolbar">
+            <div>
+              <div id="currentTitle" class="chart-title">Select a symbol</div>
+              <div id="currentSubtitle" class="chart-subtitle">Loading market universe...</div>
+            </div>
+            <div id="statusPills" class="pill-row"></div>
+          </div>
+          <div id="chart" class="chart"></div>
+        </section>
+
+        <section class="details-grid">
+          <section class="panel detail-panel">
+            <div class="panel-head">
+              <span>Symbol Registry</span>
+              <span class="muted">DB row</span>
+            </div>
+            <div id="registryDetails" class="kv-grid"></div>
+          </section>
+          <section class="panel detail-panel">
+            <div class="panel-head">
+              <span>Latest Checkpoint</span>
+              <span class="muted">bar_checkpoint</span>
+            </div>
+            <div id="checkpointDetails" class="kv-grid"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

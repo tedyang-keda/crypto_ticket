@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from datetime import date, datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from decimal import Decimal
+from typing import Any, Iterable, Optional
 
 import pymysql
 
@@ -45,6 +47,69 @@ class MySQLHotStore:
             with conn.cursor() as cursor:
                 for statement in statements:
                     cursor.execute(statement)
+
+    def list_symbol_exchanges(self) -> list[str]:
+        sql = """
+            SELECT DISTINCT exchange
+            FROM symbol_registry
+            ORDER BY exchange
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
+    def list_symbols(self, exchange: str, *, active_only: Optional[bool] = None) -> list[dict[str, Any]]:
+        filters = ["exchange = %s"]
+        params: list[Any] = [exchange]
+        if active_only is True:
+            filters.append("is_active = 1")
+        elif active_only is False:
+            filters.append("is_active = 0")
+
+        sql = f"""
+            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json, created_at, updated_at
+            FROM symbol_registry
+            WHERE {' AND '.join(filters)}
+            ORDER BY is_active DESC, symbol
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                columns = [column[0] for column in cursor.description or []]
+        return [self._row_to_dict(columns, row) for row in rows]
+
+    def get_symbol_registry(self, exchange: str, symbol: str) -> Optional[dict[str, Any]]:
+        sql = """
+            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json, created_at, updated_at
+            FROM symbol_registry
+            WHERE exchange = %s AND symbol = %s
+            LIMIT 1
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (exchange, symbol))
+                row = cursor.fetchone()
+                columns = [column[0] for column in cursor.description or []]
+        return self._row_to_dict(columns, row) if row else None
+
+    def get_bar_checkpoint(self, exchange: str, symbol: str, timeframe: str) -> Optional[dict[str, Any]]:
+        sql = """
+            SELECT exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price,
+                   close_price, volume, quote_volume, trade_count, last_tick_ms, is_final, raw_json,
+                   created_at, updated_at
+            FROM bar_checkpoint
+            WHERE exchange = %s AND symbol = %s AND timeframe = %s
+            LIMIT 1
+        """
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (exchange, symbol, timeframe))
+                row = cursor.fetchone()
+                columns = [column[0] for column in cursor.description or []]
+        return self._row_to_dict(columns, row) if row else None
 
     def upsert_symbol_registry(self, symbols: Iterable[SymbolInfo]) -> int:
         rows = []
@@ -164,6 +229,21 @@ class MySQLHotStore:
             1 if bar.is_final else 0,
             payload,
         )
+
+    def _row_to_dict(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
+        return {
+            column: self._normalize_sql_value(value)
+            for column, value in zip(columns, row)
+        }
+
+    def _normalize_sql_value(self, value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, datetime):
+            return value.isoformat(sep=" ")
+        if isinstance(value, date):
+            return value.isoformat()
+        return value
 
     def upsert_archive_manifest(
         self,
