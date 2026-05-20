@@ -79,6 +79,8 @@ class RollingBarState:
     quote_volume: float = 0.0
     trade_count: int = 0
     last_tick_ms: int = 0
+    is_closed: bool = False
+    closed_at_ms: int = 0
 
     @classmethod
     def from_tick(cls, tick: TickEvent, timeframe: str, start_ms: int, end_ms: int) -> "RollingBarState":
@@ -97,6 +99,8 @@ class RollingBarState:
             quote_volume=quote_volume,
             trade_count=1,
             last_tick_ms=tick.ts_ms,
+            is_closed=False,
+            closed_at_ms=0,
         )
 
     @classmethod
@@ -115,9 +119,13 @@ class RollingBarState:
             quote_volume=bar.quote_volume,
             trade_count=bar.trade_count,
             last_tick_ms=bar.last_tick_ms or bar.end_ms,
+            is_closed=False,
+            closed_at_ms=0,
         )
 
     def update_with_tick(self, tick: TickEvent) -> None:
+        if self.is_closed:
+            return
         self.high_price = max(self.high_price, tick.price)
         self.low_price = min(self.low_price, tick.price)
         self.close_price = tick.price
@@ -127,6 +135,8 @@ class RollingBarState:
         self.last_tick_ms = max(self.last_tick_ms, tick.ts_ms)
 
     def update_with_bar(self, bar: BarEvent) -> None:
+        if self.is_closed:
+            return
         self.high_price = max(self.high_price, bar.high_price)
         self.low_price = min(self.low_price, bar.low_price)
         self.close_price = bar.close_price
@@ -134,6 +144,10 @@ class RollingBarState:
         self.quote_volume += bar.quote_volume
         self.trade_count += bar.trade_count
         self.last_tick_ms = max(self.last_tick_ms, bar.last_tick_ms or bar.end_ms)
+
+    def mark_closed(self, closed_at_ms: int) -> None:
+        self.is_closed = True
+        self.closed_at_ms = int(closed_at_ms)
 
     def to_bar(self, *, is_final: bool, reason: str) -> BarEvent:
         return BarEvent(
@@ -153,4 +167,3 @@ class RollingBarState:
             is_final=is_final,
             reason=reason,
         )
-

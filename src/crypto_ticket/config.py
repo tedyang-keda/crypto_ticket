@@ -60,6 +60,7 @@ class AppConfig:
     health_report_interval_seconds: int
     symbol_refresh_interval_seconds: int
     archive_flush_interval_seconds: int
+    bar_close_grace_seconds: int
     reconnect_base_delay_seconds: float
     reconnect_max_delay_seconds: float
     enable_mysql: bool
@@ -108,6 +109,7 @@ def load_config() -> AppConfig:
         health_report_interval_seconds=env_int("HEALTH_REPORT_INTERVAL_SECONDS", 30),
         symbol_refresh_interval_seconds=env_int("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
         archive_flush_interval_seconds=env_int("ARCHIVE_FLUSH_INTERVAL_SECONDS", 5),
+        bar_close_grace_seconds=env_int("BAR_CLOSE_GRACE_SECONDS", 2),
         reconnect_base_delay_seconds=env_float("RECONNECT_BASE_DELAY_SECONDS", 1.0),
         reconnect_max_delay_seconds=env_float("RECONNECT_MAX_DELAY_SECONDS", 60.0),
         enable_mysql=env_bool("ENABLE_MYSQL", False),

@@ -42,9 +42,23 @@ class MultiTimeframeAggregator:
     def on_tick(self, tick: TickEvent) -> list[BarEvent]:
         final_bars = self._apply_tick_to_base(tick)
         rolled = list(final_bars)
-        for bar in final_bars:
-            rolled.extend(self._roll_up(bar))
+        rolled.extend(self._roll_up(final_bars))
         return rolled
+
+    def close_due_bars(self, now_ms: int, grace_ms: int = 0) -> list[BarEvent]:
+        emitted: list[BarEvent] = []
+        cutoff_ms = int(now_ms) - max(0, int(grace_ms))
+        states = sorted(
+            self.states.items(),
+            key=lambda item: (timeframe_index(item[0][2]), item[0][0], item[0][1]),
+        )
+        for _, state in states:
+            if state.is_closed or state.end_ms > cutoff_ms:
+                continue
+            bar = self._finalize_state(state, cutoff_ms)
+            emitted.append(bar)
+            emitted.extend(self._roll_up([bar]))
+        return emitted
 
     def _apply_tick_to_base(self, tick: TickEvent) -> list[BarEvent]:
         base_tf = "1m"
@@ -55,13 +69,19 @@ class MultiTimeframeAggregator:
         if state is None:
             self.states[key] = RollingBarState.from_tick(tick, base_tf, bucket_start, bucket_end)
             return []
+        if state.is_closed:
+            if bucket_start <= state.start_ms:
+                return []
+            finalized: list[BarEvent] = self._fill_gap_bars(state, bucket_start)
+            self.states[key] = RollingBarState.from_tick(tick, base_tf, bucket_start, bucket_end)
+            return finalized
         if bucket_start == state.start_ms:
             state.update_with_tick(tick)
             return []
         if bucket_start < state.start_ms:
             return []
 
-        finalized: list[BarEvent] = [state.to_bar(is_final=True, reason="close")]
+        finalized: list[BarEvent] = [self._finalize_state(state, tick.ts_ms)]
         finalized.extend(self._fill_gap_bars(state, bucket_start))
         self.states[key] = RollingBarState.from_tick(tick, base_tf, bucket_start, bucket_end)
         return finalized
@@ -94,31 +114,47 @@ class MultiTimeframeAggregator:
             gap_start += gap_duration_ms
         return gap_bars
 
-    def _roll_up(self, bar: BarEvent) -> list[BarEvent]:
+    def _roll_up(self, bars: list[BarEvent]) -> list[BarEvent]:
         emitted: list[BarEvent] = []
-        carry = bar
+        carry = list(bars)
         for timeframe in self.timeframes[1:]:
-            result = self._apply_bar_to_timeframe(carry, timeframe)
-            if result is None:
+            next_carry: list[BarEvent] = []
+            for bar in carry:
+                results = self._apply_bar_to_timeframe(bar, timeframe)
+                if results:
+                    emitted.extend(results)
+                    next_carry.extend(results)
+            if not next_carry:
                 break
-            emitted.append(result)
-            carry = result
+            carry = next_carry
         return emitted
 
-    def _apply_bar_to_timeframe(self, bar: BarEvent, timeframe: str) -> Optional[BarEvent]:
+    def _apply_bar_to_timeframe(self, bar: BarEvent, timeframe: str) -> list[BarEvent]:
         key = self.state_key(bar.exchange, bar.symbol, timeframe)
         bucket_start = floor_bucket_start_ms(bar.start_ms, timeframe)
         bucket_end = bucket_end_ms(bucket_start, timeframe)
         state = self.states.get(key)
         if state is None:
             self.states[key] = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
-            return None
+            return []
+        if state.is_closed:
+            if bucket_start <= state.start_ms:
+                return []
+            finalized: list[BarEvent] = self._fill_gap_bars(state, bucket_start)
+            self.states[key] = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
+            return finalized
         if bucket_start == state.start_ms:
             state.update_with_bar(bar)
-            return None
+            return []
         if bucket_start < state.start_ms:
-            return None
+            return []
 
-        finalized = state.to_bar(is_final=True, reason="close")
+        finalized = self._finalize_state(state, bar.last_tick_ms or bar.end_ms)
+        emitted = [finalized]
+        emitted.extend(self._fill_gap_bars(state, bucket_start))
         self.states[key] = RollingBarState.from_bar(bar, timeframe, bucket_start, bucket_end)
-        return finalized
+        return emitted
+
+    def _finalize_state(self, state: RollingBarState, closed_at_ms: int) -> BarEvent:
+        state.mark_closed(closed_at_ms)
+        return state.to_bar(is_final=True, reason="close")

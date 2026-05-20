@@ -284,7 +284,17 @@ class CryptoTicketService:
         await self.redis.xgroup_create(stream, group)
         pending_flush: list[BarEvent] = []
         last_flush = time.time()
+        last_due_check = time.monotonic()
         while not self._stop.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_due_check >= 1.0:
+                due_bars = self.aggregator.close_due_bars(
+                    int(time.time() * 1000),
+                    self.config.bar_close_grace_seconds * 1000,
+                )
+                if due_bars:
+                    pending_flush.extend(due_bars)
+                last_due_check = now_monotonic
             batches = await self.redis.xreadgroup(group, consumer, [stream], count=200, block_ms=1000)
             if not batches:
                 await self._flush_bars(pending_flush)
