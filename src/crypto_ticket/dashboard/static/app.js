@@ -61,6 +61,14 @@ const num = (value, digits = 2) => {
   });
 };
 
+const priceNum = (value) => {
+  const parsed = Math.abs(Number(value));
+  if (!Number.isFinite(parsed)) return "-";
+  if (parsed >= 100) return num(value, 2);
+  if (parsed >= 1) return num(value, 4);
+  return num(value, 8);
+};
+
 function setQueryParams() {
   const params = new URLSearchParams(window.location.search);
   if (state.exchange) params.set("exchange", state.exchange);
@@ -110,6 +118,19 @@ function formatChartTime(time, options = {}) {
   const value = typeof time === "object" ? Date.UTC(time.year, time.month - 1, time.day) : Number(time) * 1000;
   if (!Number.isFinite(value)) return "";
   return getDateFormatter({ seconds: options.seconds !== false }).format(new Date(value));
+}
+
+function formatTimeOfDay(ts) {
+  const parsed = Number(ts);
+  if (!Number.isFinite(parsed)) return "-";
+  const ms = parsed > 1e12 ? parsed : parsed * 1000;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: effectiveTimezone() === "local" ? undefined : effectiveTimezone(),
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date(ms));
 }
 
 function timezoneOffsetLabel() {
@@ -366,11 +387,11 @@ function renderHoverBar(bar) {
     return;
   }
 
-  setReadoutValue("hoverTime", `${formatTs(bar.start_ms)} - ${formatTs(bar.end_ms)}`);
-  setReadoutValue("hoverOpen", num(bar.open_price, 4));
-  setReadoutValue("hoverHigh", num(bar.high_price, 4));
-  setReadoutValue("hoverLow", num(bar.low_price, 4));
-  setReadoutValue("hoverClose", num(bar.close_price, 4));
+  setReadoutValue("hoverTime", `${formatTs(bar.start_ms)} - ${formatTimeOfDay(bar.end_ms)}`);
+  setReadoutValue("hoverOpen", priceNum(bar.open_price));
+  setReadoutValue("hoverHigh", priceNum(bar.high_price));
+  setReadoutValue("hoverLow", priceNum(bar.low_price));
+  setReadoutValue("hoverClose", priceNum(bar.close_price));
   setReadoutValue("hoverVolume", num(bar.volume, 4));
   setReadoutValue("hoverQuoteVolume", num(bar.quote_volume, 2));
   setReadoutValue("hoverTrades", num(bar.trade_count, 0));

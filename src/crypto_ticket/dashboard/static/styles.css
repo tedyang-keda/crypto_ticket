@@ -353,15 +353,14 @@ input[type="search"]:focus {
 
 .market-readout {
   display: grid;
-  grid-template-columns: minmax(220px, 1.35fr) repeat(7, minmax(76px, 0.74fr)) minmax(160px, 1fr) minmax(82px, 0.65fr);
+  grid-template-columns: repeat(8, minmax(96px, 1fr));
   gap: 1px;
   border-bottom: 1px solid var(--border);
   background: var(--border);
-  overflow-x: auto;
 }
 
 .readout-cell {
-  min-width: 76px;
+  min-width: 0;
   min-height: 54px;
   display: grid;
   gap: 5px;
@@ -371,7 +370,7 @@ input[type="search"]:focus {
 }
 
 .readout-cell.wide {
-  min-width: 160px;
+  grid-column: span 2;
 }
 
 .readout-cell.state {
@@ -505,7 +504,7 @@ input[type="search"]:focus {
   }
 
   .market-readout {
-    grid-template-columns: repeat(10, minmax(110px, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .chart {
