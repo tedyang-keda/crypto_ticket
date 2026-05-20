@@ -45,16 +45,12 @@ class DashboardRepository:
     def get_snapshot(self, exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
         symbol_row = self.mysql.get_symbol_registry(exchange, symbol) if self.mysql else None
         checkpoint = self.mysql.get_bar_checkpoint(exchange, symbol, timeframe) if self.mysql else None
-        bars = load_archive_bars(self.config.archive_root, exchange, timeframe, symbol, limit=400)
         return {
             "exchange": exchange,
             "symbol": symbol,
             "timeframe": timeframe,
             "symbol_row": symbol_row,
             "checkpoint": checkpoint,
-            "bar_count": len(bars),
-            "first_bar": bars[0] if bars else None,
-            "last_bar": bars[-1] if bars else None,
         }
 
     def load_bars(self, exchange: str, symbol: str, timeframe: str, *, limit: int = 400) -> list[dict[str, Any]]:

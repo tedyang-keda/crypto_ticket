@@ -69,7 +69,7 @@ class MySQLHotStore:
             filters.append("is_active = 0")
 
         sql = f"""
-            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json, created_at, updated_at
+            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, created_at, updated_at
             FROM symbol_registry
             WHERE {' AND '.join(filters)}
             ORDER BY is_active DESC, symbol
@@ -83,7 +83,7 @@ class MySQLHotStore:
 
     def get_symbol_registry(self, exchange: str, symbol: str) -> Optional[dict[str, Any]]:
         sql = """
-            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json, created_at, updated_at
+            SELECT exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, created_at, updated_at
             FROM symbol_registry
             WHERE exchange = %s AND symbol = %s
             LIMIT 1
@@ -98,8 +98,7 @@ class MySQLHotStore:
     def get_bar_checkpoint(self, exchange: str, symbol: str, timeframe: str) -> Optional[dict[str, Any]]:
         sql = """
             SELECT exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price,
-                   close_price, volume, quote_volume, trade_count, last_tick_ms, is_final, raw_json,
-                   created_at, updated_at
+                   close_price, volume, quote_volume, trade_count, last_tick_ms, is_final, created_at, updated_at
             FROM bar_checkpoint
             WHERE exchange = %s AND symbol = %s AND timeframe = %s
             LIMIT 1

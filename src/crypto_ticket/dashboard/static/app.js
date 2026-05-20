@@ -306,6 +306,10 @@ async function loadSnapshotAndBars() {
     fetchJson(`/api/bars?exchange=${encodeURIComponent(state.exchange)}&symbol=${encodeURIComponent(state.symbol)}&timeframe=${encodeURIComponent(state.timeframe)}&limit=500`),
   ]);
 
+  const rawBars = barsPayload.bars || [];
+  snapshot.bar_count = rawBars.length;
+  snapshot.first_bar = rawBars[0] || null;
+  snapshot.last_bar = rawBars[rawBars.length - 1] || null;
   updateHeadline(snapshot);
   renderDetails("registryDetails", snapshot?.symbol_row || {}, [
     ["exchange", "Exchange"],
@@ -333,14 +337,14 @@ async function loadSnapshotAndBars() {
     ["is_final", "Final", (value) => (value ? "true" : "false")],
   ]);
 
-  const bars = (barsPayload.bars || []).map((bar) => ({
+  const bars = rawBars.map((bar) => ({
     time: Math.floor(Number(bar.start_ms) / 1000),
     open: Number(bar.open_price),
     high: Number(bar.high_price),
     low: Number(bar.low_price),
     close: Number(bar.close_price),
   }));
-  const volumes = (barsPayload.bars || []).map((bar) => ({
+  const volumes = rawBars.map((bar) => ({
     time: Math.floor(Number(bar.start_ms) / 1000),
     value: Number(bar.volume || 0),
     color: Number(bar.close_price) >= Number(bar.open_price) ? "rgba(87, 214, 157, 0.55)" : "rgba(255, 123, 123, 0.55)",
