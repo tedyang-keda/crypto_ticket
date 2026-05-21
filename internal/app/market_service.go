@@ -1,0 +1,168 @@
+package app
+
+import (
+	"context"
+	"strings"
+	"sync"
+
+	"crypto-ticket/internal/aggregator"
+	"crypto-ticket/internal/cache"
+	"crypto-ticket/internal/market"
+	"crypto-ticket/internal/realtime"
+	"crypto-ticket/internal/storage"
+)
+
+type MarketService struct {
+	cache       cache.MarketCache
+	store       storage.HistoricalStore
+	hub         *realtime.Hub
+	engineMu    sync.Mutex
+	engine      *aggregator.Engine
+	recentLimit int
+}
+
+func NewMarketService(cache cache.MarketCache, store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
+	if recentLimit <= 0 {
+		recentLimit = 300
+	}
+	return &MarketService{
+		cache:       cache,
+		store:       store,
+		hub:         hub,
+		engine:      aggregator.NewEngine(frames),
+		recentLimit: recentLimit,
+	}
+}
+
+func (s *MarketService) IngestTick(ctx context.Context, tick market.Tick) error {
+	tick.Exchange = strings.ToLower(strings.TrimSpace(tick.Exchange))
+	tick.Symbol = strings.ToUpper(strings.TrimSpace(tick.Symbol))
+	if tick.RecvMS == 0 {
+		tick.RecvMS = market.NowMS()
+	}
+	if tick.Source == "" {
+		tick.Source = "api"
+	}
+	if tick.EventType == "" {
+		tick.EventType = "trade"
+	}
+
+	if err := s.cache.SetLatestTick(ctx, tick); err != nil {
+		return err
+	}
+	s.hub.Publish(market.Event{
+		Type:     "ticker",
+		Exchange: tick.Exchange,
+		Symbol:   tick.Symbol,
+		Tick:     &tick,
+	})
+
+	s.engineMu.Lock()
+	result := s.engine.OnTick(tick)
+	s.engineMu.Unlock()
+
+	return s.handleAggregationResult(ctx, result)
+}
+
+func (s *MarketService) CloseDue(ctx context.Context, nowMS int64, graceMS int64) error {
+	s.engineMu.Lock()
+	result := s.engine.CloseDue(nowMS, graceMS)
+	s.engineMu.Unlock()
+	return s.handleAggregationResult(ctx, result)
+}
+
+func (s *MarketService) handleAggregationResult(ctx context.Context, result aggregator.Result) error {
+	for _, bar := range result.LiveBars {
+		barCopy := bar
+		if err := s.cache.SetLiveBar(ctx, barCopy); err != nil {
+			return err
+		}
+		s.hub.Publish(market.Event{
+			Type:      "kline",
+			Exchange:  barCopy.Exchange,
+			Symbol:    barCopy.Symbol,
+			Timeframe: barCopy.Timeframe,
+			Bar:       &barCopy,
+		})
+	}
+	if len(result.FinalBars) > 0 {
+		if err := s.store.UpsertBars(ctx, result.FinalBars); err != nil {
+			return err
+		}
+		if err := s.cache.PutFinalBars(ctx, result.FinalBars, s.recentLimit); err != nil {
+			return err
+		}
+		for _, bar := range result.FinalBars {
+			barCopy := bar
+			s.hub.Publish(market.Event{
+				Type:      "kline",
+				Exchange:  barCopy.Exchange,
+				Symbol:    barCopy.Symbol,
+				Timeframe: barCopy.Timeframe,
+				Bar:       &barCopy,
+			})
+		}
+	}
+	return nil
+}
+
+func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string) (*market.Tick, error) {
+	return s.cache.GetLatestTick(ctx, strings.ToLower(exchange), strings.ToUpper(symbol))
+}
+
+func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
+	query.Exchange = strings.ToLower(query.Exchange)
+	query.Symbol = strings.ToUpper(query.Symbol)
+	if query.Limit <= 0 {
+		query.Limit = 300
+	}
+	if query.Limit > 1000 {
+		query.Limit = 1000
+	}
+
+	bars, err := s.cache.RecentBars(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(bars) < query.Limit {
+		dbBars, err := s.store.RecentBars(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		if len(dbBars) > 0 {
+			bars = dbBars
+			_ = s.cache.PutFinalBars(ctx, dbBars, s.recentLimit)
+		}
+	}
+	if query.IncludeLive {
+		live, err := s.cache.GetLiveBar(ctx, query.Exchange, query.Symbol, query.Timeframe)
+		if err != nil {
+			return nil, err
+		}
+		bars = mergeLiveBar(bars, live)
+	}
+	if len(bars) > query.Limit+1 {
+		bars = bars[len(bars)-query.Limit-1:]
+	}
+	return bars, nil
+}
+
+func (s *MarketService) ListSymbols(ctx context.Context, exchange string, activeOnly *bool) ([]market.SymbolInfo, error) {
+	return s.store.ListSymbols(ctx, strings.ToLower(exchange), activeOnly)
+}
+
+func mergeLiveBar(bars []market.Bar, live *market.Bar) []market.Bar {
+	if live == nil {
+		return bars
+	}
+	for i := range bars {
+		if bars[i].StartMS == live.StartMS {
+			bars[i] = *live
+			return bars
+		}
+	}
+	if len(bars) == 0 || live.StartMS > bars[len(bars)-1].StartMS {
+		return append(bars, *live)
+	}
+	return bars
+}

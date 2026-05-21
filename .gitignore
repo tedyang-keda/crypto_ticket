@@ -13,3 +13,7 @@ data/
 logs/
 .env
 .DS_Store
+node_modules/
+web/dist/
+.playwright-mcp/
+*.tsbuildinfo
