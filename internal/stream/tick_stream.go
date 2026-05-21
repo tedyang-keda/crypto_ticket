@@ -23,6 +23,7 @@ type TickMessage struct {
 type TickStream interface {
 	EnsureGroup(ctx context.Context, streamName string, group string) error
 	AddTick(ctx context.Context, streamName string, tick market.Tick, maxLen int64) (string, error)
+	AddTicks(ctx context.Context, streamName string, ticks []market.Tick, maxLen int64) ([]string, error)
 	ReadGroup(ctx context.Context, streamName string, group string, consumer string, startID string, count int64, block time.Duration) ([]TickMessage, error)
 	Ack(ctx context.Context, streamName string, group string, ids ...string) error
 }
@@ -52,6 +53,48 @@ func (r *RedisTickStream) EnsureGroup(ctx context.Context, streamName string, gr
 }
 
 func (r *RedisTickStream) AddTick(ctx context.Context, streamName string, tick market.Tick, maxLen int64) (string, error) {
+	ids, err := r.AddTicks(ctx, streamName, []market.Tick{tick}, maxLen)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", nil
+	}
+	return ids[0], nil
+}
+
+func (r *RedisTickStream) AddTicks(ctx context.Context, streamName string, ticks []market.Tick, maxLen int64) ([]string, error) {
+	if len(ticks) == 0 {
+		return nil, nil
+	}
+	pipe := r.client.Pipeline()
+	commands := make([]*redis.StringCmd, 0, len(ticks))
+	for _, tick := range ticks {
+		args := &redis.XAddArgs{
+			Stream: streamName,
+			Values: tickValues(tick),
+		}
+		if maxLen > 0 {
+			args.MaxLen = maxLen
+			args.Approx = true
+		}
+		commands = append(commands, pipe.XAdd(ctx, args))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(commands))
+	for _, command := range commands {
+		id, err := command.Result()
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func tickValues(tick market.Tick) map[string]any {
 	values := map[string]any{
 		"exchange":   strings.ToLower(tick.Exchange),
 		"symbol":     strings.ToUpper(tick.Symbol),
@@ -67,15 +110,7 @@ func (r *RedisTickStream) AddTick(ctx context.Context, streamName string, tick m
 	if len(tick.Raw) > 0 {
 		values["raw"] = string(tick.Raw)
 	}
-	args := &redis.XAddArgs{
-		Stream: streamName,
-		Values: values,
-	}
-	if maxLen > 0 {
-		args.MaxLen = maxLen
-		args.Approx = true
-	}
-	return r.client.XAdd(ctx, args).Result()
+	return values
 }
 
 func (r *RedisTickStream) ReadGroup(

@@ -24,6 +24,8 @@ type Config struct {
 	RedisConsumerName            string
 	StreamReadCount              int
 	StreamBlockMS                int
+	StreamWriteBatchSize         int
+	StreamWriteFlushMS           int
 	BarCloseGraceSeconds         int
 	SymbolRefreshIntervalSeconds int
 	ReconnectBaseDelaySeconds    int
@@ -69,6 +71,8 @@ func Load() Config {
 		RedisConsumerName:            env("REDIS_CONSUMER_NAME", "marketd-1"),
 		StreamReadCount:              envInt("STREAM_READ_COUNT", 200),
 		StreamBlockMS:                envInt("STREAM_BLOCK_MS", 1000),
+		StreamWriteBatchSize:         envInt("STREAM_WRITE_BATCH_SIZE", 500),
+		StreamWriteFlushMS:           envInt("STREAM_WRITE_FLUSH_MS", 50),
 		BarCloseGraceSeconds:         envInt("BAR_CLOSE_GRACE_SECONDS", 2),
 		SymbolRefreshIntervalSeconds: envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
 		ReconnectBaseDelaySeconds:    envInt("RECONNECT_BASE_DELAY_SECONDS", 1),

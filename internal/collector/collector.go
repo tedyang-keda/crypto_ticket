@@ -24,6 +24,8 @@ type Config struct {
 	ReconnectMaxDelay     time.Duration
 	StreamMaxLen          int64
 	SubscriptionChunkSize int
+	WriteBatchSize        int
+	WriteFlushInterval    time.Duration
 	Shard                 int
 }
 
@@ -111,10 +113,21 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	}
 	log.Printf("%s collector connected symbols=%d stream=%s", adapter.Name(), len(symbols), stream.NameForExchange(adapter.Name(), cfg.Shard))
 
+	writerCtx, cancelWriter := context.WithCancel(ctx)
+	defer cancelWriter()
+	tickCh := make(chan market.Tick, 50_000)
+	writeErrCh := make(chan error, 1)
+	go r.writeTicks(writerCtx, stream.NameForExchange(adapter.Name(), cfg.Shard), cfg, tickCh, writeErrCh)
+
 	refreshAt := time.Now().Add(cfg.SymbolRefreshInterval)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		select {
+		case err := <-writeErrCh:
+			return err
+		default:
 		}
 		deadline := time.Now().Add(30 * time.Second)
 		if untilRefresh := time.Until(refreshAt); untilRefresh > 0 && untilRefresh < 30*time.Second {
@@ -137,18 +150,74 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 			log.Printf("%s parse message failed: %v", adapter.Name(), err)
 			continue
 		}
-		streamName := stream.NameForExchange(adapter.Name(), cfg.Shard)
 		for _, tick := range ticks {
 			if tick.RecvMS == 0 {
 				tick.RecvMS = market.NowMS()
 			}
-			if _, err := r.writer.AddTick(ctx, streamName, tick, cfg.StreamMaxLen); err != nil {
+			if err := enqueueTick(ctx, tickCh, writeErrCh, tick); err != nil {
 				return err
 			}
 		}
 		if !time.Now().Before(refreshAt) {
 			return nil
 		}
+	}
+}
+
+func (r *Runner) writeTicks(ctx context.Context, streamName string, cfg Config, ticks <-chan market.Tick, errCh chan<- error) {
+	batchSize := cfg.WriteBatchSize
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	flushInterval := cfg.WriteFlushInterval
+	if flushInterval <= 0 {
+		flushInterval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+	batch := make([]market.Tick, 0, batchSize)
+
+	flush := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		if _, err := r.writer.AddTicks(ctx, streamName, batch, cfg.StreamMaxLen); err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			return false
+		}
+		batch = batch[:0]
+		return true
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case tick := <-ticks:
+			batch = append(batch, tick)
+			if len(batch) >= batchSize && !flush() {
+				return
+			}
+		case <-ticker.C:
+			if !flush() {
+				return
+			}
+		}
+	}
+}
+
+func enqueueTick(ctx context.Context, tickCh chan<- market.Tick, errCh <-chan error, tick market.Tick) error {
+	select {
+	case tickCh <- tick:
+		return nil
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -186,6 +255,12 @@ func (r *Runner) configFor(exchangeName string) Config {
 	}
 	if cfg.SubscriptionChunkSize <= 0 {
 		cfg.SubscriptionChunkSize = 100
+	}
+	if cfg.WriteBatchSize <= 0 {
+		cfg.WriteBatchSize = 500
+	}
+	if cfg.WriteFlushInterval <= 0 {
+		cfg.WriteFlushInterval = 50 * time.Millisecond
 	}
 	return cfg
 }

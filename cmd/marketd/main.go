@@ -163,6 +163,8 @@ func startBackgroundWorkers(
 				ReconnectMaxDelay:     time.Duration(cfg.ReconnectMaxDelaySeconds) * time.Second,
 				StreamMaxLen:          cfg.RedisStreamMaxLen,
 				SubscriptionChunkSize: exchangeConfig.SubscriptionChunkSize,
+				WriteBatchSize:        cfg.StreamWriteBatchSize,
+				WriteFlushInterval:    time.Duration(cfg.StreamWriteFlushMS) * time.Millisecond,
 				Shard:                 exchangeConfig.Shard,
 			}
 		}
