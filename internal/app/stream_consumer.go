@@ -75,11 +75,15 @@ func (c *StreamConsumer) readAndProcess(ctx context.Context, startID string) err
 }
 
 func (c *StreamConsumer) processMessages(ctx context.Context, messages []stream.TickMessage) error {
+	ackIDs := make(map[string][]string)
 	for _, message := range messages {
 		if err := c.service.IngestTick(ctx, message.Tick); err != nil {
 			return err
 		}
-		if err := c.ticks.Ack(ctx, message.Stream, c.config.Group, message.ID); err != nil {
+		ackIDs[message.Stream] = append(ackIDs[message.Stream], message.ID)
+	}
+	for streamName, ids := range ackIDs {
+		if err := c.ticks.Ack(ctx, streamName, c.config.Group, ids...); err != nil {
 			return err
 		}
 	}

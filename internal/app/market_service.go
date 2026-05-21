@@ -13,12 +13,15 @@ import (
 )
 
 type MarketService struct {
-	cache       cache.MarketCache
-	store       storage.HistoricalStore
-	hub         *realtime.Hub
-	engineMu    sync.Mutex
-	engine      *aggregator.Engine
-	recentLimit int
+	cache             cache.MarketCache
+	store             storage.HistoricalStore
+	hub               *realtime.Hub
+	engineMu          sync.Mutex
+	engine            *aggregator.Engine
+	liveMu            sync.Mutex
+	lastLiveWriteMS   map[string]int64
+	liveWriteInterval int64
+	recentLimit       int
 }
 
 func NewMarketService(cache cache.MarketCache, store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
@@ -26,11 +29,13 @@ func NewMarketService(cache cache.MarketCache, store storage.HistoricalStore, hu
 		recentLimit = 300
 	}
 	return &MarketService{
-		cache:       cache,
-		store:       store,
-		hub:         hub,
-		engine:      aggregator.NewEngine(frames),
-		recentLimit: recentLimit,
+		cache:             cache,
+		store:             store,
+		hub:               hub,
+		engine:            aggregator.NewEngine(frames),
+		lastLiveWriteMS:   make(map[string]int64),
+		liveWriteInterval: 250,
+		recentLimit:       recentLimit,
 	}
 }
 
@@ -74,6 +79,9 @@ func (s *MarketService) CloseDue(ctx context.Context, nowMS int64, graceMS int64
 func (s *MarketService) handleAggregationResult(ctx context.Context, result aggregator.Result) error {
 	for _, bar := range result.LiveBars {
 		barCopy := bar
+		if !s.shouldWriteLiveBar(barCopy) {
+			continue
+		}
 		if err := s.cache.SetLiveBar(ctx, barCopy); err != nil {
 			return err
 		}
@@ -104,6 +112,22 @@ func (s *MarketService) handleAggregationResult(ctx context.Context, result aggr
 		}
 	}
 	return nil
+}
+
+func (s *MarketService) shouldWriteLiveBar(bar market.Bar) bool {
+	key := strings.ToLower(bar.Exchange) + ":" + strings.ToUpper(bar.Symbol) + ":" + bar.Timeframe
+	nowMS := bar.UpdatedAtMS
+	if nowMS == 0 {
+		nowMS = market.NowMS()
+	}
+	s.liveMu.Lock()
+	defer s.liveMu.Unlock()
+	last := s.lastLiveWriteMS[key]
+	if last != 0 && nowMS-last < s.liveWriteInterval {
+		return false
+	}
+	s.lastLiveWriteMS[key] = nowMS
+	return true
 }
 
 func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string) (*market.Tick, error) {
