@@ -106,6 +106,7 @@ func (r *RedisMarketCache) PutFinalBars(ctx context.Context, bars []market.Bar, 
 		return nil
 	}
 	pipe := r.client.Pipeline()
+	trimCommands := make(map[string][]*redis.StringSliceCmd)
 	for _, bar := range bars {
 		idxKey := recentIdxKey(bar.Exchange, bar.Symbol, bar.Timeframe)
 		hashKey := recentHashKey(bar.Exchange, bar.Symbol, bar.Timeframe)
@@ -119,11 +120,35 @@ func (r *RedisMarketCache) PutFinalBars(ctx context.Context, bars []market.Bar, 
 		pipe.Expire(ctx, idxKey, 24*time.Hour)
 		pipe.Expire(ctx, hashKey, 24*time.Hour)
 		if maxKeep > 0 {
+			trimCommands[hashKey] = append(trimCommands[hashKey], pipe.ZRange(ctx, idxKey, 0, int64(-maxKeep-1)))
 			pipe.ZRemRangeByRank(ctx, idxKey, 0, int64(-maxKeep-1))
 		}
 	}
-	_, err := pipe.Exec(ctx)
-	return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+	for hashKey, commands := range trimCommands {
+		oldFields := make([]string, 0)
+		seen := map[string]bool{}
+		for _, command := range commands {
+			fields, err := command.Result()
+			if err != nil {
+				return err
+			}
+			for _, field := range fields {
+				if !seen[field] {
+					seen[field] = true
+					oldFields = append(oldFields, field)
+				}
+			}
+		}
+		if len(oldFields) > 0 {
+			if err := r.client.HDel(ctx, hashKey, oldFields...).Err(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (r *RedisMarketCache) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
