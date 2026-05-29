@@ -29,20 +29,26 @@ type Config struct {
 	Shard                 int
 }
 
-type Runner struct {
-	adapters []exchange.Adapter
-	writer   stream.TickStream
-	store    storage.HistoricalStore
-	configs  map[string]Config
-	client   *http.Client
+type TickPublisher interface {
+	PublishTick(ctx context.Context, tick market.Tick) (market.Tick, error)
 }
 
-func NewRunner(adapters []exchange.Adapter, writer stream.TickStream, store storage.HistoricalStore, configs map[string]Config) *Runner {
+type Runner struct {
+	adapters  []exchange.Adapter
+	writer    stream.TickStream
+	store     storage.HistoricalStore
+	publisher TickPublisher
+	configs   map[string]Config
+	client    *http.Client
+}
+
+func NewRunner(adapters []exchange.Adapter, writer stream.TickStream, store storage.HistoricalStore, publisher TickPublisher, configs map[string]Config) *Runner {
 	return &Runner{
-		adapters: adapters,
-		writer:   writer,
-		store:    store,
-		configs:  configs,
+		adapters:  adapters,
+		writer:    writer,
+		store:     store,
+		publisher: publisher,
+		configs:   configs,
 		client: &http.Client{
 			Timeout: 20 * time.Second,
 		},
@@ -153,6 +159,12 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 		for _, tick := range ticks {
 			if tick.RecvMS == 0 {
 				tick.RecvMS = market.NowMS()
+			}
+			if r.publisher != nil {
+				tick, err = r.publisher.PublishTick(ctx, tick)
+				if err != nil {
+					return err
+				}
 			}
 			if err := enqueueTick(ctx, tickCh, writeErrCh, tick); err != nil {
 				return err

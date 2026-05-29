@@ -40,20 +40,25 @@ func NewMarketService(cache cache.MarketCache, store storage.HistoricalStore, hu
 }
 
 func (s *MarketService) IngestTick(ctx context.Context, tick market.Tick) error {
-	tick.Exchange = strings.ToLower(strings.TrimSpace(tick.Exchange))
-	tick.Symbol = strings.ToUpper(strings.TrimSpace(tick.Symbol))
-	if tick.RecvMS == 0 {
-		tick.RecvMS = market.NowMS()
-	}
-	if tick.Source == "" {
-		tick.Source = "api"
-	}
-	if tick.EventType == "" {
-		tick.EventType = "trade"
-	}
-
-	if err := s.cache.SetLatestTick(ctx, tick); err != nil {
+	tick = normalizeTick(tick, "api")
+	tick, err := s.publishNormalizedTick(ctx, tick)
+	if err != nil {
 		return err
+	}
+	return s.aggregateNormalizedTick(ctx, tick)
+}
+
+func (s *MarketService) PublishTick(ctx context.Context, tick market.Tick) (market.Tick, error) {
+	return s.publishNormalizedTick(ctx, normalizeTick(tick, "ws"))
+}
+
+func (s *MarketService) AggregateTick(ctx context.Context, tick market.Tick) error {
+	return s.aggregateNormalizedTick(ctx, normalizeTick(tick, "stream"))
+}
+
+func (s *MarketService) publishNormalizedTick(ctx context.Context, tick market.Tick) (market.Tick, error) {
+	if err := s.cache.SetLatestTick(ctx, tick); err != nil {
+		return tick, err
 	}
 	s.hub.Publish(market.Event{
 		Type:     "ticker",
@@ -61,12 +66,30 @@ func (s *MarketService) IngestTick(ctx context.Context, tick market.Tick) error 
 		Symbol:   tick.Symbol,
 		Tick:     &tick,
 	})
+	return tick, nil
+}
 
+func (s *MarketService) aggregateNormalizedTick(ctx context.Context, tick market.Tick) error {
 	s.engineMu.Lock()
 	result := s.engine.OnTick(tick)
 	s.engineMu.Unlock()
 
 	return s.handleAggregationResult(ctx, result)
+}
+
+func normalizeTick(tick market.Tick, defaultSource string) market.Tick {
+	tick.Exchange = strings.ToLower(strings.TrimSpace(tick.Exchange))
+	tick.Symbol = strings.ToUpper(strings.TrimSpace(tick.Symbol))
+	if tick.RecvMS == 0 {
+		tick.RecvMS = market.NowMS()
+	}
+	if tick.Source == "" {
+		tick.Source = defaultSource
+	}
+	if tick.EventType == "" {
+		tick.EventType = "trade"
+	}
+	return tick
 }
 
 func (s *MarketService) CloseDue(ctx context.Context, nowMS int64, graceMS int64) error {

@@ -10,11 +10,12 @@ import (
 )
 
 type StreamConsumerConfig struct {
-	StreamName string
-	Group      string
-	Consumer   string
-	ReadCount  int64
-	Block      time.Duration
+	StreamName   string
+	Group        string
+	Consumer     string
+	ReadCount    int64
+	Block        time.Duration
+	PublishTicks bool
 }
 
 type StreamConsumer struct {
@@ -77,7 +78,13 @@ func (c *StreamConsumer) readAndProcess(ctx context.Context, startID string) err
 func (c *StreamConsumer) processMessages(ctx context.Context, messages []stream.TickMessage) error {
 	ackIDs := make(map[string][]string)
 	for _, message := range messages {
-		if err := c.service.IngestTick(ctx, message.Tick); err != nil {
+		var err error
+		if c.config.PublishTicks {
+			err = c.service.IngestTick(ctx, message.Tick)
+		} else {
+			err = c.service.AggregateTick(ctx, message.Tick)
+		}
+		if err != nil {
 			return err
 		}
 		ackIDs[message.Stream] = append(ackIDs[message.Stream], message.ID)

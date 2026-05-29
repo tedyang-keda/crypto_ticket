@@ -27,7 +27,22 @@ export const useMarketStore = create<MarketState>((set) => ({
   setExchange: (exchange) => set({ exchange, symbol: exchange === "okx" ? "BTC-USDT-SWAP" : "BTCUSDT" }),
   setSymbol: (symbol) => set({ symbol }),
   setTimeframe: (timeframe) => set({ timeframe }),
-  setLatestTick: (latestTick) => set({ latestTick }),
+  setLatestTick: (latestTick) =>
+    set((state) => {
+      if (!latestTick) return { latestTick };
+      const exchange = latestTick.exchange.toLowerCase();
+      const symbol = latestTick.symbol.toUpperCase();
+      if (exchange !== state.exchange.toLowerCase() || symbol !== state.symbol.toUpperCase()) return state;
+      if (
+        state.latestTick &&
+        state.latestTick.exchange.toLowerCase() === exchange &&
+        state.latestTick.symbol.toUpperCase() === symbol &&
+        latestTick.ts_ms < state.latestTick.ts_ms
+      ) {
+        return state;
+      }
+      return { latestTick };
+    }),
   setBars: (bars) => set({ bars }),
   updateBar: (bar) =>
     set((state) => {

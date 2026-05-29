@@ -122,11 +122,12 @@ func startBackgroundWorkers(
 			streamName := tickstream.NameForExchange(exchangeConfig.Name, exchangeConfig.Shard)
 			consumerName := cfg.RedisConsumerName + "-" + exchangeConfig.Name
 			consumer := app.NewStreamConsumer(ticks, marketService, app.StreamConsumerConfig{
-				StreamName: streamName,
-				Group:      cfg.RedisConsumerGroup,
-				Consumer:   consumerName,
-				ReadCount:  int64(cfg.StreamReadCount),
-				Block:      time.Duration(cfg.StreamBlockMS) * time.Millisecond,
+				StreamName:   streamName,
+				Group:        cfg.RedisConsumerGroup,
+				Consumer:     consumerName,
+				ReadCount:    int64(cfg.StreamReadCount),
+				Block:        time.Duration(cfg.StreamBlockMS) * time.Millisecond,
+				PublishTicks: !cfg.EnableCollector,
 			})
 			go func() {
 				if err := consumer.Run(ctx); err != nil && ctx.Err() == nil {
@@ -168,7 +169,7 @@ func startBackgroundWorkers(
 				Shard:                 exchangeConfig.Shard,
 			}
 		}
-		runner := collector.NewRunner(adapters, ticks, store, configs)
+		runner := collector.NewRunner(adapters, ticks, store, marketService, configs)
 		go func() {
 			if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
 				errCh <- err
