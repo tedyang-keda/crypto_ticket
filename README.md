@@ -62,6 +62,15 @@ MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
 DASHBOARD_DIR=./web/dist \
 HTTP_ADDR=127.0.0.1:8088 \
 go run ./cmd/marketd
+
+# Backfill recent official REST klines into bar_history and clear Redis kline cache.
+USE_MEMORY_STORE=false \
+MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
+REDIS_URL='redis://127.0.0.1:6379/0' \
+go run ./cmd/backfill_klines -exchanges=binance,okx -timeframes=1m,5m,15m,30m,1H -limit=300
+
+# Test-stage reset: clear all stored bars and all Redis kline keys first.
+go run ./cmd/backfill_klines -clear-all-bar-history -clear-all-redis-kline -limit=300
 ```
 
 The Go service can now run the exchange WebSocket collectors, write normalized

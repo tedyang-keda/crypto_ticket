@@ -139,6 +139,27 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 	return tx.Commit()
 }
 
+func (s *Store) ClearBars(ctx context.Context) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var deleted int64
+	for _, statement := range []string{`DELETE FROM bar_checkpoint`, `DELETE FROM bar_history`} {
+		result, err := tx.ExecContext(ctx, statement)
+		if err != nil {
+			return deleted, err
+		}
+		count, err := result.RowsAffected()
+		if err == nil {
+			deleted += count
+		}
+	}
+	return deleted, tx.Commit()
+}
+
 func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
 	limit := query.Limit
 	if limit <= 0 {

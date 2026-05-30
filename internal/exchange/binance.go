@@ -42,7 +42,7 @@ func (a *BinanceFuturesAdapter) WSURL() string {
 
 func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]market.SymbolInfo, error) {
 	path := "/api/v3/exchangeInfo"
-	if a.marketType == "" || a.marketType == "um_futures" {
+	if a.marketType == "" || strings.EqualFold(a.marketType, "um_futures") {
 		path = "/fapi/v1/exchangeInfo"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.restURL+path, nil)
