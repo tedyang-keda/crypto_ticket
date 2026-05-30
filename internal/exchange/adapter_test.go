@@ -1,6 +1,9 @@
 package exchange
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestBinanceParseTradeMessage(t *testing.T) {
 	adapter := NewBinanceFuturesAdapter("um_futures", "https://fapi.binance.com", "wss://example")
@@ -35,5 +38,54 @@ func TestOKXParseTradesMessage(t *testing.T) {
 	}
 	if tick.Side != "buy" || tick.TradeID != "9" {
 		t.Fatalf("unexpected side/trade id: %+v", tick)
+	}
+}
+
+func TestOKXParseSwapTradeUsesBaseContractValue(t *testing.T) {
+	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
+	adapter.replaceInstrumentSpecs(map[string]okxInstrumentSpec{
+		"BTC-USDT-SWAP": {
+			baseCcy:   "BTC",
+			quoteCcy:  "USDT",
+			settleCcy: "USDT",
+			ctVal:     0.01,
+			ctValCcy:  "BTC",
+		},
+	})
+	ticks, err := adapter.ParseMessage([]byte(`{"arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","tradeId":"9","px":"70000.5","sz":"2","side":"buy","ts":"1779340001000"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ticks) != 1 {
+		t.Fatalf("expected one tick, got %d", len(ticks))
+	}
+	assertFloatEqual(t, ticks[0].Size, 0.02)
+}
+
+func TestOKXParseSwapTradeConvertsQuoteContractValueToBase(t *testing.T) {
+	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
+	adapter.replaceInstrumentSpecs(map[string]okxInstrumentSpec{
+		"BTC-USD-SWAP": {
+			baseCcy:   "BTC",
+			quoteCcy:  "USD",
+			settleCcy: "BTC",
+			ctVal:     100,
+			ctValCcy:  "USD",
+		},
+	})
+	ticks, err := adapter.ParseMessage([]byte(`{"arg":{"channel":"trades","instId":"BTC-USD-SWAP"},"data":[{"instId":"BTC-USD-SWAP","tradeId":"10","px":"50000","sz":"3","side":"sell","ts":"1779340001000"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ticks) != 1 {
+		t.Fatalf("expected one tick, got %d", len(ticks))
+	}
+	assertFloatEqual(t, ticks[0].Size, 0.006)
+}
+
+func assertFloatEqual(t *testing.T, got float64, want float64) {
+	t.Helper()
+	if math.Abs(got-want) > 1e-12 {
+		t.Fatalf("expected %v, got %v", want, got)
 	}
 }

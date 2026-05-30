@@ -41,6 +41,7 @@ type ExchangeConfig struct {
 	Enabled               bool
 	SubscriptionChunkSize int
 	Shard                 int
+	StreamMaxLen          int64
 }
 
 func Load() Config {
@@ -92,6 +93,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true),
 			SubscriptionChunkSize: envInt("BINANCE_SUBSCRIPTION_CHUNK_SIZE", 200),
 			Shard:                 envInt("BINANCE_STREAM_SHARD", 0),
+			StreamMaxLen:          int64(envInt("BINANCE_STREAM_MAXLEN", 0)),
 		},
 		{
 			Name:                  "okx",
@@ -101,6 +103,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			Enabled:               enabled["okx"] && envBool("OKX_ENABLED", true),
 			SubscriptionChunkSize: envInt("OKX_SUBSCRIPTION_CHUNK_SIZE", 120),
 			Shard:                 envInt("OKX_STREAM_SHARD", 0),
+			StreamMaxLen:          int64(envInt("OKX_STREAM_MAXLEN", 0)),
 		},
 	}
 }

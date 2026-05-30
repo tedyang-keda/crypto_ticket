@@ -158,11 +158,15 @@ func startBackgroundWorkers(
 		adapters := makeExchangeAdapters(cfg.Exchanges)
 		configs := make(map[string]collector.Config, len(cfg.Exchanges))
 		for _, exchangeConfig := range cfg.Exchanges {
+			streamMaxLen := cfg.RedisStreamMaxLen
+			if exchangeConfig.StreamMaxLen > 0 {
+				streamMaxLen = exchangeConfig.StreamMaxLen
+			}
 			configs[exchangeConfig.Name] = collector.Config{
 				SymbolRefreshInterval: time.Duration(cfg.SymbolRefreshIntervalSeconds) * time.Second,
 				ReconnectBaseDelay:    time.Duration(cfg.ReconnectBaseDelaySeconds) * time.Second,
 				ReconnectMaxDelay:     time.Duration(cfg.ReconnectMaxDelaySeconds) * time.Second,
-				StreamMaxLen:          cfg.RedisStreamMaxLen,
+				StreamMaxLen:          streamMaxLen,
 				SubscriptionChunkSize: exchangeConfig.SubscriptionChunkSize,
 				WriteBatchSize:        cfg.StreamWriteBatchSize,
 				WriteFlushInterval:    time.Duration(cfg.StreamWriteFlushMS) * time.Millisecond,
