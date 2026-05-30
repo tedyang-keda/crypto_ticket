@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log"
 	"math"
-	"net"
 	"net/http"
 	"sort"
 	"time"
@@ -143,20 +142,9 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 			}
 			refreshAt = time.Now().Add(cfg.SymbolRefreshInterval)
 		}
-		deadline := time.Now().Add(30 * time.Second)
-		if untilRefresh := time.Until(refreshAt); untilRefresh > 0 && untilRefresh < 30*time.Second {
-			deadline = time.Now().Add(untilRefresh)
-		}
-		_ = conn.SetReadDeadline(deadline)
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			if isTimeout(err) && time.Now().Before(refreshAt) {
-				_ = conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
-				continue
-			}
-			if isTimeout(err) && !time.Now().Before(refreshAt) {
-				continue
-			}
 			return err
 		}
 		ticks, err := adapter.ParseMessage(payload)
@@ -385,11 +373,6 @@ func sendSubscriptionPayloads(conn *websocket.Conn, symbols []string, requestID 
 		requestID++
 	}
 	return requestID, nil
-}
-
-func isTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {
