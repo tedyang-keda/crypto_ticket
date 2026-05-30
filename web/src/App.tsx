@@ -1,15 +1,61 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { Activity, Database, Radio, Search, Wifi } from "lucide-react";
+import {
+  Activity,
+  Bell,
+  Brush,
+  Crosshair,
+  Lock,
+  Magnet,
+  Minus,
+  PencilRuler,
+  Ruler,
+  Search,
+  TrendingUp,
+  Type,
+  Wifi,
+} from "lucide-react";
 import { ChartPanel } from "./ChartPanel";
 import { getKlines, getLatestTicker, getSymbols } from "./api";
+import {
+  formatCompact,
+  formatLatency,
+  formatPct,
+  formatPrice,
+  formatQty,
+  formatSignedPrice,
+  formatTime,
+  formatTimeRange,
+  metricsForBar,
+  quoteAmountForBar,
+  tickLatencyMs,
+} from "./marketMetrics";
 import { useMarketSocket } from "./useMarketSocket";
 import { useMarketStore } from "./store";
+import type { Bar, SymbolInfo, Tick } from "./types";
 import "./styles.css";
 
 const queryClient = new QueryClient();
 const timeframes = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
 const exchanges = ["binance", "okx"];
+const modes = ["Candles", "Depth", "Replay"];
+const tools = [
+  ["crosshair", "Crosshair", <Crosshair size={16} />],
+  ["trend", "Trend line", <TrendingUp size={16} />],
+  ["horizontal", "Horizontal line", <Minus size={16} />],
+  ["brush", "Brush", <Brush size={16} />],
+  ["text", "Text", <Type size={16} />],
+  ["measure", "Measure", <Ruler size={16} />],
+  ["fib", "Fib retracement", <PencilRuler size={16} />],
+  ["magnet", "Magnet", <Magnet size={16} />],
+  ["lock", "Lock", <Lock size={16} />],
+] as const;
+
+type Indicators = {
+  ema: boolean;
+  volume: boolean;
+  momentum: boolean;
+};
 
 export default function App() {
   return (
@@ -31,10 +77,24 @@ function MarketTerminal() {
   const setTimeframe = useMarketStore((state) => state.setTimeframe);
   const setLatestTick = useMarketStore((state) => state.setLatestTick);
   const setBars = useMarketStore((state) => state.setBars);
+  const [mode, setMode] = useState("Candles");
+  const [activeTool, setActiveTool] = useState("crosshair");
+  const [symbolQuery, setSymbolQuery] = useState("");
+  const [selectedBar, setSelectedBar] = useState<Bar | null>(null);
+  const [recentTicks, setRecentTicks] = useState<Tick[]>([]);
+  const [indicators, setIndicators] = useState<Indicators>({ ema: true, volume: true, momentum: true });
 
   const symbolsQuery = useQuery({ queryKey: ["symbols", exchange], queryFn: () => getSymbols(exchange) });
-  const barsQuery = useQuery({ queryKey: ["klines", exchange, symbol, timeframe], queryFn: () => getKlines(exchange, symbol, timeframe), refetchInterval: 30_000 });
-  const tickerQuery = useQuery({ queryKey: ["ticker", exchange, symbol], queryFn: () => getLatestTicker(exchange, symbol), refetchInterval: 5_000 });
+  const barsQuery = useQuery({
+    queryKey: ["klines", exchange, symbol, timeframe],
+    queryFn: () => getKlines(exchange, symbol, timeframe),
+    refetchInterval: 30_000,
+  });
+  const tickerQuery = useQuery({
+    queryKey: ["ticker", exchange, symbol],
+    queryFn: () => getLatestTicker(exchange, symbol),
+    refetchInterval: 5_000,
+  });
 
   useEffect(() => {
     if (barsQuery.data) setBars(barsQuery.data);
@@ -44,117 +104,372 @@ function MarketTerminal() {
     if (tickerQuery.data) setLatestTick(tickerQuery.data);
   }, [tickerQuery.data, setLatestTick]);
 
+  useEffect(() => {
+    setSelectedBar(null);
+    setRecentTicks([]);
+  }, [exchange, symbol, timeframe]);
+
+  useEffect(() => {
+    if (!latestTick) return;
+    setRecentTicks((items) => {
+      const key = tickKey(latestTick);
+      if (items.some((item) => tickKey(item) === key)) return items;
+      return [latestTick, ...items].slice(0, 9);
+    });
+  }, [latestTick]);
+
   useMarketSocket();
 
-  const lastBar = bars[bars.length - 1];
+  const lastBar = bars[bars.length - 1] ?? null;
+  const activeBar = selectedBar ?? lastBar;
+  const activeMetrics = metricsForBar(activeBar);
+  const lastMetrics = metricsForBar(lastBar);
   const symbols = symbolsQuery.data ?? [];
-  const subtitle = useMemo(() => {
-    if (!lastBar) return "waiting for live cache";
-    return `${lastBar.is_final ? "final" : "live"} bar · ${formatTime(lastBar.start_ms)} · ${bars.length} rows`;
-  }, [bars.length, lastBar]);
+  const filteredSymbols = useMemo(() => filterSymbols(symbols, symbolQuery), [symbols, symbolQuery]);
+  const watchlist = useMemo(() => makeWatchlist(symbols, filteredSymbols, symbol), [filteredSymbols, symbol, symbols]);
+  const latency = tickLatencyMs(latestTick);
+  const latestPrice = latestTick?.price ?? lastBar?.close_price ?? null;
+
+  const changeLabel = lastMetrics ? `${formatPct(lastMetrics.changePct)} ${formatSignedPrice(lastMetrics.change)}` : "waiting for live bar";
+  const subtitle = lastBar ? `${lastBar.is_final ? "final" : "live"} bar | ${formatTime(lastBar.start_ms)} | ${bars.length} rows` : "waiting for live cache";
 
   return (
-    <main className="terminal-shell">
+    <main className="terminal">
       <header className="topbar">
-        <div>
-          <div className="eyebrow">Crypto Ticket Realtime</div>
-          <h1>{exchange.toUpperCase()} / {symbol} / {timeframe}</h1>
+        <div className="symbol-strip">
+          <div className="symbol-card">
+            <strong>{symbolDisplay(symbol)}</strong>
+            <span>{exchange.toUpperCase()}</span>
+          </div>
+          <div className="price-stack">
+            <strong className={`last-price ${lastMetrics?.direction ?? "flat"}`}>{formatPrice(latestPrice)}</strong>
+            <span className={lastMetrics?.direction ?? "flat"}>{changeLabel}</span>
+          </div>
         </div>
-        <div className={`connection ${connection}`}>
-          <Wifi size={16} />
-          {connection}
+
+        <div className="market-switchboard">
+          <SegmentedControl values={exchanges} active={exchange} onSelect={(item) => setExchange(item)} labelFormatter={(item) => item.toUpperCase()} />
+          <SegmentedControl values={timeframes} active={timeframe} onSelect={setTimeframe} />
+          <button className={`live-button ${connection === "open" ? "active" : ""}`} type="button">
+            LIVE
+          </button>
+          <SegmentedControl values={modes} active={mode} onSelect={setMode} />
+        </div>
+
+        <div className="top-actions">
+          <label className="terminal-search">
+            <Search size={15} />
+            <input value={symbolQuery} onChange={(event) => setSymbolQuery(event.target.value)} placeholder="BTCUSDT, OKX..." />
+          </label>
+          <IconButton active={indicators.ema} label="Indicators" onClick={() => setIndicators((value) => ({ ...value, ema: !value.ema }))}>
+            <Activity size={16} />
+          </IconButton>
+          <IconButton label="Alerts">
+            <Bell size={16} />
+          </IconButton>
+          <div className={`connection ${connection}`}>
+            <Wifi size={15} />
+            <span>{connection}</span>
+          </div>
         </div>
       </header>
 
-      <section className="workspace">
-        <aside className="sidebar">
-          <div className="segmented">
-            {exchanges.map((item) => (
-              <button className={item === exchange ? "active" : ""} key={item} onClick={() => setExchange(item)}>
-                {item.toUpperCase()}
-              </button>
-            ))}
-          </div>
-          <label className="search">
-            <Search size={15} />
-            <input placeholder="Filter symbols" />
-          </label>
-          <div className="symbol-list">
-            {symbols.map((item) => (
-              <button className={item.symbol === symbol ? "symbol active" : "symbol"} key={item.symbol} onClick={() => setSymbol(item.symbol)}>
-                <span className="dot" />
-                <span>
-                  <strong>{item.symbol}</strong>
-                  <small>{item.market_type || "market"} · {item.status || "live"}</small>
-                </span>
-              </button>
-            ))}
-          </div>
-        </aside>
+      <section className="terminal-workspace">
+        <nav className="drawbar" aria-label="Drawing tools">
+          {tools.map(([id, label, icon]) => (
+            <button className={id === activeTool ? "active" : ""} key={id} title={label} type="button" onClick={() => setActiveTool(id)}>
+              {icon}
+            </button>
+          ))}
+        </nav>
 
-        <section className="main-panel">
-          <div className="tool-row">
-            <div className="timeframes">
-              {timeframes.map((item) => (
-                <button className={item === timeframe ? "active" : ""} key={item} onClick={() => setTimeframe(item)}>
-                  {item}
-                </button>
-              ))}
-            </div>
-            <div className="hint">{subtitle}</div>
-          </div>
-          <ChartPanel bars={bars} />
+        <section className="chart-column">
+          <ChartReadout bar={activeBar} metrics={activeMetrics} />
+          <ChartPanel bars={bars} onSelectBar={setSelectedBar} showMovingAverages={indicators.ema} showVolume={indicators.volume} />
+          {indicators.momentum ? <MomentumStrip bars={bars} /> : <div className="indicator-strip empty" />}
         </section>
 
-        <aside className="inspector">
-          <InfoCard icon={<Radio size={17} />} title="Latest Tick" rows={[
-            ["Price", latestTick ? price(latestTick.price) : "-"],
-            ["Size", latestTick ? qty(latestTick.size) : "-"],
-            ["Side", latestTick?.side || "-"],
-            ["Time", latestTick ? formatTime(latestTick.ts_ms) : "-"],
-          ]} />
-          <InfoCard icon={<Activity size={17} />} title="Live Bar" rows={[
-            ["Open", lastBar ? price(lastBar.open_price) : "-"],
-            ["High", lastBar ? price(lastBar.high_price) : "-"],
-            ["Low", lastBar ? price(lastBar.low_price) : "-"],
-            ["Close", lastBar ? price(lastBar.close_price) : "-"],
-            ["Volume", lastBar ? qty(lastBar.volume) : "-"],
-            ["Trades", lastBar ? String(lastBar.trade_count) : "-"],
-          ]} />
-          <InfoCard icon={<Database size={17} />} title="Cache Path" rows={[
-            ["HTTP", "Redis first"],
-            ["History", "MySQL fallback"],
-            ["Live", "WebSocket"],
-            ["Limit", "300 bars"],
-          ]} />
+        <aside className="sidebar">
+          <Panel title="Watchlist" meta={`${filteredSymbols.length}/${symbols.length}`}>
+            <Watchlist items={watchlist} activeSymbol={symbol} latestTick={latestTick} onSelect={setSymbol} />
+          </Panel>
+          <Panel title="Indicators" meta="active set">
+            <IndicatorToggle label="EMA 20 / 50" active={indicators.ema} onClick={() => setIndicators((value) => ({ ...value, ema: !value.ema }))} />
+            <IndicatorToggle label="Volume" active={indicators.volume} onClick={() => setIndicators((value) => ({ ...value, volume: !value.volume }))} />
+            <IndicatorToggle label="Momentum" active={indicators.momentum} onClick={() => setIndicators((value) => ({ ...value, momentum: !value.momentum }))} />
+          </Panel>
+          <Panel title="Depth Feed" meta={mode === "Depth" ? "selected" : "standby"}>
+            <MetricRows
+              rows={[
+                ["Best bid", "-"],
+                ["Best ask", "-"],
+                ["Spread", "-"],
+                ["Status", "not wired"],
+              ]}
+            />
+          </Panel>
+          <Panel title="System Metrics" meta="live path">
+            <MetricRows
+              rows={[
+                ["Exchange", exchange.toUpperCase()],
+                ["Browser WS", connection],
+                ["Latest source", latestTick?.source || lastBar?.source || "stream"],
+                ["Rows", String(bars.length)],
+                ["Tick latency", formatLatency(latency)],
+                ["Cache limit", "300 bars"],
+              ]}
+            />
+          </Panel>
         </aside>
       </section>
+
+      <BottomDock activeBar={activeBar} metrics={activeMetrics} latestTick={latestTick} recentTicks={recentTicks} subtitle={subtitle} />
     </main>
   );
 }
 
-function InfoCard({ icon, title, rows }: { icon: React.ReactNode; title: string; rows: Array<[string, string]> }) {
+function SegmentedControl<T extends string>({
+  values,
+  active,
+  onSelect,
+  labelFormatter = (value: T) => value,
+}: {
+  values: readonly T[];
+  active: string;
+  onSelect: (value: T) => void;
+  labelFormatter?: (value: T) => string;
+}) {
   return (
-    <section className="info-card">
-      <h2>{icon}{title}</h2>
-      {rows.map(([key, value]) => (
-        <div className="kv" key={key}>
-          <span>{key}</span>
-          <strong>{value}</strong>
-        </div>
+    <div className="segmented">
+      {values.map((item) => (
+        <button className={item === active ? "active" : ""} key={item} type="button" onClick={() => onSelect(item)}>
+          {labelFormatter(item)}
+        </button>
       ))}
+    </div>
+  );
+}
+
+function IconButton({ active, label, children, onClick }: { active?: boolean; label: string; children: ReactNode; onClick?: () => void }) {
+  return (
+    <button className={active ? "icon-action active" : "icon-action"} title={label} type="button" onClick={onClick}>
+      {children}
+    </button>
+  );
+}
+
+function ChartReadout({ bar, metrics }: { bar: Bar | null; metrics: ReturnType<typeof metricsForBar> }) {
+  return (
+    <div className="chart-head">
+      <div className="ohlc">
+        <span>
+          O <strong>{formatPrice(bar?.open_price)}</strong>
+        </span>
+        <span>
+          H <strong>{formatPrice(bar?.high_price)}</strong>
+        </span>
+        <span>
+          L <strong>{formatPrice(bar?.low_price)}</strong>
+        </span>
+        <span>
+          C <strong>{formatPrice(bar?.close_price)}</strong>
+        </span>
+        <span>
+          V <strong>{formatCompact(bar?.volume)}</strong>
+        </span>
+        <span>
+          Amt <strong>{formatCompact(quoteAmountForBar(bar))}</strong>
+        </span>
+        <span>
+          T <strong>{formatCompact(bar?.trade_count)}</strong>
+        </span>
+        <span className={metrics?.direction ?? "flat"}>{metrics ? formatPct(metrics.changePct) : "-"}</span>
+      </div>
+      <div className="legend">
+        <span className="legend-pill amber">EMA 20</span>
+        <span className="legend-pill blue">EMA 50</span>
+        <span className="legend-pill green">Volume</span>
+      </div>
+    </div>
+  );
+}
+
+function MomentumStrip({ bars }: { bars: Bar[] }) {
+  const items = bars.slice(-34).map((bar) => ({
+    id: `${bar.start_ms}`,
+    value: Number(bar.close_price) - Number(bar.open_price),
+  }));
+  const max = Math.max(1, ...items.map((item) => Math.abs(item.value)));
+  return (
+    <div className="indicator-strip">
+      <div className="indicator-label">Momentum</div>
+      <div className="mini-histogram">
+        {items.map((item) => {
+          const height = Math.max(6, (Math.abs(item.value) / max) * 100);
+          const style: CSSProperties = { height: `${height}%` };
+          return <span className={item.value >= 0 ? "positive" : "negative"} key={item.id} style={style} />;
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Panel({ title, meta, children }: { title: string; meta?: string; children: ReactNode }) {
+  return (
+    <section className="terminal-panel">
+      <h2>
+        <span>{title}</span>
+        {meta ? <small>{meta}</small> : null}
+      </h2>
+      {children}
     </section>
   );
 }
 
-function price(value: number) {
-  return Number(value).toLocaleString("en-US", { maximumFractionDigits: value > 1 ? 4 : 8 });
+function Watchlist({
+  items,
+  activeSymbol,
+  latestTick,
+  onSelect,
+}: {
+  items: SymbolInfo[];
+  activeSymbol: string;
+  latestTick: Tick | null;
+  onSelect: (symbol: string) => void;
+}) {
+  if (!items.length) return <div className="empty-state">No symbols</div>;
+  return (
+    <div className="watchlist">
+      {items.map((item) => {
+        const isActive = item.symbol === activeSymbol;
+        return (
+          <button className={isActive ? "watch-row active" : "watch-row"} key={item.symbol} type="button" onClick={() => onSelect(item.symbol)}>
+            <span className={item.is_active ? "status-dot on" : "status-dot"} />
+            <span className="watch-symbol">{symbolDisplay(item.symbol)}</span>
+            <strong>{isActive && latestTick ? formatPrice(latestTick.price) : item.status || "-"}</strong>
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
-function qty(value: number) {
-  return Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
+function IndicatorToggle({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  return (
+    <button className="indicator-row" type="button" onClick={onClick}>
+      <span>{label}</span>
+      <span className={active ? "switch on" : "switch"} />
+      <strong className={active ? "positive" : ""}>{active ? "On" : "Off"}</strong>
+    </button>
+  );
 }
 
-function formatTime(ms: number) {
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(ms));
+function MetricRows({ rows }: { rows: Array<[string, string]> }) {
+  return (
+    <div className="metric-list">
+      {rows.map(([key, value]) => (
+        <div className="metric-row" key={key}>
+          <span>{key}</span>
+          <strong>{value}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BottomDock({
+  activeBar,
+  metrics,
+  latestTick,
+  recentTicks,
+  subtitle,
+}: {
+  activeBar: Bar | null;
+  metrics: ReturnType<typeof metricsForBar>;
+  latestTick: Tick | null;
+  recentTicks: Tick[];
+  subtitle: string;
+}) {
+  const collectorLatency = latestTick?.recv_ms && latestTick.ts_ms ? Math.max(0, latestTick.recv_ms - latestTick.ts_ms) : null;
+  const exchangeLatency = tickLatencyMs(latestTick);
+  return (
+    <footer className="bottom-dock">
+      <section className="dock-panel">
+        <h2>
+          Selected K-Line <small>{subtitle}</small>
+        </h2>
+        <div className="kline-stats">
+          <StatBox label="Time" value={formatTimeRange(activeBar)} />
+          <StatBox label="Range" value={metrics ? formatPrice(metrics.range) : "-"} />
+          <StatBox label="Body" value={metrics ? formatPrice(metrics.body) : "-"} />
+          <StatBox label="Signal" value={metrics?.signal ?? "-"} tone={metrics?.direction} />
+        </div>
+      </section>
+      <section className="dock-panel">
+        <h2>
+          Realtime Route <small>end-to-end</small>
+        </h2>
+        <div className="route">
+          <StatBox label="Exchange WS" value={formatLatency(exchangeLatency)} tone={latencyTone(exchangeLatency)} />
+          <StatBox label="Collector" value={formatLatency(collectorLatency)} tone={latencyTone(collectorLatency)} />
+          <StatBox label="Browser WS" value={latestTick ? "open" : "-"} tone={latestTick ? "positive" : "flat"} />
+          <StatBox label="Kline agg" value={activeBar?.source || "stream"} />
+        </div>
+      </section>
+      <section className="dock-panel">
+        <h2>
+          Tape <small>latest trades</small>
+        </h2>
+        <div className="tape">
+          {recentTicks.length ? (
+            recentTicks.slice(0, 4).map((tick) => (
+              <div className="trade-row" key={tickKey(tick)}>
+                <span>{formatTime(tick.ts_ms)}</span>
+                <strong className={tick.side === "sell" ? "negative" : "positive"}>{tick.side || "tick"}</strong>
+                <span>{formatPrice(tick.price)}</span>
+                <span>{formatQty(tick.size, 5)}</span>
+              </div>
+            ))
+          ) : (
+            <div className="empty-state">No ticks</div>
+          )}
+        </div>
+      </section>
+    </footer>
+  );
+}
+
+function StatBox({ label, value, tone }: { label: string; value: string; tone?: string }) {
+  return (
+    <div className="stat-box">
+      <span>{label}</span>
+      <strong className={tone ?? ""}>{value}</strong>
+    </div>
+  );
+}
+
+function filterSymbols(symbols: SymbolInfo[], query: string) {
+  const trimmed = query.trim().toLowerCase();
+  if (!trimmed) return symbols;
+  return symbols.filter((item) => item.symbol.toLowerCase().includes(trimmed) || item.exchange.toLowerCase().includes(trimmed));
+}
+
+function makeWatchlist(symbols: SymbolInfo[], filteredSymbols: SymbolInfo[], activeSymbol: string) {
+  const active = symbols.find((item) => item.symbol === activeSymbol);
+  const merged = active ? [active, ...filteredSymbols.filter((item) => item.symbol !== activeSymbol)] : filteredSymbols;
+  return merged.slice(0, 8);
+}
+
+function symbolDisplay(value: string) {
+  if (value.endsWith("USDT") && !value.includes("-")) return `${value}.P`;
+  return value;
+}
+
+function tickKey(tick: Tick) {
+  return tick.trade_id || `${tick.exchange}:${tick.symbol}:${tick.ts_ms}:${tick.price}:${tick.size}`;
+}
+
+function latencyTone(value: number | null | undefined) {
+  if (value === null || value === undefined || value > 60_000) return "flat";
+  return "positive";
 }
