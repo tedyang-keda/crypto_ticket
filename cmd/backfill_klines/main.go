@@ -45,6 +45,8 @@ type runOptions struct {
 	clearLive      bool
 	clearAllBars   bool
 	clearAllRedis  bool
+	refreshSymbols bool
+	continueOnErr  bool
 	dryRun         bool
 	redisScanCount int64
 }
@@ -116,7 +118,7 @@ func main() {
 	}
 
 	for _, runtime := range runtimes {
-		symbols, err := loadSymbols(ctx, store, httpClient, runtime.adapter, runtime.config.Name, options.symbols)
+		symbols, err := loadSymbols(ctx, store, httpClient, runtime.adapter, runtime.config.Name, options.symbols, options.refreshSymbols)
 		if err != nil {
 			log.Fatalf("load symbols exchange=%s: %v", runtime.config.Name, err)
 		}
@@ -166,6 +168,8 @@ func parseOptions(cfg config.Config) (runOptions, error) {
 	flag.BoolVar(&options.clearLive, "clear-livebar", true, "also clear Redis livebar keys")
 	flag.BoolVar(&options.clearAllBars, "clear-all-bar-history", false, "delete all rows from bar_history and bar_checkpoint before backfill")
 	flag.BoolVar(&options.clearAllRedis, "clear-all-redis-kline", false, "delete all Redis kline recent/live keys with wildcard SCAN")
+	flag.BoolVar(&options.refreshSymbols, "refresh-symbols", false, "fetch the exchange symbol list before backfill and use that current list")
+	flag.BoolVar(&options.continueOnErr, "continue-on-error", false, "log individual symbol/timeframe fetch errors and continue")
 	flag.BoolVar(&options.dryRun, "dry-run", false, "fetch and log only; do not write MySQL or delete Redis keys")
 	flag.Int64Var(&options.redisScanCount, "redis-scan-count", 500, "Redis SCAN count for cache cleanup")
 	flag.Parse()
@@ -256,19 +260,33 @@ func loadSymbols(
 	adapter exchange.Adapter,
 	exchangeName string,
 	filter map[string]bool,
+	refresh bool,
 ) ([]string, error) {
 	active := true
-	infos, err := store.ListSymbols(ctx, exchangeName, &active)
-	if err != nil {
-		return nil, err
-	}
-	if len(infos) == 0 {
+	var infos []market.SymbolInfo
+	if refresh {
+		var err error
 		infos, err = adapter.FetchSymbols(ctx, client)
 		if err != nil {
 			return nil, err
 		}
 		if err := store.UpsertSymbols(ctx, infos); err != nil {
 			return nil, err
+		}
+	} else {
+		var err error
+		infos, err = store.ListSymbols(ctx, exchangeName, &active)
+		if err != nil {
+			return nil, err
+		}
+		if len(infos) == 0 {
+			infos, err = adapter.FetchSymbols(ctx, client)
+			if err != nil {
+				return nil, err
+			}
+			if err := store.UpsertSymbols(ctx, infos); err != nil {
+				return nil, err
+			}
 		}
 	}
 	symbols := make([]string, 0, len(infos))
@@ -329,6 +347,10 @@ func backfillExchange(
 			if err != nil {
 				if errors.Is(err, exchange.ErrUnsupportedKlineInterval) {
 					log.Printf("skip unsupported exchange=%s symbol=%s timeframe=%s err=%v", fetcher.Name(), symbol, tf, err)
+					continue
+				}
+				if options.continueOnErr {
+					log.Printf("skip failed exchange=%s symbol=%s timeframe=%s err=%v", fetcher.Name(), symbol, tf, err)
 					continue
 				}
 				return total, err
