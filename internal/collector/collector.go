@@ -108,6 +108,9 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	if len(symbols) == 0 {
 		return errors.New("no active symbols")
 	}
+	if staticAdapter, ok := adapter.(exchange.StaticStreamAdapter); ok {
+		return r.connectStaticStreams(ctx, adapter, staticAdapter, symbols, cfg)
+	}
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, adapter.WSURL(), nil)
 	if err != nil {
@@ -133,6 +136,52 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 				return err
 			}
 			refreshAt = time.Now().Add(cfg.SymbolRefreshInterval)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		bars, err := adapter.ParseKlineMessage(payload)
+		if err != nil {
+			log.Printf("%s %s parse kline failed: %v", adapter.Name(), adapter.MarketType(), err)
+			continue
+		}
+		for _, bar := range bars {
+			if err := r.publisher.IngestKline(ctx, bar); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols []string, cfg Config) error {
+	chunks := chunkSymbols(symbols, cfg.SubscriptionChunkSize)
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, len(chunks))
+	for index, chunk := range chunks {
+		index := index
+		chunk := append([]string(nil), chunk...)
+		go func() {
+			errCh <- r.readStaticStream(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk))
+		}()
+	}
+	err := <-errCh
+	cancel()
+	return err
+}
+
+func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) error {
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	log.Printf("%s %s static kline stream connected chunk=%d symbols=%d", adapter.Name(), adapter.MarketType(), index, symbolCount)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()

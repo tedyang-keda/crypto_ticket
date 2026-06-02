@@ -99,6 +99,23 @@ func (a *BinanceFuturesAdapter) BuildUnsubscribePayload(symbols []string, reques
 	return a.buildSubscriptionPayload("UNSUBSCRIBE", symbols, requestID)
 }
 
+func (a *BinanceFuturesAdapter) StaticStreamURL(symbols []string) string {
+	streams := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		symbol = strings.ToLower(strings.TrimSpace(symbol))
+		if symbol != "" {
+			streams = append(streams, symbol+"@kline_1m")
+		}
+	}
+	base := strings.TrimRight(strings.TrimSpace(a.wsURL), "/")
+	if strings.HasSuffix(base, "/ws") {
+		base = strings.TrimSuffix(base, "/ws") + "/stream"
+	} else if !strings.HasSuffix(base, "/stream") {
+		base += "/stream"
+	}
+	return base + "?streams=" + strings.Join(streams, "/")
+}
+
 func (a *BinanceFuturesAdapter) buildSubscriptionPayload(method string, symbols []string, requestID int64) ([]byte, error) {
 	params := make([]string, 0, len(symbols))
 	for _, symbol := range symbols {

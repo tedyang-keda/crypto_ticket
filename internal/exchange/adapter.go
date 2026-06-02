@@ -18,3 +18,7 @@ type Adapter interface {
 	ParseMessage(payload []byte) ([]market.Tick, error)
 	ParseKlineMessage(payload []byte) ([]market.Bar, error)
 }
+
+type StaticStreamAdapter interface {
+	StaticStreamURL(symbols []string) string
+}
