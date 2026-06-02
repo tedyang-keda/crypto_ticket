@@ -44,6 +44,8 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 	path := "/api/v3/exchangeInfo"
 	if a.marketType == "" || strings.EqualFold(a.marketType, "um_futures") {
 		path = "/fapi/v1/exchangeInfo"
+	} else if a.marginType() == "coinmargin" {
+		path = "/dapi/v1/exchangeInfo"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.restURL+path, nil)
 	if err != nil {
@@ -103,7 +105,7 @@ func (a *BinanceFuturesAdapter) buildSubscriptionPayload(method string, symbols 
 		if symbol == "" {
 			continue
 		}
-		params = append(params, symbol+"@trade")
+		params = append(params, symbol+"@kline_1m")
 	}
 	return json.Marshal(map[string]any{
 		"method": method,
@@ -149,4 +151,101 @@ func (a *BinanceFuturesAdapter) ParseMessage(payload []byte) ([]market.Tick, err
 		Raw:       append([]byte(nil), payload...),
 	}
 	return []market.Tick{tick}, nil
+}
+
+func (a *BinanceFuturesAdapter) ParseKlineMessage(payload []byte) ([]market.Bar, error) {
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil, err
+	}
+	data := root
+	if nested, ok := root["data"].(map[string]any); ok {
+		data = nested
+	}
+	if strings.ToLower(stringValue(data["e"])) != "kline" {
+		return nil, nil
+	}
+	kline, ok := data["k"].(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	symbol := strings.ToUpper(stringValue(firstNonEmpty(kline["s"], data["s"])))
+	startMS := intValue(kline["t"])
+	endMS := intValue(kline["T"])
+	open := floatValue(kline["o"])
+	high := floatValue(kline["h"])
+	low := floatValue(kline["l"])
+	closePrice := floatValue(kline["c"])
+	if symbol == "" || startMS <= 0 || endMS <= 0 || open <= 0 || high <= 0 || low <= 0 || closePrice <= 0 {
+		return nil, nil
+	}
+	marginType := a.marginType()
+	base, quote := binanceSymbolCurrencies(symbol, marginType)
+	volume := floatValue(kline["v"])
+	quoteVolume := floatValue(kline["q"])
+	volumeUnit := base
+	quoteUnit := quote
+	contractVolume := float64(0)
+	if marginType == "coinmargin" {
+		contractVolume = volume
+		volumeUnit = "contract"
+		quoteUnit = base
+	}
+	isFinal := false
+	if closed, ok := kline["x"].(bool); ok {
+		isFinal = closed
+	}
+	now := market.NowMS()
+	reason := "update"
+	if isFinal {
+		reason = "final"
+	}
+	bar := market.Bar{
+		Exchange:       a.Name(),
+		Symbol:         symbol,
+		MarginType:     marginType,
+		Timeframe:      "1m",
+		StartMS:        startMS,
+		EndMS:          endMS,
+		OpenPrice:      open,
+		HighPrice:      high,
+		LowPrice:       low,
+		ClosePrice:     closePrice,
+		Volume:         volume,
+		VolumeUnit:     volumeUnit,
+		QuoteVolume:    quoteVolume,
+		QuoteUnit:      quoteUnit,
+		ContractVolume: contractVolume,
+		TradeCount:     intValue(kline["n"]),
+		LastTickMS:     intValue(firstNonEmpty(data["E"], endMS)),
+		IsFinal:        isFinal,
+		Source:         "exchange_kline",
+		Reason:         reason,
+		UpdatedAtMS:    now,
+	}
+	return []market.Bar{market.DecorateBar(bar)}, nil
+}
+
+func (a *BinanceFuturesAdapter) marginType() string {
+	value := strings.ToLower(strings.TrimSpace(a.marketType))
+	if value == "coin_futures" || value == "coin_margined" || value == "coinmargin" || value == "coin-m" || value == "cm_futures" {
+		return "coinmargin"
+	}
+	return "umargin"
+}
+
+func binanceSymbolCurrencies(symbol string, marginType string) (string, string) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if marginType == "coinmargin" {
+		if index := strings.Index(symbol, "USD"); index > 0 {
+			return symbol[:index], "USD"
+		}
+		return symbol, "USD"
+	}
+	for _, quote := range []string{"USDT", "USDC", "BUSD", "FDUSD", "USD"} {
+		if strings.HasSuffix(symbol, quote) && len(symbol) > len(quote) {
+			return strings.TrimSuffix(symbol, quote), quote
+		}
+	}
+	return symbol, ""
 }

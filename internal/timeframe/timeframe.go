@@ -126,6 +126,15 @@ func EndMS(startMS int64, tf string) int64 {
 	return NextStartMS(startMS, tf) - 1
 }
 
+func DurationMS(tf string) int64 {
+	tf = MustNormalize(tf)
+	if minutes, ok := fixedMinuteFrames[tf]; ok {
+		return minutes * MinuteMS
+	}
+	start := FloorStartMS(time.Now().UnixMilli(), tf)
+	return NextStartMS(start, tf) - start
+}
+
 func weekdayOffset(dt time.Time) int {
 	weekday := int(dt.Weekday())
 	if weekday == 0 {

@@ -59,7 +59,7 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 	starts = starts[len(starts)-limit:]
 	bars := make([]market.Bar, 0, len(starts))
 	for _, start := range starts {
-		bars = append(bars, rows[start])
+		bars = append(bars, market.DecorateBar(rows[start]))
 	}
 	return bars, nil
 }
@@ -83,7 +83,7 @@ func (m *MemoryHistoricalStore) BarsInRange(_ context.Context, exchange string, 
 	for _, start := range starts {
 		bar := rows[start]
 		if bar.IsFinal {
-			bars = append(bars, bar)
+			bars = append(bars, market.DecorateBar(bar))
 		}
 	}
 	return bars, nil

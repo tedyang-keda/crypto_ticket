@@ -16,4 +16,5 @@ type Adapter interface {
 	BuildSubscribePayload(symbols []string, requestID int64) ([]byte, error)
 	BuildUnsubscribePayload(symbols []string, requestID int64) ([]byte, error)
 	ParseMessage(payload []byte) ([]market.Tick, error)
+	ParseKlineMessage(payload []byte) ([]market.Bar, error)
 }

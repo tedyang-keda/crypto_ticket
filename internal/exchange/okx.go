@@ -138,7 +138,7 @@ func (a *OKXAdapter) buildSubscriptionPayload(op string, symbols []string, reque
 		if symbol == "" {
 			continue
 		}
-		args = append(args, map[string]string{"channel": "trades", "instId": symbol})
+		args = append(args, map[string]string{"channel": "candle1m", "instId": symbol})
 	}
 	return json.Marshal(map[string]any{
 		"op":   op,
@@ -195,6 +195,95 @@ func (a *OKXAdapter) ParseMessage(payload []byte) ([]market.Tick, error) {
 	return ticks, nil
 }
 
+func (a *OKXAdapter) ParseKlineMessage(payload []byte) ([]market.Bar, error) {
+	var data struct {
+		Event string `json:"event"`
+		Arg   struct {
+			Channel string `json:"channel"`
+			InstID  string `json:"instId"`
+		} `json:"arg"`
+		Data [][]string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return nil, err
+	}
+	channel := strings.ToLower(strings.TrimSpace(data.Arg.Channel))
+	if data.Event != "" || !strings.HasPrefix(channel, "candle") {
+		return nil, nil
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(data.Arg.InstID))
+	if symbol == "" {
+		return nil, nil
+	}
+	base, quote := inferOKXSymbolCurrencies(symbol)
+	spec, ok := a.instrumentSpec(symbol)
+	if ok {
+		if spec.baseCcy != "" {
+			base = spec.baseCcy
+		}
+		if spec.quoteCcy != "" {
+			quote = spec.quoteCcy
+		}
+	}
+	marginType := okxMarginType(symbol, spec)
+	now := market.NowMS()
+	bars := make([]market.Bar, 0, len(data.Data))
+	for _, row := range data.Data {
+		if len(row) < 9 {
+			continue
+		}
+		startMS := parseInt(row[0])
+		open := parseFloat(row[1])
+		high := parseFloat(row[2])
+		low := parseFloat(row[3])
+		closePrice := parseFloat(row[4])
+		if startMS <= 0 || open <= 0 || high <= 0 || low <= 0 || closePrice <= 0 {
+			continue
+		}
+		contractVolume := parseFloat(row[5])
+		volumeBase := parseFloat(row[6])
+		quoteVolume := parseFloat(row[7])
+		volume := volumeBase
+		volumeUnit := base
+		quoteUnit := quote
+		if marginType == "coinmargin" {
+			volume = contractVolume
+			volumeUnit = "contract"
+			quoteVolume = volumeBase
+			quoteUnit = base
+		}
+		isFinal := strings.TrimSpace(row[8]) == "1"
+		reason := "update"
+		if isFinal {
+			reason = "final"
+		}
+		bar := market.Bar{
+			Exchange:       a.Name(),
+			Symbol:         symbol,
+			MarginType:     marginType,
+			Timeframe:      "1m",
+			StartMS:        startMS,
+			EndMS:          startMS + 60_000 - 1,
+			OpenPrice:      open,
+			HighPrice:      high,
+			LowPrice:       low,
+			ClosePrice:     closePrice,
+			Volume:         volume,
+			VolumeUnit:     volumeUnit,
+			QuoteVolume:    quoteVolume,
+			QuoteUnit:      quoteUnit,
+			ContractVolume: contractVolume,
+			LastTickMS:     startMS + 60_000 - 1,
+			IsFinal:        isFinal,
+			Source:         "exchange_kline",
+			Reason:         reason,
+			UpdatedAtMS:    now,
+		}
+		bars = append(bars, market.DecorateBar(bar))
+	}
+	return bars, nil
+}
+
 func (a *OKXAdapter) replaceInstrumentSpecs(specs map[string]okxInstrumentSpec) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -237,4 +326,28 @@ func inferOKXSymbolCurrencies(symbol string) (string, string) {
 		return "", ""
 	}
 	return parts[0], parts[1]
+}
+
+func okxMarginType(symbol string, spec okxInstrumentSpec) string {
+	base, quote := inferOKXSymbolCurrencies(symbol)
+	if spec.baseCcy != "" {
+		base = spec.baseCcy
+	}
+	if spec.quoteCcy != "" {
+		quote = spec.quoteCcy
+	}
+	settle := spec.settleCcy
+	if settle == "" {
+		parts := strings.Split(strings.ToUpper(strings.TrimSpace(symbol)), "-")
+		if len(parts) >= 2 {
+			settle = parts[1]
+		}
+	}
+	if quote == "USDT" || quote == "USDC" || settle == "USDT" || settle == "USDC" {
+		return "umargin"
+	}
+	if quote == "USD" || settle == base {
+		return "coinmargin"
+	}
+	return "umargin"
 }

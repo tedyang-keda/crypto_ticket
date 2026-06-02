@@ -23,6 +23,36 @@ func TestBinanceParseTradeMessage(t *testing.T) {
 	}
 }
 
+func TestBinanceParseUMarginKlineMessage(t *testing.T) {
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://fapi.binance.com", "wss://example")
+	bars, err := adapter.ParseKlineMessage([]byte(`{"e":"kline","E":1779340060000,"s":"BTCUSDT","k":{"t":1779340000000,"T":1779340059999,"s":"BTCUSDT","i":"1m","o":"100","c":"105","h":"110","l":"95","v":"2.5","n":12,"x":true,"q":"260","V":"1","Q":"100"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar, got %d", len(bars))
+	}
+	bar := bars[0]
+	if bar.MarginType != "umargin" || bar.Volume != 2.5 || bar.VolumeUnit != "BTC" || bar.QuoteVolume != 260 || bar.QuoteUnit != "USDT" || !bar.IsFinal {
+		t.Fatalf("unexpected bar: %+v", bar)
+	}
+}
+
+func TestBinanceParseCoinMarginKlineMessage(t *testing.T) {
+	adapter := NewBinanceFuturesAdapter("coin_futures", "https://dapi.binance.com", "wss://example")
+	bars, err := adapter.ParseKlineMessage([]byte(`{"e":"kline","E":1779340060000,"s":"BTCUSD_PERP","k":{"t":1779340000000,"T":1779340059999,"s":"BTCUSD_PERP","i":"1m","o":"100","c":"105","h":"110","l":"95","v":"25","n":12,"x":true,"q":"0.5"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar, got %d", len(bars))
+	}
+	bar := bars[0]
+	if bar.MarginType != "coinmargin" || bar.Volume != 25 || bar.VolumeUnit != "contract" || bar.ContractVolume != 25 || bar.QuoteVolume != 0.5 || bar.QuoteUnit != "BTC" {
+		t.Fatalf("unexpected bar: %+v", bar)
+	}
+}
+
 func TestOKXParseTradesMessage(t *testing.T) {
 	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
 	ticks, err := adapter.ParseMessage([]byte(`{"arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","tradeId":"9","px":"70000.5","sz":"2","side":"buy","ts":"1779340001000"}]}`))
@@ -38,6 +68,42 @@ func TestOKXParseTradesMessage(t *testing.T) {
 	}
 	if tick.Side != "buy" || tick.TradeID != "9" {
 		t.Fatalf("unexpected side/trade id: %+v", tick)
+	}
+}
+
+func TestOKXParseUMarginCandleMessage(t *testing.T) {
+	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
+	adapter.replaceInstrumentSpecs(map[string]okxInstrumentSpec{
+		"BTC-USDT-SWAP": {baseCcy: "BTC", quoteCcy: "USDT", settleCcy: "USDT"},
+	})
+	bars, err := adapter.ParseKlineMessage([]byte(`{"arg":{"channel":"candle1m","instId":"BTC-USDT-SWAP"},"data":[["1779340000000","100","110","95","105","25","0.25","26000","1"]]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar, got %d", len(bars))
+	}
+	bar := bars[0]
+	if bar.MarginType != "umargin" || bar.Volume != 0.25 || bar.VolumeUnit != "BTC" || bar.QuoteVolume != 26000 || bar.QuoteUnit != "USDT" || bar.ContractVolume != 25 {
+		t.Fatalf("unexpected bar: %+v", bar)
+	}
+}
+
+func TestOKXParseCoinMarginCandleMessage(t *testing.T) {
+	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
+	adapter.replaceInstrumentSpecs(map[string]okxInstrumentSpec{
+		"BTC-USD-SWAP": {baseCcy: "BTC", quoteCcy: "USD", settleCcy: "BTC"},
+	})
+	bars, err := adapter.ParseKlineMessage([]byte(`{"arg":{"channel":"candle1m","instId":"BTC-USD-SWAP"},"data":[["1779340000000","100","110","95","105","25","0.5","25000","1"]]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one bar, got %d", len(bars))
+	}
+	bar := bars[0]
+	if bar.MarginType != "coinmargin" || bar.Volume != 25 || bar.VolumeUnit != "contract" || bar.QuoteVolume != 0.5 || bar.QuoteUnit != "BTC" || bar.ContractVolume != 25 {
+		t.Fatalf("unexpected bar: %+v", bar)
 	}
 }
 

@@ -51,6 +51,8 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 	path := "/api/v3/klines"
 	if a.marketType == "" || strings.EqualFold(a.marketType, "um_futures") {
 		path = "/fapi/v1/klines"
+	} else if a.marginType() == "coinmargin" {
+		path = "/dapi/v1/klines"
 	}
 
 	var all []market.Bar
@@ -142,6 +144,8 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 	}
 	now := market.NowMS()
 	bars := make([]market.Bar, 0, len(rows))
+	marginType := a.marginType()
+	base, quote := binanceSymbolCurrencies(symbol, marginType)
 	for _, row := range rows {
 		if len(row) < 9 {
 			continue
@@ -151,27 +155,41 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 		if startMS <= 0 || closeMS <= 0 || closeMS >= now {
 			continue
 		}
+		volume := floatValue(row[5])
+		quoteVolume := floatValue(row[7])
+		volumeUnit := base
+		quoteUnit := quote
+		contractVolume := float64(0)
+		if marginType == "coinmargin" {
+			contractVolume = volume
+			volumeUnit = "contract"
+			quoteUnit = base
+		}
 		bar := market.Bar{
-			Exchange:    a.Name(),
-			Symbol:      symbol,
-			Timeframe:   tf,
-			StartMS:     startMS,
-			EndMS:       closeMS,
-			OpenPrice:   floatValue(row[1]),
-			HighPrice:   floatValue(row[2]),
-			LowPrice:    floatValue(row[3]),
-			ClosePrice:  floatValue(row[4]),
-			Volume:      floatValue(row[5]),
-			QuoteVolume: floatValue(row[7]),
-			TradeCount:  intValue(row[8]),
-			LastTickMS:  closeMS,
-			IsFinal:     true,
-			Source:      "rest",
-			Reason:      "exchange_kline_backfill",
-			UpdatedAtMS: now,
+			Exchange:       a.Name(),
+			Symbol:         symbol,
+			MarginType:     marginType,
+			Timeframe:      tf,
+			StartMS:        startMS,
+			EndMS:          closeMS,
+			OpenPrice:      floatValue(row[1]),
+			HighPrice:      floatValue(row[2]),
+			LowPrice:       floatValue(row[3]),
+			ClosePrice:     floatValue(row[4]),
+			Volume:         volume,
+			VolumeUnit:     volumeUnit,
+			QuoteVolume:    quoteVolume,
+			QuoteUnit:      quoteUnit,
+			ContractVolume: contractVolume,
+			TradeCount:     intValue(row[8]),
+			LastTickMS:     closeMS,
+			IsFinal:        true,
+			Source:         "rest",
+			Reason:         "exchange_kline_backfill",
+			UpdatedAtMS:    now,
 		}
 		if validOHLC(bar) {
-			bars = append(bars, bar)
+			bars = append(bars, market.DecorateBar(bar))
 		}
 	}
 	return bars, nil
@@ -298,6 +316,17 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 	}
 	now := market.NowMS()
 	bars := make([]market.Bar, 0, len(payload.Data))
+	base, quote := inferOKXSymbolCurrencies(symbol)
+	spec, ok := a.instrumentSpec(symbol)
+	if ok {
+		if spec.baseCcy != "" {
+			base = spec.baseCcy
+		}
+		if spec.quoteCcy != "" {
+			quote = spec.quoteCcy
+		}
+	}
+	marginType := okxMarginType(symbol, spec)
 	for _, row := range payload.Data {
 		if len(row) < 9 || row[8] != "1" {
 			continue
@@ -307,27 +336,42 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 		if startMS <= 0 || endMS >= now {
 			continue
 		}
+		contractVolume := parseFloat(row[5])
+		volume := parseFloat(row[6])
+		quoteVolume := parseFloat(row[7])
+		volumeUnit := base
+		quoteUnit := quote
+		if marginType == "coinmargin" {
+			volume = contractVolume
+			volumeUnit = "contract"
+			quoteVolume = parseFloat(row[6])
+			quoteUnit = base
+		}
 		bar := market.Bar{
-			Exchange:    a.Name(),
-			Symbol:      symbol,
-			Timeframe:   tf,
-			StartMS:     startMS,
-			EndMS:       endMS,
-			OpenPrice:   parseFloat(row[1]),
-			HighPrice:   parseFloat(row[2]),
-			LowPrice:    parseFloat(row[3]),
-			ClosePrice:  parseFloat(row[4]),
-			Volume:      parseFloat(row[6]),
-			QuoteVolume: parseFloat(row[7]),
-			TradeCount:  0,
-			LastTickMS:  endMS,
-			IsFinal:     true,
-			Source:      "rest",
-			Reason:      "exchange_kline_backfill",
-			UpdatedAtMS: now,
+			Exchange:       a.Name(),
+			Symbol:         symbol,
+			MarginType:     marginType,
+			Timeframe:      tf,
+			StartMS:        startMS,
+			EndMS:          endMS,
+			OpenPrice:      parseFloat(row[1]),
+			HighPrice:      parseFloat(row[2]),
+			LowPrice:       parseFloat(row[3]),
+			ClosePrice:     parseFloat(row[4]),
+			Volume:         volume,
+			VolumeUnit:     volumeUnit,
+			QuoteVolume:    quoteVolume,
+			QuoteUnit:      quoteUnit,
+			ContractVolume: contractVolume,
+			TradeCount:     0,
+			LastTickMS:     endMS,
+			IsFinal:        true,
+			Source:         "rest",
+			Reason:         "exchange_kline_backfill",
+			UpdatedAtMS:    now,
 		}
 		if validOHLC(bar) {
-			bars = append(bars, bar)
+			bars = append(bars, market.DecorateBar(bar))
 		}
 	}
 	sortBars(bars)

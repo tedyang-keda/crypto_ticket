@@ -18,15 +18,6 @@ type Config struct {
 	DashboardDir                 string
 	EnableMockSymbols            bool
 	EnableCollector              bool
-	EnableStreamConsumer         bool
-	RedisStreamMaxLen            int64
-	RedisConsumerGroup           string
-	RedisConsumerName            string
-	StreamReadCount              int
-	StreamBlockMS                int
-	StreamWriteBatchSize         int
-	StreamWriteFlushMS           int
-	BarCloseGraceSeconds         int
 	SymbolRefreshIntervalSeconds int
 	ReconnectBaseDelaySeconds    int
 	ReconnectMaxDelaySeconds     int
@@ -40,8 +31,6 @@ type ExchangeConfig struct {
 	WSURL                 string
 	Enabled               bool
 	SubscriptionChunkSize int
-	Shard                 int
-	StreamMaxLen          int64
 }
 
 func Load() Config {
@@ -54,27 +43,17 @@ func Load() Config {
 		}
 		outFrames = append(outFrames, timeframe.MustNormalize(frame))
 	}
-	useMemory := envBool("USE_MEMORY_STORE", true)
 	enableCollector := envBool("ENABLE_COLLECTOR", false)
 	return Config{
 		HTTPAddr:                     env("HTTP_ADDR", "127.0.0.1:8088"),
 		RedisURL:                     env("REDIS_URL", "redis://127.0.0.1:6379/0"),
 		MySQLDSN:                     env("MYSQL_DSN", mysqlDSNFromEnv()),
-		UseMemory:                    useMemory,
+		UseMemory:                    envBool("USE_MEMORY_STORE", true),
 		RecentCacheLimit:             envInt("RECENT_CACHE_LIMIT", 300),
 		Timeframes:                   outFrames,
 		DashboardDir:                 env("DASHBOARD_DIR", "./web/dist"),
 		EnableMockSymbols:            envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
 		EnableCollector:              enableCollector,
-		EnableStreamConsumer:         envBool("ENABLE_STREAM_CONSUMER", !useMemory),
-		RedisStreamMaxLen:            int64(envInt("REDIS_STREAM_MAXLEN", 200_000)),
-		RedisConsumerGroup:           env("REDIS_CONSUMER_GROUP", "crypto_ticket"),
-		RedisConsumerName:            env("REDIS_CONSUMER_NAME", "marketd-1"),
-		StreamReadCount:              envInt("STREAM_READ_COUNT", 200),
-		StreamBlockMS:                envInt("STREAM_BLOCK_MS", 1000),
-		StreamWriteBatchSize:         envInt("STREAM_WRITE_BATCH_SIZE", 500),
-		StreamWriteFlushMS:           envInt("STREAM_WRITE_FLUSH_MS", 50),
-		BarCloseGraceSeconds:         envInt("BAR_CLOSE_GRACE_SECONDS", 2),
 		SymbolRefreshIntervalSeconds: envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
 		ReconnectBaseDelaySeconds:    envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
 		ReconnectMaxDelaySeconds:     envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
@@ -90,10 +69,16 @@ func loadExchangeConfigs() []ExchangeConfig {
 			MarketType:            env("BINANCE_KIND", "um_futures"),
 			RestURL:               env("BINANCE_REST_URL", "https://fapi.binance.com"),
 			WSURL:                 env("BINANCE_WS_URL", "wss://fstream.binance.com/ws"),
-			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true),
+			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_UM_ENABLED", true),
 			SubscriptionChunkSize: envInt("BINANCE_SUBSCRIPTION_CHUNK_SIZE", 200),
-			Shard:                 envInt("BINANCE_STREAM_SHARD", 0),
-			StreamMaxLen:          int64(envInt("BINANCE_STREAM_MAXLEN", 0)),
+		},
+		{
+			Name:                  "binance",
+			MarketType:            env("BINANCE_COIN_KIND", "coin_futures"),
+			RestURL:               env("BINANCE_COIN_REST_URL", "https://dapi.binance.com"),
+			WSURL:                 env("BINANCE_COIN_WS_URL", "wss://dstream.binance.com/ws"),
+			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_COIN_ENABLED", true),
+			SubscriptionChunkSize: envInt("BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE", 200),
 		},
 		{
 			Name:                  "okx",
@@ -102,8 +87,6 @@ func loadExchangeConfigs() []ExchangeConfig {
 			WSURL:                 env("OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/public"),
 			Enabled:               enabled["okx"] && envBool("OKX_ENABLED", true),
 			SubscriptionChunkSize: envInt("OKX_SUBSCRIPTION_CHUNK_SIZE", 120),
-			Shard:                 envInt("OKX_STREAM_SHARD", 0),
-			StreamMaxLen:          int64(envInt("OKX_STREAM_MAXLEN", 0)),
 		},
 	}
 }

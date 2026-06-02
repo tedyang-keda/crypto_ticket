@@ -42,7 +42,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/ticker/latest", s.latestTicker)
 	mux.HandleFunc("GET /api/v1/klines", s.klines)
 	mux.HandleFunc("GET /api/v1/symbols", s.symbols)
-	mux.HandleFunc("POST /api/v1/ingest/tick", s.ingestTick)
 	mux.HandleFunc("GET /api/v1/ws", s.websocket)
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -133,20 +132,6 @@ func (s *Server) symbols(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"exchange": exchange, "symbols": symbols})
-}
-
-func (s *Server) ingestTick(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	var tick market.Tick
-	if err := json.NewDecoder(r.Body).Decode(&tick); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.market.IngestTick(r.Context(), tick); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }
 
 func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {

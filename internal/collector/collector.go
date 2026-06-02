@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -14,40 +15,36 @@ import (
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/storage"
-	"crypto-ticket/internal/stream"
 )
 
 type Config struct {
 	SymbolRefreshInterval time.Duration
 	ReconnectBaseDelay    time.Duration
 	ReconnectMaxDelay     time.Duration
-	StreamMaxLen          int64
 	SubscriptionChunkSize int
-	WriteBatchSize        int
-	WriteFlushInterval    time.Duration
-	Shard                 int
 }
 
-type TickPublisher interface {
-	PublishTick(ctx context.Context, tick market.Tick) (market.Tick, error)
+type KlinePublisher interface {
+	IngestKline(ctx context.Context, bar market.Bar) error
+}
+
+type Runtime struct {
+	Adapter exchange.Adapter
+	Config  Config
 }
 
 type Runner struct {
-	adapters  []exchange.Adapter
-	writer    stream.TickStream
+	runtimes  []Runtime
 	store     storage.HistoricalStore
-	publisher TickPublisher
-	configs   map[string]Config
+	publisher KlinePublisher
 	client    *http.Client
 }
 
-func NewRunner(adapters []exchange.Adapter, writer stream.TickStream, store storage.HistoricalStore, publisher TickPublisher, configs map[string]Config) *Runner {
+func NewRunner(runtimes []Runtime, store storage.HistoricalStore, publisher KlinePublisher) *Runner {
 	return &Runner{
-		adapters:  adapters,
-		writer:    writer,
+		runtimes:  runtimes,
 		store:     store,
 		publisher: publisher,
-		configs:   configs,
 		client: &http.Client{
 			Timeout: 20 * time.Second,
 		},
@@ -55,14 +52,14 @@ func NewRunner(adapters []exchange.Adapter, writer stream.TickStream, store stor
 }
 
 func (r *Runner) Run(ctx context.Context) error {
-	errCh := make(chan error, len(r.adapters))
-	for _, adapter := range r.adapters {
-		adapter := adapter
+	errCh := make(chan error, len(r.runtimes))
+	for _, runtime := range r.runtimes {
+		runtime := runtime
 		go func() {
-			errCh <- r.runExchange(ctx, adapter)
+			errCh <- r.runExchange(ctx, runtime)
 		}()
 	}
-	for range r.adapters {
+	for range r.runtimes {
 		err := <-errCh
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
@@ -71,20 +68,26 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) runExchange(ctx context.Context, adapter exchange.Adapter) error {
-	cfg := r.configFor(adapter.Name())
+func (r *Runner) runExchange(ctx context.Context, runtime Runtime) error {
+	cfg := runtime.Config
+	if cfg.ReconnectBaseDelay <= 0 {
+		cfg.ReconnectBaseDelay = time.Second
+	}
+	if cfg.ReconnectMaxDelay <= 0 {
+		cfg.ReconnectMaxDelay = 60 * time.Second
+	}
 	backoff := cfg.ReconnectBaseDelay
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := r.connectOnce(ctx, adapter, cfg)
+		err := r.connectOnce(ctx, runtime.Adapter, cfg)
 		if err == nil {
 			backoff = cfg.ReconnectBaseDelay
 			continue
 		}
 		if ctx.Err() == nil {
-			log.Printf("%s collector reconnect after error: %v", adapter.Name(), err)
+			log.Printf("%s %s collector reconnect after error: %v", runtime.Adapter.Name(), runtime.Adapter.MarketType(), err)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -117,25 +120,14 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	if err != nil {
 		return err
 	}
-	log.Printf("%s collector connected symbols=%d stream=%s", adapter.Name(), len(symbols), stream.NameForExchange(adapter.Name(), cfg.Shard))
-
-	writerCtx, cancelWriter := context.WithCancel(ctx)
-	defer cancelWriter()
-	tickCh := make(chan market.Tick, 50_000)
-	writeErrCh := make(chan error, 1)
-	go r.writeTicks(writerCtx, stream.NameForExchange(adapter.Name(), cfg.Shard), cfg, tickCh, writeErrCh)
+	log.Printf("%s %s kline collector connected symbols=%d", adapter.Name(), adapter.MarketType(), len(symbols))
 
 	refreshAt := time.Now().Add(cfg.SymbolRefreshInterval)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		select {
-		case err := <-writeErrCh:
-			return err
-		default:
-		}
-		if !time.Now().Before(refreshAt) {
+		if cfg.SymbolRefreshInterval > 0 && !time.Now().Before(refreshAt) {
 			symbols, requestID, err = r.refreshConnectionSubscriptions(ctx, conn, adapter, symbols, requestID, cfg)
 			if err != nil {
 				return err
@@ -147,22 +139,13 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 		if err != nil {
 			return err
 		}
-		ticks, err := adapter.ParseMessage(payload)
+		bars, err := adapter.ParseKlineMessage(payload)
 		if err != nil {
-			log.Printf("%s parse message failed: %v", adapter.Name(), err)
+			log.Printf("%s %s parse kline failed: %v", adapter.Name(), adapter.MarketType(), err)
 			continue
 		}
-		for _, tick := range ticks {
-			if tick.RecvMS == 0 {
-				tick.RecvMS = market.NowMS()
-			}
-			if r.publisher != nil {
-				tick, err = r.publisher.PublishTick(ctx, tick)
-				if err != nil {
-					return err
-				}
-			}
-			if err := enqueueTick(ctx, tickCh, writeErrCh, tick); err != nil {
+		for _, bar := range bars {
+			if err := r.publisher.IngestKline(ctx, bar); err != nil {
 				return err
 			}
 		}
@@ -189,66 +172,9 @@ func (r *Runner) refreshConnectionSubscriptions(
 		return current, requestID, err
 	}
 	if subscribed > 0 || unsubscribed > 0 {
-		log.Printf("%s subscriptions refreshed active=%d subscribe=%d unsubscribe=%d", adapter.Name(), len(next), subscribed, unsubscribed)
+		log.Printf("%s %s subscriptions refreshed active=%d subscribe=%d unsubscribe=%d", adapter.Name(), adapter.MarketType(), len(next), subscribed, unsubscribed)
 	}
 	return next, requestID, nil
-}
-
-func (r *Runner) writeTicks(ctx context.Context, streamName string, cfg Config, ticks <-chan market.Tick, errCh chan<- error) {
-	batchSize := cfg.WriteBatchSize
-	if batchSize <= 0 {
-		batchSize = 500
-	}
-	flushInterval := cfg.WriteFlushInterval
-	if flushInterval <= 0 {
-		flushInterval = 50 * time.Millisecond
-	}
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
-	batch := make([]market.Tick, 0, batchSize)
-
-	flush := func() bool {
-		if len(batch) == 0 {
-			return true
-		}
-		if _, err := r.writer.AddTicks(ctx, streamName, batch, cfg.StreamMaxLen); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
-			return false
-		}
-		batch = batch[:0]
-		return true
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
-			return
-		case tick := <-ticks:
-			batch = append(batch, tick)
-			if len(batch) >= batchSize && !flush() {
-				return
-			}
-		case <-ticker.C:
-			if !flush() {
-				return
-			}
-		}
-	}
-}
-
-func enqueueTick(ctx context.Context, tickCh chan<- market.Tick, errCh <-chan error, tick market.Tick) error {
-	select {
-	case tickCh <- tick:
-		return nil
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) ([]string, error) {
@@ -267,103 +193,12 @@ func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) (
 			active = append(active, symbol.Symbol)
 		}
 	}
-	sort.Strings(active)
-	log.Printf("%s symbol refresh active=%d total=%d", adapter.Name(), len(active), len(symbols))
 	return active, nil
 }
 
-func (r *Runner) configFor(exchangeName string) Config {
-	cfg := r.configs[exchangeName]
-	if cfg.SymbolRefreshInterval <= 0 {
-		cfg.SymbolRefreshInterval = 2 * time.Minute
-	}
-	if cfg.ReconnectBaseDelay <= 0 {
-		cfg.ReconnectBaseDelay = time.Second
-	}
-	if cfg.ReconnectMaxDelay <= 0 {
-		cfg.ReconnectMaxDelay = time.Minute
-	}
-	if cfg.SubscriptionChunkSize <= 0 {
-		cfg.SubscriptionChunkSize = 100
-	}
-	if cfg.WriteBatchSize <= 0 {
-		cfg.WriteBatchSize = 500
-	}
-	if cfg.WriteFlushInterval <= 0 {
-		cfg.WriteFlushInterval = 50 * time.Millisecond
-	}
-	return cfg
-}
-
-func syncSubscriptions(
-	conn *websocket.Conn,
-	adapter exchange.Adapter,
-	current []string,
-	next []string,
-	requestID int64,
-	chunkSize int,
-) (int64, int, int, error) {
-	subscribe, unsubscribe := diffSymbols(current, next)
-	var err error
-	if len(unsubscribe) > 0 {
-		requestID, err = sendUnsubscriptions(conn, adapter, unsubscribe, requestID, chunkSize)
-		if err != nil {
-			return requestID, 0, 0, err
-		}
-	}
-	if len(subscribe) > 0 {
-		requestID, err = sendSubscriptions(conn, adapter, subscribe, requestID, chunkSize)
-		if err != nil {
-			return requestID, 0, 0, err
-		}
-	}
-	return requestID, len(subscribe), len(unsubscribe), nil
-}
-
-func diffSymbols(current []string, next []string) ([]string, []string) {
-	currentSet := make(map[string]struct{}, len(current))
-	for _, symbol := range current {
-		currentSet[symbol] = struct{}{}
-	}
-	nextSet := make(map[string]struct{}, len(next))
-	for _, symbol := range next {
-		nextSet[symbol] = struct{}{}
-	}
-	subscribe := make([]string, 0)
-	for _, symbol := range next {
-		if _, ok := currentSet[symbol]; !ok {
-			subscribe = append(subscribe, symbol)
-		}
-	}
-	unsubscribe := make([]string, 0)
-	for _, symbol := range current {
-		if _, ok := nextSet[symbol]; !ok {
-			unsubscribe = append(unsubscribe, symbol)
-		}
-	}
-	return subscribe, unsubscribe
-}
-
 func sendSubscriptions(conn *websocket.Conn, adapter exchange.Adapter, symbols []string, requestID int64, chunkSize int) (int64, error) {
-	return sendSubscriptionPayloads(conn, symbols, requestID, chunkSize, adapter.BuildSubscribePayload)
-}
-
-func sendUnsubscriptions(conn *websocket.Conn, adapter exchange.Adapter, symbols []string, requestID int64, chunkSize int) (int64, error) {
-	return sendSubscriptionPayloads(conn, symbols, requestID, chunkSize, adapter.BuildUnsubscribePayload)
-}
-
-type subscriptionPayloadBuilder func(symbols []string, requestID int64) ([]byte, error)
-
-func sendSubscriptionPayloads(conn *websocket.Conn, symbols []string, requestID int64, chunkSize int, build subscriptionPayloadBuilder) (int64, error) {
-	if chunkSize <= 0 {
-		chunkSize = 100
-	}
-	for index := 0; index < len(symbols); index += chunkSize {
-		end := index + chunkSize
-		if end > len(symbols) {
-			end = len(symbols)
-		}
-		payload, err := build(symbols[index:end], requestID)
+	for _, chunk := range chunkSymbols(symbols, chunkSize) {
+		payload, err := adapter.BuildSubscribePayload(chunk, requestID)
 		if err != nil {
 			return requestID, err
 		}
@@ -373,6 +208,78 @@ func sendSubscriptionPayloads(conn *websocket.Conn, symbols []string, requestID 
 		requestID++
 	}
 	return requestID, nil
+}
+
+func syncSubscriptions(conn *websocket.Conn, adapter exchange.Adapter, current []string, next []string, requestID int64, chunkSize int) (int64, int, int, error) {
+	subscribe, unsubscribe := diffSymbols(current, next)
+	for _, chunk := range chunkSymbols(unsubscribe, chunkSize) {
+		payload, err := adapter.BuildUnsubscribePayload(chunk, requestID)
+		if err != nil {
+			return requestID, len(subscribe), len(unsubscribe), err
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			return requestID, len(subscribe), len(unsubscribe), err
+		}
+		requestID++
+	}
+	for _, chunk := range chunkSymbols(subscribe, chunkSize) {
+		payload, err := adapter.BuildSubscribePayload(chunk, requestID)
+		if err != nil {
+			return requestID, len(subscribe), len(unsubscribe), err
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			return requestID, len(subscribe), len(unsubscribe), err
+		}
+		requestID++
+	}
+	return requestID, len(subscribe), len(unsubscribe), nil
+}
+
+func diffSymbols(current []string, next []string) ([]string, []string) {
+	currentSet := make(map[string]bool, len(current))
+	nextSet := make(map[string]bool, len(next))
+	for _, symbol := range current {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol != "" {
+			currentSet[symbol] = true
+		}
+	}
+	for _, symbol := range next {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol != "" {
+			nextSet[symbol] = true
+		}
+	}
+	var subscribe []string
+	var unsubscribe []string
+	for symbol := range nextSet {
+		if !currentSet[symbol] {
+			subscribe = append(subscribe, symbol)
+		}
+	}
+	for symbol := range currentSet {
+		if !nextSet[symbol] {
+			unsubscribe = append(unsubscribe, symbol)
+		}
+	}
+	sort.Strings(subscribe)
+	sort.Strings(unsubscribe)
+	return subscribe, unsubscribe
+}
+
+func chunkSymbols(symbols []string, chunkSize int) [][]string {
+	if chunkSize <= 0 {
+		chunkSize = 100
+	}
+	var chunks [][]string
+	for start := 0; start < len(symbols); start += chunkSize {
+		end := start + chunkSize
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+		chunks = append(chunks, symbols[start:end])
+	}
+	return chunks
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {

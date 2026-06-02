@@ -20,23 +20,37 @@ type Tick struct {
 }
 
 type Bar struct {
-	Exchange    string  `json:"exchange"`
-	Symbol      string  `json:"symbol"`
-	Timeframe   string  `json:"timeframe"`
-	StartMS     int64   `json:"start_ms"`
-	EndMS       int64   `json:"end_ms"`
-	OpenPrice   float64 `json:"open_price"`
-	HighPrice   float64 `json:"high_price"`
-	LowPrice    float64 `json:"low_price"`
-	ClosePrice  float64 `json:"close_price"`
-	Volume      float64 `json:"volume"`
-	QuoteVolume float64 `json:"quote_volume"`
-	TradeCount  int64   `json:"trade_count"`
-	LastTickMS  int64   `json:"last_tick_ms"`
-	IsFinal     bool    `json:"is_final"`
-	Source      string  `json:"source"`
-	Reason      string  `json:"reason"`
-	UpdatedAtMS int64   `json:"updated_at_ms"`
+	Exchange       string  `json:"exchange"`
+	Symbol         string  `json:"symbol"`
+	MarginType     string  `json:"margin_type,omitempty"`
+	Timeframe      string  `json:"timeframe"`
+	StartMS        int64   `json:"start_ms"`
+	EndMS          int64   `json:"end_ms"`
+	StartTS        int64   `json:"startts,omitempty"`
+	EndTS          int64   `json:"endts,omitempty"`
+	OpenPrice      float64 `json:"open_price"`
+	HighPrice      float64 `json:"high_price"`
+	LowPrice       float64 `json:"low_price"`
+	ClosePrice     float64 `json:"close_price"`
+	Open           float64 `json:"open,omitempty"`
+	High           float64 `json:"high,omitempty"`
+	Low            float64 `json:"low,omitempty"`
+	Close          float64 `json:"close,omitempty"`
+	PrevClose      float64 `json:"prev_close,omitempty"`
+	Chg            float64 `json:"chg,omitempty"`
+	Amp            float64 `json:"amp,omitempty"`
+	Volume         float64 `json:"volume"`
+	VolumeUnit     string  `json:"volume_unit,omitempty"`
+	QuoteVolume    float64 `json:"quote_volume"`
+	Quote          float64 `json:"quote,omitempty"`
+	QuoteUnit      string  `json:"quote_unit,omitempty"`
+	ContractVolume float64 `json:"contract_volume,omitempty"`
+	TradeCount     int64   `json:"trade_count"`
+	LastTickMS     int64   `json:"last_tick_ms"`
+	IsFinal        bool    `json:"is_final"`
+	Source         string  `json:"source"`
+	Reason         string  `json:"reason"`
+	UpdatedAtMS    int64   `json:"updated_at_ms"`
 }
 
 type SymbolInfo struct {
@@ -70,4 +84,15 @@ type Event struct {
 
 func NowMS() int64 {
 	return time.Now().UnixMilli()
+}
+
+func DecorateBar(bar Bar) Bar {
+	bar.StartTS = bar.StartMS
+	bar.EndTS = bar.EndMS
+	bar.Open = bar.OpenPrice
+	bar.High = bar.HighPrice
+	bar.Low = bar.LowPrice
+	bar.Close = bar.ClosePrice
+	bar.Quote = bar.QuoteVolume
+	return bar
 }

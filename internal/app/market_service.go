@@ -4,10 +4,8 @@ import (
 	"context"
 	"strings"
 	"sync"
-	"time"
 
 	"crypto-ticket/internal/aggregator"
-	"crypto-ticket/internal/cache"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
@@ -15,225 +13,162 @@ import (
 )
 
 const (
-	defaultRecentLimit       = 300
-	defaultDedupeTTL         = 10 * time.Minute
-	defaultRollingTTL        = 10 * time.Minute
-	defaultAllowedLatenessMS = int64(30_000)
-	defaultCleanupGraceMS    = int64(60_000)
+	defaultRecentLimit      = 300
+	livePublishIntervalMS   = int64(1_000)
+	officialOneMinuteSource = "exchange_kline"
 )
 
 type MarketService struct {
-	cache     cache.MarketCache
-	store     storage.HistoricalStore
-	hub       *realtime.Hub
-	mu        sync.Mutex
-	frames    []string
-	recentMax int
+	store       storage.HistoricalStore
+	hub         *realtime.Hub
+	mu          sync.RWMutex
+	frames      []string
+	recentMax   int
+	liveBars    map[string]market.Bar
+	lastPublish map[string]int64
 }
 
-func NewMarketService(cache cache.MarketCache, store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
+func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
 	if recentLimit <= 0 {
 		recentLimit = defaultRecentLimit
 	}
 	normalized := normalizeFrames(frames)
 	return &MarketService{
-		cache:     cache,
-		store:     store,
-		hub:       hub,
-		frames:    normalized,
-		recentMax: recentLimit,
+		store:       store,
+		hub:         hub,
+		frames:      normalized,
+		recentMax:   recentLimit,
+		liveBars:    make(map[string]market.Bar),
+		lastPublish: make(map[string]int64),
 	}
 }
 
-func (s *MarketService) IngestTick(ctx context.Context, tick market.Tick) error {
-	tick = normalizeTick(tick, "api")
-	tick, err := s.publishNormalizedTick(ctx, tick)
-	if err != nil {
-		return err
-	}
-	return s.aggregateNormalizedTick(ctx, tick)
-}
-
-func (s *MarketService) PublishTick(ctx context.Context, tick market.Tick) (market.Tick, error) {
-	return s.publishNormalizedTick(ctx, normalizeTick(tick, "ws"))
-}
-
-func (s *MarketService) AggregateTick(ctx context.Context, tick market.Tick) error {
-	return s.aggregateNormalizedTick(ctx, normalizeTick(tick, "stream"))
-}
-
-func (s *MarketService) publishNormalizedTick(ctx context.Context, tick market.Tick) (market.Tick, error) {
-	if err := s.cache.SetLatestTick(ctx, tick); err != nil {
-		return tick, err
-	}
-	s.hub.Publish(market.Event{
-		Type:     "ticker",
-		Exchange: tick.Exchange,
-		Symbol:   tick.Symbol,
-		Tick:     &tick,
-	})
-	return tick, nil
-}
-
-func (s *MarketService) aggregateNormalizedTick(ctx context.Context, tick market.Tick) error {
-	if !aggregator.ValidTick(tick) {
+func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
+	bar = normalizeBar(bar)
+	if !validBar(bar) {
 		return nil
 	}
-	windowStart := aggregator.OneMinuteStartMS(tick.TsMS)
-	seen, err := s.cache.MarkTickSeen(ctx, tick, windowStart, defaultDedupeTTL)
+	enriched, err := s.enrichBar(ctx, bar)
 	if err != nil {
 		return err
-	}
-	if !seen {
-		return nil
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	nowMS := market.NowMS()
-	if err := s.closePreviousLiveWindow(ctx, tick.Exchange, tick.Symbol, windowStart, nowMS); err != nil {
-		return err
-	}
-	bar, err := s.loadOneMinuteBar(ctx, tick, windowStart)
-	if err != nil {
-		return err
-	}
-	if bar == nil {
-		newBar := aggregator.NewOneMinuteBar(tick)
-		bar = &newBar
+	liveKey := barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe)
+	if enriched.IsFinal {
+		delete(s.liveBars, liveKey)
 	} else {
-		updated := aggregator.ApplyTick(*bar, tick)
-		bar = &updated
+		s.liveBars[liveKey] = enriched
 	}
+	shouldPublish := enriched.IsFinal || market.NowMS()-s.lastPublish[liveKey] >= livePublishIntervalMS
+	if shouldPublish {
+		s.lastPublish[liveKey] = market.NowMS()
+	}
+	s.mu.Unlock()
 
-	if err := s.saveRollingBar(ctx, *bar); err != nil {
-		return err
-	}
-	if bar.IsFinal {
-		return s.persistFinalBars(ctx, []market.Bar{*bar})
-	}
-	return s.publishLive1m(ctx, *bar)
-}
-
-func normalizeTick(tick market.Tick, defaultSource string) market.Tick {
-	tick.Exchange = strings.ToLower(strings.TrimSpace(tick.Exchange))
-	tick.Symbol = strings.ToUpper(strings.TrimSpace(tick.Symbol))
-	if tick.RecvMS == 0 {
-		tick.RecvMS = market.NowMS()
-	}
-	if tick.Source == "" {
-		tick.Source = defaultSource
-	}
-	if tick.EventType == "" {
-		tick.EventType = "trade"
-	}
-	return tick
-}
-
-func (s *MarketService) loadOneMinuteBar(ctx context.Context, tick market.Tick, startMS int64) (*market.Bar, error) {
-	bar, err := s.cache.GetRollingBar(ctx, tick.Exchange, tick.Symbol, startMS)
-	if err != nil || bar != nil {
-		return bar, err
-	}
-	bars, err := s.store.BarsInRange(ctx, tick.Exchange, tick.Symbol, aggregator.OneMinute, startMS, startMS)
-	if err != nil {
-		return nil, err
-	}
-	if len(bars) == 0 {
-		return nil, nil
-	}
-	bar = &bars[0]
-	return bar, nil
-}
-
-func (s *MarketService) saveRollingBar(ctx context.Context, bar market.Bar) error {
-	actionAtMS := bar.EndMS
-	if bar.IsFinal {
-		actionAtMS = bar.EndMS + defaultAllowedLatenessMS + defaultCleanupGraceMS
-	}
-	return s.cache.PutRollingBar(ctx, bar, actionAtMS, defaultRollingTTL)
-}
-
-func (s *MarketService) publishLive1m(ctx context.Context, bar market.Bar) error {
-	live, err := s.cache.GetLive1mBar(ctx, bar.Exchange, bar.Symbol)
-	if err != nil {
-		return err
-	}
-	if live != nil && live.StartMS > bar.StartMS {
+	if enriched.IsFinal {
+		if err := s.persistFinalBars(ctx, []market.Bar{enriched}); err != nil {
+			return err
+		}
 		return nil
 	}
-	if err := s.cache.SetLive1mBar(ctx, bar); err != nil {
-		return err
+	if shouldPublish {
+		s.publishBar(enriched)
 	}
-	s.publishBar(bar)
 	return nil
 }
 
-func (s *MarketService) closePreviousLiveWindow(ctx context.Context, exchange string, symbol string, nextStartMS int64, nowMS int64) error {
-	live, err := s.cache.GetLive1mBar(ctx, exchange, symbol)
-	if err != nil || live == nil || live.StartMS >= nextStartMS {
-		return err
+func normalizeBar(bar market.Bar) market.Bar {
+	bar.Exchange = strings.ToLower(strings.TrimSpace(bar.Exchange))
+	bar.Symbol = strings.ToUpper(strings.TrimSpace(bar.Symbol))
+	bar.Timeframe = timeframe.MustNormalize(bar.Timeframe)
+	bar.MarginType = normalizeMarginType(bar.MarginType)
+	if bar.EndMS == 0 && bar.StartMS > 0 {
+		bar.EndMS = timeframe.EndMS(bar.StartMS, bar.Timeframe)
 	}
-	final := aggregator.FinalizeBar(*live, nowMS, "close")
-	finals := []market.Bar{final}
-	finals = append(finals, aggregator.GapBars(final, nextStartMS, nowMS)...)
-	if err := s.cache.DeleteRollingBar(ctx, final.Exchange, final.Symbol, final.StartMS); err != nil {
-		return err
+	if bar.LastTickMS == 0 {
+		bar.LastTickMS = bar.EndMS
 	}
-	for _, gap := range finals[1:] {
-		if err := s.cache.PutRollingBar(ctx, gap, gap.EndMS+defaultAllowedLatenessMS+defaultCleanupGraceMS, defaultRollingTTL); err != nil {
-			return err
+	if bar.UpdatedAtMS == 0 {
+		bar.UpdatedAtMS = market.NowMS()
+	}
+	if bar.Source == "" {
+		bar.Source = officialOneMinuteSource
+	}
+	if bar.Reason == "" {
+		if bar.IsFinal {
+			bar.Reason = "final"
+		} else {
+			bar.Reason = "update"
 		}
 	}
-	return s.persistFinalBars(ctx, finals)
+	return market.DecorateBar(bar)
 }
 
-func (s *MarketService) CloseDue(ctx context.Context, nowMS int64, graceMS int64) error {
-	if graceMS < 0 {
-		graceMS = 0
+func normalizeMarginType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "coinmargin", "coin_margin", "coin-m", "coin_futures":
+		return "coinmargin"
+	case "umargin", "u_margin", "usdsmargin", "um_futures", "linear":
+		return "umargin"
+	default:
+		return value
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+}
 
-	cutoffMS := nowMS - graceMS
-	for {
-		bars, err := s.cache.DueRollingBars(ctx, cutoffMS, 500)
-		if err != nil {
-			return err
-		}
-		if len(bars) == 0 {
-			return nil
-		}
-		for _, bar := range bars {
-			if bar.IsFinal {
-				if err := s.cache.DeleteRollingBar(ctx, bar.Exchange, bar.Symbol, bar.StartMS); err != nil {
-					return err
-				}
-				continue
-			}
-			final := aggregator.FinalizeBar(bar, nowMS, "close")
-			if err := s.saveRollingBar(ctx, final); err != nil {
-				return err
-			}
-			if err := s.persistFinalBars(ctx, []market.Bar{final}); err != nil {
-				return err
-			}
-		}
-		if len(bars) < 500 {
-			return nil
-		}
+func validBar(bar market.Bar) bool {
+	return bar.Exchange != "" &&
+		bar.Symbol != "" &&
+		bar.Timeframe != "" &&
+		bar.StartMS > 0 &&
+		bar.EndMS >= bar.StartMS &&
+		bar.OpenPrice > 0 &&
+		bar.HighPrice > 0 &&
+		bar.LowPrice > 0 &&
+		bar.ClosePrice > 0
+}
+
+func (s *MarketService) enrichBar(ctx context.Context, bar market.Bar) (market.Bar, error) {
+	previousClose, err := s.previousClose(ctx, bar)
+	if err != nil {
+		return bar, err
 	}
+	return aggregator.ApplyDerived(bar, previousClose), nil
+}
+
+func (s *MarketService) previousClose(ctx context.Context, bar market.Bar) (float64, error) {
+	previousStart := bar.StartMS - timeframe.DurationMS(bar.Timeframe)
+	if previousStart < 0 {
+		return 0, nil
+	}
+	bars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, bar.Timeframe, previousStart, previousStart)
+	if err != nil {
+		return 0, err
+	}
+	if len(bars) > 0 {
+		return bars[len(bars)-1].ClosePrice, nil
+	}
+	if bar.Timeframe == aggregator.OneMinute {
+		return 0, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	live, ok := s.liveBars[barKey(bar.Exchange, bar.Symbol, bar.Timeframe)]
+	if ok && live.StartMS == previousStart && live.IsFinal {
+		return live.ClosePrice, nil
+	}
+	return 0, nil
 }
 
 func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar) error {
 	if len(bars) == 0 {
 		return nil
 	}
-	if err := s.store.UpsertBars(ctx, bars); err != nil {
-		return err
+	for i := range bars {
+		bars[i] = market.DecorateBar(bars[i])
 	}
-	if err := s.cache.PutFinalBars(ctx, bars, s.recentMax); err != nil {
+	if err := s.store.UpsertBars(ctx, bars); err != nil {
 		return err
 	}
 	for _, bar := range bars {
@@ -254,7 +189,7 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 			}
 			targetStart := timeframe.FloorStartMS(bar.StartMS, tf)
 			targetEnd := timeframe.EndMS(targetStart, tf)
-			if targetEnd > nowMS {
+			if bar.EndMS < targetEnd {
 				continue
 			}
 			oneMinuteBars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, aggregator.OneMinute, targetStart, targetEnd)
@@ -268,20 +203,21 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 			if rollup == nil {
 				continue
 			}
-			if err := s.store.UpsertBars(ctx, []market.Bar{*rollup}); err != nil {
+			enriched, err := s.enrichBar(ctx, *rollup)
+			if err != nil {
 				return err
 			}
-			if err := s.cache.PutFinalBars(ctx, []market.Bar{*rollup}, s.recentMax); err != nil {
+			if err := s.store.UpsertBars(ctx, []market.Bar{enriched}); err != nil {
 				return err
 			}
-			s.publishBar(*rollup)
+			s.publishBar(enriched)
 		}
 	}
 	return nil
 }
 
 func (s *MarketService) publishBar(bar market.Bar) {
-	barCopy := bar
+	barCopy := market.DecorateBar(bar)
 	s.hub.Publish(market.Event{
 		Type:      "kline",
 		Exchange:  barCopy.Exchange,
@@ -292,7 +228,32 @@ func (s *MarketService) publishBar(bar market.Bar) {
 }
 
 func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string) (*market.Tick, error) {
-	return s.cache.GetLatestTick(ctx, strings.ToLower(exchange), strings.ToUpper(symbol))
+	exchange = strings.ToLower(strings.TrimSpace(exchange))
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	s.mu.RLock()
+	live, ok := s.liveBars[barKey(exchange, symbol, aggregator.OneMinute)]
+	s.mu.RUnlock()
+	if ok {
+		return tickFromBar(live), nil
+	}
+	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1})
+	if err != nil || len(bars) == 0 {
+		return nil, err
+	}
+	return tickFromBar(bars[len(bars)-1]), nil
+}
+
+func tickFromBar(bar market.Bar) *market.Tick {
+	return &market.Tick{
+		Exchange:  bar.Exchange,
+		Symbol:    bar.Symbol,
+		TsMS:      bar.LastTickMS,
+		Price:     bar.ClosePrice,
+		Size:      bar.Volume,
+		EventType: "kline",
+		Source:    bar.Source,
+		RecvMS:    bar.UpdatedAtMS,
+	}
 }
 
 func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
@@ -310,12 +271,15 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	if err != nil {
 		return nil, err
 	}
+	for i := range bars {
+		bars[i] = market.DecorateBar(bars[i])
+	}
 	if !query.IncludeLive {
 		return trimBars(bars, query.Limit), nil
 	}
-	live, err := s.cache.GetLive1mBar(ctx, query.Exchange, query.Symbol)
-	if err != nil || live == nil {
-		return trimBars(bars, query.Limit), err
+	live := s.liveOneMinute(query.Exchange, query.Symbol)
+	if live == nil {
+		return trimBars(bars, query.Limit), nil
 	}
 	if query.Timeframe == aggregator.OneMinute {
 		return trimBars(mergeLiveBar(bars, live), query.Limit+1), nil
@@ -331,7 +295,22 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	if partial == nil {
 		return trimBars(bars, query.Limit), nil
 	}
-	return trimBars(mergeLiveBar(bars, partial), query.Limit+1), nil
+	enriched, err := s.enrichBar(ctx, *partial)
+	if err != nil {
+		return nil, err
+	}
+	return trimBars(mergeLiveBar(bars, &enriched), query.Limit+1), nil
+}
+
+func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Bar {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	live, ok := s.liveBars[barKey(exchange, symbol, aggregator.OneMinute)]
+	if !ok {
+		return nil
+	}
+	live = market.DecorateBar(live)
+	return &live
 }
 
 func (s *MarketService) ListSymbols(ctx context.Context, exchange string, activeOnly *bool) ([]market.SymbolInfo, error) {
@@ -376,4 +355,8 @@ func normalizeFrames(frames []string) []string {
 		out = append(out, tf)
 	}
 	return out
+}
+
+func barKey(exchange string, symbol string, tf string) string {
+	return strings.ToLower(exchange) + ":" + strings.ToUpper(symbol) + ":" + timeframe.MustNormalize(tf)
 }
