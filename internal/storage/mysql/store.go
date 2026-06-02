@@ -194,6 +194,35 @@ func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]mark
 	return bars, rows.Err()
 }
 
+func (s *Store) BarsInRange(ctx context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64) ([]market.Bar, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT exchange, symbol, timeframe, start_ms, end_ms,
+		open_price, high_price, low_price, close_price, volume, quote_volume, trade_count, last_tick_ms, is_final
+		FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ? AND is_final = 1
+		ORDER BY start_ms ASC`, strings.ToLower(exchange), strings.ToUpper(symbol), tf, startMS, endMS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bars []market.Bar
+	for rows.Next() {
+		var bar market.Bar
+		var isFinal bool
+		if err := rows.Scan(
+			&bar.Exchange, &bar.Symbol, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
+			&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume,
+			&bar.QuoteVolume, &bar.TradeCount, &bar.LastTickMS, &isFinal,
+		); err != nil {
+			return nil, err
+		}
+		bar.IsFinal = isFinal
+		bar.Source = "mysql"
+		bars = append(bars, bar)
+	}
+	return bars, rows.Err()
+}
+
 func (s *Store) UpsertSymbols(ctx context.Context, symbols []market.SymbolInfo) error {
 	if len(symbols) == 0 {
 		return nil

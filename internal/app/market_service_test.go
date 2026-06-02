@@ -88,12 +88,62 @@ func TestAggregateTickDoesNotUpdateLatest(t *testing.T) {
 	}
 }
 
+func TestKlinesBuildsHigherTimeframeFromFinalOneMinuteAndLiveOneMinute(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1H"})
+	base := int64(1_710_000_000_000)
+
+	if err := service.AggregateTick(ctx, market.Tick{
+		Exchange: "binance",
+		Symbol:   "BTCUSDT",
+		TsMS:     base + 1_000,
+		Price:    100,
+		Size:     1,
+	}); err != nil {
+		t.Fatalf("aggregate first tick: %v", err)
+	}
+	if err := service.AggregateTick(ctx, market.Tick{
+		Exchange: "binance",
+		Symbol:   "BTCUSDT",
+		TsMS:     base + 61_000,
+		Price:    110,
+		Size:     2,
+	}); err != nil {
+		t.Fatalf("aggregate second tick: %v", err)
+	}
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange:    "binance",
+		Symbol:      "BTCUSDT",
+		Timeframe:   "1H",
+		Limit:       10,
+		IncludeLive: true,
+	})
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one partial 1H bar, got %+v", bars)
+	}
+	bar := bars[0]
+	if bar.Timeframe != "1H" || bar.IsFinal {
+		t.Fatalf("expected live 1H rollup, got %+v", bar)
+	}
+	if bar.OpenPrice != 100 || bar.ClosePrice != 110 || bar.Volume != 3 || bar.TradeCount != 2 {
+		t.Fatalf("unexpected rollup values: %+v", bar)
+	}
+}
+
 func newTestMarketService() *MarketService {
+	return newTestMarketServiceWithFrames([]string{"1m"})
+}
+
+func newTestMarketServiceWithFrames(frames []string) *MarketService {
 	return NewMarketService(
 		cache.NewMemoryMarketCache(),
 		storage.NewMemoryHistoricalStore(),
 		realtime.NewHub(),
-		[]string{"1m"},
+		frames,
 		300,
 	)
 }

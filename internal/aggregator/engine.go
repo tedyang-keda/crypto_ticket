@@ -8,154 +8,27 @@ import (
 	"crypto-ticket/internal/timeframe"
 )
 
-type Result struct {
-	LiveBars  []market.Bar
-	FinalBars []market.Bar
+const OneMinute = "1m"
+
+func ValidTick(tick market.Tick) bool {
+	return strings.TrimSpace(tick.Exchange) != "" &&
+		strings.TrimSpace(tick.Symbol) != "" &&
+		tick.TsMS > 0 &&
+		tick.Price > 0
 }
 
-type Engine struct {
-	timeframes []string
-	states     map[stateKey]rollingState
+func OneMinuteStartMS(tsMS int64) int64 {
+	return timeframe.FloorStartMS(tsMS, OneMinute)
 }
 
-type stateKey struct {
-	exchange  string
-	symbol    string
-	timeframe string
-}
-
-type rollingState struct {
-	bar market.Bar
-}
-
-func NewEngine(frames []string) *Engine {
-	if len(frames) == 0 {
-		frames = timeframe.Order
-	}
-	normalized := make([]string, 0, len(frames))
-	seen := map[string]bool{}
-	for _, tf := range frames {
-		tf = timeframe.MustNormalize(tf)
-		if seen[tf] {
-			continue
-		}
-		seen[tf] = true
-		normalized = append(normalized, tf)
-	}
-	sort.Slice(normalized, func(i, j int) bool {
-		return timeframe.Index(normalized[i]) < timeframe.Index(normalized[j])
-	})
-	return &Engine{
-		timeframes: normalized,
-		states:     make(map[stateKey]rollingState),
-	}
-}
-
-func (e *Engine) OnTick(tick market.Tick) Result {
-	tick.Exchange = strings.ToLower(strings.TrimSpace(tick.Exchange))
-	tick.Symbol = strings.ToUpper(strings.TrimSpace(tick.Symbol))
-	if tick.EventType == "" {
-		tick.EventType = "trade"
-	}
-	if tick.Source == "" {
-		tick.Source = "ws"
-	}
-	if tick.RecvMS == 0 {
-		tick.RecvMS = market.NowMS()
-	}
-	if tick.Exchange == "" || tick.Symbol == "" || tick.TsMS <= 0 || tick.Price <= 0 {
-		return Result{}
-	}
-
-	result := Result{}
-	for _, tf := range e.timeframes {
-		live, finals := e.applyTickToTimeframe(tick, tf)
-		result.FinalBars = append(result.FinalBars, finals...)
-		if live != nil {
-			result.LiveBars = append(result.LiveBars, *live)
-		}
-	}
-	return result
-}
-
-func (e *Engine) CloseDue(nowMS int64, graceMS int64) Result {
-	cutoff := nowMS - maxInt64(graceMS, 0)
-	keys := make([]stateKey, 0, len(e.states))
-	for key := range e.states {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if timeframe.Index(keys[i].timeframe) != timeframe.Index(keys[j].timeframe) {
-			return timeframe.Index(keys[i].timeframe) < timeframe.Index(keys[j].timeframe)
-		}
-		if keys[i].exchange != keys[j].exchange {
-			return keys[i].exchange < keys[j].exchange
-		}
-		return keys[i].symbol < keys[j].symbol
-	})
-
-	result := Result{}
-	for _, key := range keys {
-		state := e.states[key]
-		if state.bar.IsFinal || state.bar.EndMS > cutoff {
-			continue
-		}
-		bar := state.bar
-		bar.IsFinal = true
-		bar.Reason = "close"
-		bar.UpdatedAtMS = nowMS
-		state.bar = bar
-		e.states[key] = state
-		result.FinalBars = append(result.FinalBars, bar)
-	}
-	return result
-}
-
-func (e *Engine) applyTickToTimeframe(tick market.Tick, tf string) (*market.Bar, []market.Bar) {
-	key := stateKey{exchange: tick.Exchange, symbol: tick.Symbol, timeframe: tf}
-	start := timeframe.FloorStartMS(tick.TsMS, tf)
-	end := timeframe.EndMS(start, tf)
-	state, ok := e.states[key]
-	if !ok {
-		bar := barFromTick(tick, tf, start, end)
-		e.states[key] = rollingState{bar: bar}
-		return &bar, nil
-	}
-
-	if start < state.bar.StartMS {
-		return nil, nil
-	}
-
-	if start == state.bar.StartMS {
-		if state.bar.IsFinal {
-			return nil, nil
-		}
-		bar := updateBarWithTick(state.bar, tick)
-		e.states[key] = rollingState{bar: bar}
-		return &bar, nil
-	}
-
-	finals := make([]market.Bar, 0, 1)
-	if !state.bar.IsFinal {
-		final := state.bar
-		final.IsFinal = true
-		final.Reason = "close"
-		final.UpdatedAtMS = tick.RecvMS
-		finals = append(finals, final)
-	}
-	finals = append(finals, fillGaps(state.bar, start)...)
-	newBar := barFromTick(tick, tf, start, end)
-	e.states[key] = rollingState{bar: newBar}
-	return &newBar, finals
-}
-
-func barFromTick(tick market.Tick, tf string, startMS int64, endMS int64) market.Bar {
+func NewOneMinuteBar(tick market.Tick) market.Bar {
+	startMS := OneMinuteStartMS(tick.TsMS)
 	return market.Bar{
-		Exchange:    tick.Exchange,
-		Symbol:      tick.Symbol,
-		Timeframe:   tf,
+		Exchange:    strings.ToLower(strings.TrimSpace(tick.Exchange)),
+		Symbol:      strings.ToUpper(strings.TrimSpace(tick.Symbol)),
+		Timeframe:   OneMinute,
 		StartMS:     startMS,
-		EndMS:       endMS,
+		EndMS:       timeframe.EndMS(startMS, OneMinute),
 		OpenPrice:   tick.Price,
 		HighPrice:   tick.Price,
 		LowPrice:    tick.Price,
@@ -171,34 +44,50 @@ func barFromTick(tick market.Tick, tf string, startMS int64, endMS int64) market
 	}
 }
 
-func updateBarWithTick(bar market.Bar, tick market.Tick) market.Bar {
+func ApplyTick(bar market.Bar, tick market.Tick) market.Bar {
+	if bar.OpenPrice <= 0 {
+		return NewOneMinuteBar(tick)
+	}
 	if tick.Price > bar.HighPrice {
 		bar.HighPrice = tick.Price
 	}
 	if tick.Price < bar.LowPrice {
 		bar.LowPrice = tick.Price
 	}
-	bar.ClosePrice = tick.Price
+	if tick.TsMS >= bar.LastTickMS {
+		bar.ClosePrice = tick.Price
+		bar.LastTickMS = tick.TsMS
+	}
 	bar.Volume += tick.Size
 	bar.QuoteVolume += tick.Price * tick.Size
 	bar.TradeCount++
-	if tick.TsMS > bar.LastTickMS {
-		bar.LastTickMS = tick.TsMS
-	}
 	bar.UpdatedAtMS = tick.RecvMS
-	bar.Reason = "update"
+	if bar.IsFinal {
+		bar.Reason = "late_correction"
+	} else {
+		bar.Reason = "update"
+	}
+	bar.Source = "aggregator"
 	return bar
 }
 
-func fillGaps(previous market.Bar, nextStartMS int64) []market.Bar {
+func FinalizeBar(bar market.Bar, nowMS int64, reason string) market.Bar {
+	bar.IsFinal = true
+	bar.Source = "aggregator"
+	bar.Reason = reason
+	bar.UpdatedAtMS = nowMS
+	return bar
+}
+
+func GapBars(previous market.Bar, nextStartMS int64, nowMS int64) []market.Bar {
 	var gaps []market.Bar
-	gapStart := timeframe.NextStartMS(previous.StartMS, previous.Timeframe)
+	gapStart := timeframe.NextStartMS(previous.StartMS, OneMinute)
 	for gapStart < nextStartMS {
-		gapEnd := timeframe.EndMS(gapStart, previous.Timeframe)
+		gapEnd := timeframe.EndMS(gapStart, OneMinute)
 		gaps = append(gaps, market.Bar{
 			Exchange:    previous.Exchange,
 			Symbol:      previous.Symbol,
-			Timeframe:   previous.Timeframe,
+			Timeframe:   OneMinute,
 			StartMS:     gapStart,
 			EndMS:       gapEnd,
 			OpenPrice:   previous.ClosePrice,
@@ -212,16 +101,51 @@ func fillGaps(previous market.Bar, nextStartMS int64) []market.Bar {
 			IsFinal:     true,
 			Source:      "aggregator",
 			Reason:      "gap",
-			UpdatedAtMS: market.NowMS(),
+			UpdatedAtMS: nowMS,
 		})
-		gapStart = timeframe.NextStartMS(gapStart, previous.Timeframe)
+		gapStart = timeframe.NextStartMS(gapStart, OneMinute)
 	}
 	return gaps
 }
 
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
+func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updatedAtMS int64) *market.Bar {
+	tf = timeframe.MustNormalize(tf)
+	if len(bars) == 0 {
+		return nil
 	}
-	return b
+	ordered := append([]market.Bar(nil), bars...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].StartMS < ordered[j].StartMS })
+
+	startMS := timeframe.FloorStartMS(ordered[0].StartMS, tf)
+	rollup := market.Bar{
+		Exchange:    strings.ToLower(ordered[0].Exchange),
+		Symbol:      strings.ToUpper(ordered[0].Symbol),
+		Timeframe:   tf,
+		StartMS:     startMS,
+		EndMS:       timeframe.EndMS(startMS, tf),
+		OpenPrice:   ordered[0].OpenPrice,
+		HighPrice:   ordered[0].HighPrice,
+		LowPrice:    ordered[0].LowPrice,
+		ClosePrice:  ordered[len(ordered)-1].ClosePrice,
+		LastTickMS:  ordered[len(ordered)-1].LastTickMS,
+		IsFinal:     isFinal,
+		Source:      "rollup",
+		Reason:      reason,
+		UpdatedAtMS: updatedAtMS,
+	}
+	for _, bar := range ordered {
+		if bar.HighPrice > rollup.HighPrice {
+			rollup.HighPrice = bar.HighPrice
+		}
+		if bar.LowPrice < rollup.LowPrice {
+			rollup.LowPrice = bar.LowPrice
+		}
+		rollup.Volume += bar.Volume
+		rollup.QuoteVolume += bar.QuoteVolume
+		rollup.TradeCount += bar.TradeCount
+		if bar.LastTickMS > rollup.LastTickMS {
+			rollup.LastTickMS = bar.LastTickMS
+		}
+	}
+	return &rollup
 }

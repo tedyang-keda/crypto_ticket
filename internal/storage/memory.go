@@ -64,6 +64,31 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 	return bars, nil
 }
 
+func (m *MemoryHistoricalStore) BarsInRange(_ context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64) ([]market.Bar, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	key := strings.ToLower(exchange) + ":" + strings.ToUpper(symbol) + ":" + tf
+	rows := m.bars[key]
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	starts := make([]int64, 0, len(rows))
+	for start := range rows {
+		if start >= startMS && start <= endMS {
+			starts = append(starts, start)
+		}
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+	bars := make([]market.Bar, 0, len(starts))
+	for _, start := range starts {
+		bar := rows[start]
+		if bar.IsFinal {
+			bars = append(bars, bar)
+		}
+	}
+	return bars, nil
+}
+
 func (m *MemoryHistoricalStore) UpsertSymbols(_ context.Context, symbols []market.SymbolInfo) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

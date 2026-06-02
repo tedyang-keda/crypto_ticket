@@ -199,6 +199,131 @@ func (r *RedisMarketCache) RecentBars(ctx context.Context, query market.KlineQue
 	return bars, nil
 }
 
+func (r *RedisMarketCache) MarkTickSeen(ctx context.Context, tick market.Tick, windowStartMS int64, ttl time.Duration) (bool, error) {
+	key := dedupeRedisKey(tick.Exchange, tick.Symbol, windowStartMS)
+	member := dedupeMember(tick)
+	added, err := r.client.SAdd(ctx, key, member).Result()
+	if err != nil {
+		return false, err
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if added > 0 {
+		if err := r.client.Expire(ctx, key, ttl).Err(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *RedisMarketCache) GetRollingBar(ctx context.Context, exchange string, symbol string, startMS int64) (*market.Bar, error) {
+	raw, err := r.client.Get(ctx, rollingRedisKey(exchange, symbol, startMS)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var bar market.Bar
+	if err := json.Unmarshal(raw, &bar); err != nil {
+		return nil, err
+	}
+	return &bar, nil
+}
+
+func (r *RedisMarketCache) PutRollingBar(ctx context.Context, bar market.Bar, actionAtMS int64, ttl time.Duration) error {
+	payload, err := json.Marshal(bar)
+	if err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	key := rollingRedisKey(bar.Exchange, bar.Symbol, bar.StartMS)
+	pipe := r.client.Pipeline()
+	pipe.Set(ctx, key, payload, ttl)
+	pipe.ZAdd(ctx, rollingIndexRedisKey(), redis.Z{Score: float64(actionAtMS), Member: key})
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (r *RedisMarketCache) DeleteRollingBar(ctx context.Context, exchange string, symbol string, startMS int64) error {
+	key := rollingRedisKey(exchange, symbol, startMS)
+	pipe := r.client.Pipeline()
+	pipe.Del(ctx, key)
+	pipe.ZRem(ctx, rollingIndexRedisKey(), key)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (r *RedisMarketCache) DueRollingBars(ctx context.Context, cutoffMS int64, limit int) ([]market.Bar, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	keys, err := r.client.ZRangeByScore(ctx, rollingIndexRedisKey(), &redis.ZRangeBy{
+		Min:    "-inf",
+		Max:    strconv.FormatInt(cutoffMS, 10),
+		Offset: 0,
+		Count:  int64(limit),
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	values, err := r.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]market.Bar, 0, len(values))
+	missing := make([]any, 0)
+	for index, value := range values {
+		if value == nil {
+			missing = append(missing, keys[index])
+			continue
+		}
+		raw, ok := value.(string)
+		if !ok {
+			continue
+		}
+		var bar market.Bar
+		if err := json.Unmarshal([]byte(raw), &bar); err == nil {
+			bars = append(bars, bar)
+		}
+	}
+	if len(missing) > 0 {
+		_ = r.client.ZRem(ctx, rollingIndexRedisKey(), missing...).Err()
+	}
+	return bars, nil
+}
+
+func (r *RedisMarketCache) SetLive1mBar(ctx context.Context, bar market.Bar) error {
+	bar.Timeframe = "1m"
+	payload, err := json.Marshal(bar)
+	if err != nil {
+		return err
+	}
+	return r.client.Set(ctx, live1mRedisKey(bar.Exchange, bar.Symbol), payload, 10*time.Minute).Err()
+}
+
+func (r *RedisMarketCache) GetLive1mBar(ctx context.Context, exchange string, symbol string) (*market.Bar, error) {
+	raw, err := r.client.Get(ctx, live1mRedisKey(exchange, symbol)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var bar market.Bar
+	if err := json.Unmarshal(raw, &bar); err != nil {
+		return nil, err
+	}
+	return &bar, nil
+}
+
 func (r *RedisMarketCache) ClearKlineCache(ctx context.Context, options KlineCacheClearOptions) (int64, error) {
 	if !options.IncludeRecent && !options.IncludeLive {
 		return 0, nil
@@ -268,6 +393,30 @@ func (r *RedisMarketCache) deleteByPattern(ctx context.Context, pattern string, 
 
 func liveBarRedisKey(exchange string, symbol string, tf string) string {
 	return fmt.Sprintf("livebar:%s:%s:%s", strings.ToLower(exchange), strings.ToUpper(symbol), tf)
+}
+
+func live1mRedisKey(exchange string, symbol string) string {
+	return fmt.Sprintf("live_1m:%s:%s", strings.ToLower(exchange), strings.ToUpper(symbol))
+}
+
+func rollingRedisKey(exchange string, symbol string, startMS int64) string {
+	return fmt.Sprintf("rolling_1m:%s:%s:%d", strings.ToLower(exchange), strings.ToUpper(symbol), startMS)
+}
+
+func rollingIndexRedisKey() string {
+	return "rolling_1m:idx"
+}
+
+func dedupeRedisKey(exchange string, symbol string, startMS int64) string {
+	return fmt.Sprintf("dedupe_1m:%s:%s:%d", strings.ToLower(exchange), strings.ToUpper(symbol), startMS)
+}
+
+func dedupeMember(tick market.Tick) string {
+	id := strings.TrimSpace(tick.TradeID)
+	if id != "" {
+		return id
+	}
+	return fmt.Sprintf("%d:%0.12f:%0.12f:%s", tick.TsMS, tick.Price, tick.Size, strings.ToLower(tick.Side))
 }
 
 func recentIdxKey(exchange string, symbol string, tf string) string {
