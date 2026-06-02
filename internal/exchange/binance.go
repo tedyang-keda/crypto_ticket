@@ -61,8 +61,9 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 	}
 	var payload struct {
 		Symbols []struct {
-			Symbol string `json:"symbol"`
-			Status string `json:"status"`
+			Symbol         string `json:"symbol"`
+			Status         string `json:"status"`
+			ContractStatus string `json:"contractStatus"`
 		} `json:"symbols"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -75,7 +76,7 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 		if symbol == "" {
 			continue
 		}
-		status := strings.ToUpper(item.Status)
+		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
 		symbols = append(symbols, market.SymbolInfo{
 			Exchange:      a.Name(),
 			Symbol:        symbol,

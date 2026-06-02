@@ -197,7 +197,8 @@ func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) (
 }
 
 func sendSubscriptions(conn *websocket.Conn, adapter exchange.Adapter, symbols []string, requestID int64, chunkSize int) (int64, error) {
-	for _, chunk := range chunkSymbols(symbols, chunkSize) {
+	chunks := chunkSymbols(symbols, chunkSize)
+	for index, chunk := range chunks {
 		payload, err := adapter.BuildSubscribePayload(chunk, requestID)
 		if err != nil {
 			return requestID, err
@@ -206,6 +207,9 @@ func sendSubscriptions(conn *websocket.Conn, adapter exchange.Adapter, symbols [
 			return requestID, err
 		}
 		requestID++
+		if index < len(chunks)-1 {
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
 	return requestID, nil
 }

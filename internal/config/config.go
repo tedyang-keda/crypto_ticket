@@ -70,7 +70,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			RestURL:               env("BINANCE_REST_URL", "https://fapi.binance.com"),
 			WSURL:                 env("BINANCE_WS_URL", "wss://fstream.binance.com/ws"),
 			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_UM_ENABLED", true),
-			SubscriptionChunkSize: envInt("BINANCE_SUBSCRIPTION_CHUNK_SIZE", 200),
+			SubscriptionChunkSize: envInt("BINANCE_SUBSCRIPTION_CHUNK_SIZE", 50),
 		},
 		{
 			Name:                  "binance",
@@ -78,7 +78,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			RestURL:               env("BINANCE_COIN_REST_URL", "https://dapi.binance.com"),
 			WSURL:                 env("BINANCE_COIN_WS_URL", "wss://dstream.binance.com/ws"),
 			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_COIN_ENABLED", true),
-			SubscriptionChunkSize: envInt("BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE", 200),
+			SubscriptionChunkSize: envInt("BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE", 50),
 		},
 		{
 			Name:                  "okx",
