@@ -90,7 +90,7 @@ func main() {
 
 	if options.clearAllBars {
 		if options.dryRun {
-			log.Printf("dry-run clear all bar_history and bar_checkpoint")
+			log.Printf("dry-run clear all bar_history")
 		} else {
 			count, err := store.ClearBars(ctx)
 			if err != nil {
@@ -166,7 +166,7 @@ func parseOptions(cfg config.Config) (runOptions, error) {
 	flag.BoolVar(&options.backfill, "backfill", true, "fetch official REST klines and upsert bar_history")
 	flag.BoolVar(&options.clearRedis, "clear-redis", true, "clear Redis kline recent cache after processing")
 	flag.BoolVar(&options.clearLive, "clear-livebar", true, "also clear Redis livebar keys")
-	flag.BoolVar(&options.clearAllBars, "clear-all-bar-history", false, "delete all rows from bar_history and bar_checkpoint before backfill")
+	flag.BoolVar(&options.clearAllBars, "clear-all-bar-history", false, "delete all rows from bar_history before backfill")
 	flag.BoolVar(&options.clearAllRedis, "clear-all-redis-kline", false, "delete all Redis kline recent/live keys with wildcard SCAN")
 	flag.BoolVar(&options.refreshSymbols, "refresh-symbols", false, "fetch the exchange symbol list before backfill and use that current list")
 	flag.BoolVar(&options.continueOnErr, "continue-on-error", false, "log individual symbol/timeframe fetch errors and continue")

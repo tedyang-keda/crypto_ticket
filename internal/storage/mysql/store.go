@@ -48,27 +48,6 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			PRIMARY KEY (exchange, symbol),
 			KEY idx_registry_active (exchange, is_active, last_seen_at_ms)
 		)`,
-		`CREATE TABLE IF NOT EXISTS bar_checkpoint (
-			exchange VARCHAR(16) NOT NULL,
-			symbol VARCHAR(64) NOT NULL,
-			timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-			start_ms BIGINT NOT NULL,
-			end_ms BIGINT NOT NULL,
-			open_price DECIMAL(28, 12) NOT NULL,
-			high_price DECIMAL(28, 12) NOT NULL,
-			low_price DECIMAL(28, 12) NOT NULL,
-			close_price DECIMAL(28, 12) NOT NULL,
-			volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
-			quote_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
-			trade_count BIGINT NOT NULL DEFAULT 0,
-			last_tick_ms BIGINT NOT NULL,
-			is_final TINYINT(1) NOT NULL DEFAULT 0,
-			raw_json JSON NULL,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			PRIMARY KEY (exchange, symbol, timeframe),
-			KEY idx_bar_checkpoint_time (exchange, timeframe, start_ms)
-		)`,
 		`CREATE TABLE IF NOT EXISTS bar_history (
 			exchange VARCHAR(16) NOT NULL,
 			symbol VARCHAR(64) NOT NULL,
@@ -117,22 +96,9 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 		 low_price=VALUES(low_price), close_price=VALUES(close_price), volume=VALUES(volume),
 		 quote_volume=VALUES(quote_volume), trade_count=VALUES(trade_count), last_tick_ms=VALUES(last_tick_ms),
 		 is_final=VALUES(is_final)`
-	checkpointSQL := `INSERT INTO bar_checkpoint
-		(exchange, symbol, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
-		 volume, quote_volume, trade_count, last_tick_ms, is_final, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-		 start_ms=VALUES(start_ms), end_ms=VALUES(end_ms), open_price=VALUES(open_price),
-		 high_price=VALUES(high_price), low_price=VALUES(low_price), close_price=VALUES(close_price),
-		 volume=VALUES(volume), quote_volume=VALUES(quote_volume), trade_count=VALUES(trade_count),
-		 last_tick_ms=VALUES(last_tick_ms), is_final=VALUES(is_final), raw_json=VALUES(raw_json)`
-
 	for _, bar := range bars {
 		args := barArgs(bar)
 		if _, err := tx.ExecContext(ctx, historySQL, args...); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, checkpointSQL, checkpointArgs(bar)...); err != nil {
 			return err
 		}
 	}
@@ -141,15 +107,13 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 
 func (s *Store) ClearBars(ctx context.Context) (int64, error) {
 	var deleted int64
-	for _, statement := range []string{`TRUNCATE TABLE bar_checkpoint`, `TRUNCATE TABLE bar_history`} {
-		result, err := s.db.ExecContext(ctx, statement)
-		if err != nil {
-			return deleted, err
-		}
-		count, err := result.RowsAffected()
-		if err == nil {
-			deleted += count
-		}
+	result, err := s.db.ExecContext(ctx, `TRUNCATE TABLE bar_history`)
+	if err != nil {
+		return deleted, err
+	}
+	count, err := result.RowsAffected()
+	if err == nil {
+		deleted += count
 	}
 	return deleted, nil
 }
@@ -296,10 +260,4 @@ func barArgs(bar market.Bar) []any {
 		bar.LastTickMS,
 		bar.IsFinal,
 	}
-}
-
-func checkpointArgs(bar market.Bar) []any {
-	args := barArgs(bar)
-	rawJSON, _ := json.Marshal(bar)
-	return append(args, string(rawJSON))
 }
