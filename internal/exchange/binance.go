@@ -159,6 +159,9 @@ func (a *BinanceFuturesAdapter) ParseKlineMessage(payload []byte) ([]market.Bar,
 	if err := json.Unmarshal(payload, &root); err != nil {
 		return nil, err
 	}
+	if code := stringValue(root["code"]); code != "" {
+		return nil, fmt.Errorf("binance websocket error code=%s msg=%s", code, stringValue(root["msg"]))
+	}
 	data := root
 	if nested, ok := root["data"].(map[string]any); ok {
 		data = nested
