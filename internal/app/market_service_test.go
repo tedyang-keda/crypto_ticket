@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"testing"
+	"time"
 
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
@@ -91,6 +92,34 @@ func TestKlinesBuildsHigherTimeframeFromFinalOneMinuteAndLiveOneMinute(t *testin
 	}
 }
 
+func TestIngestKlinePublishesKlineAndTickerEvents(t *testing.T) {
+	ctx := context.Background()
+	hub := realtime.NewHub()
+	service := NewMarketService(storage.NewMemoryHistoricalStore(), hub, []string{"1m"}, 300)
+	sub := hub.Subscribe()
+	defer sub.Close()
+	sub.Add(realtime.KlineChannel("binance", "BTCUSDT", "1m"))
+	sub.Add(realtime.TickerChannel("binance", "BTCUSDT"))
+
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: 1_710_000_000_000, EndMS: 1_710_000_059_999,
+		OpenPrice: 100, HighPrice: 105, LowPrice: 99, ClosePrice: 102,
+		Volume: 1, QuoteVolume: 102, IsFinal: false,
+	}); err != nil {
+		t.Fatalf("ingest live: %v", err)
+	}
+
+	kline := nextTestEvent(t, sub)
+	if kline.Type != "kline" || kline.Bar == nil {
+		t.Fatalf("expected kline event, got %+v", kline)
+	}
+	ticker := nextTestEvent(t, sub)
+	if ticker.Type != "ticker" || ticker.Tick == nil || ticker.Tick.Price != 102 {
+		t.Fatalf("expected ticker event, got %+v", ticker)
+	}
+}
+
 func newTestMarketService() *MarketService {
 	return newTestMarketServiceWithFrames([]string{"1m"})
 }
@@ -102,4 +131,15 @@ func newTestMarketServiceWithFrames(frames []string) *MarketService {
 		frames,
 		300,
 	)
+}
+
+func nextTestEvent(t *testing.T, sub *realtime.Subscriber) market.Event {
+	t.Helper()
+	select {
+	case event := <-sub.Events():
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for realtime event")
+		return market.Event{}
+	}
 }

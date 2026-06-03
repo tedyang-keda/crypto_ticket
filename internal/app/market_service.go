@@ -225,6 +225,15 @@ func (s *MarketService) publishBar(bar market.Bar) {
 		Timeframe: barCopy.Timeframe,
 		Bar:       &barCopy,
 	})
+	if barCopy.Timeframe != aggregator.OneMinute {
+		return
+	}
+	s.hub.Publish(market.Event{
+		Type:     "ticker",
+		Exchange: barCopy.Exchange,
+		Symbol:   barCopy.Symbol,
+		Tick:     tickFromBar(barCopy),
+	})
 }
 
 func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string) (*market.Tick, error) {
