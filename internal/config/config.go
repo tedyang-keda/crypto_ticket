@@ -68,7 +68,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			Name:                  "binance",
 			MarketType:            env("BINANCE_KIND", "um_futures"),
 			RestURL:               env("BINANCE_REST_URL", "https://fapi.binance.com"),
-			WSURL:                 env("BINANCE_WS_URL", "wss://fstream.binance.com/ws"),
+			WSURL:                 env("BINANCE_WS_URL", "wss://fstream.binance.com/market"),
 			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_UM_ENABLED", true),
 			SubscriptionChunkSize: envInt("BINANCE_SUBSCRIPTION_CHUNK_SIZE", 50),
 		},

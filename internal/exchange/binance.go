@@ -107,13 +107,37 @@ func (a *BinanceFuturesAdapter) StaticStreamURL(symbols []string) string {
 			streams = append(streams, symbol+"@kline_1m")
 		}
 	}
-	base := strings.TrimRight(strings.TrimSpace(a.wsURL), "/")
-	if strings.HasSuffix(base, "/ws") {
-		base = strings.TrimSuffix(base, "/ws") + "/stream"
-	} else if !strings.HasSuffix(base, "/stream") {
-		base += "/stream"
-	}
+	base := a.staticKlineStreamBaseURL()
 	return base + "?streams=" + strings.Join(streams, "/")
+}
+
+func (a *BinanceFuturesAdapter) staticKlineStreamBaseURL() string {
+	base := strings.TrimRight(strings.TrimSpace(a.wsURL), "/")
+	if base == "" {
+		if a.marginType() == "coinmargin" {
+			base = "wss://dstream.binance.com/ws"
+		} else {
+			base = "wss://fstream.binance.com/market"
+		}
+	}
+	if a.marginType() == "umargin" {
+		base = strings.TrimSuffix(base, "/ws")
+		base = strings.TrimSuffix(base, "/stream")
+		base = strings.TrimSuffix(base, "/public")
+		base = strings.TrimSuffix(base, "/public/ws")
+		base = strings.TrimSuffix(base, "/public/stream")
+		if !strings.HasSuffix(base, "/market") {
+			base += "/market"
+		}
+		return base + "/stream"
+	}
+	if strings.HasSuffix(base, "/ws") {
+		return strings.TrimSuffix(base, "/ws") + "/stream"
+	}
+	if strings.HasSuffix(base, "/stream") {
+		return base
+	}
+	return base + "/stream"
 }
 
 func (a *BinanceFuturesAdapter) buildSubscriptionPayload(method string, symbols []string, requestID int64) ([]byte, error) {

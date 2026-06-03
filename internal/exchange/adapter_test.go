@@ -53,6 +53,24 @@ func TestBinanceParseCoinMarginKlineMessage(t *testing.T) {
 	}
 }
 
+func TestBinanceUMarginStaticStreamURLUsesMarketNamespace(t *testing.T) {
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://fapi.binance.com", "wss://fstream.binance.com/ws")
+	got := adapter.StaticStreamURL([]string{"BTCUSDT", "ETHUSDT"})
+	want := "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m/ethusdt@kline_1m"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestBinanceCoinMarginStaticStreamURLKeepsDStreamNamespace(t *testing.T) {
+	adapter := NewBinanceFuturesAdapter("coin_futures", "https://dapi.binance.com", "wss://dstream.binance.com/ws")
+	got := adapter.StaticStreamURL([]string{"BTCUSD_PERP"})
+	want := "wss://dstream.binance.com/stream?streams=btcusd_perp@kline_1m"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
 func TestOKXParseTradesMessage(t *testing.T) {
 	adapter := NewOKXAdapter("SWAP", "https://www.okx.com", "wss://example")
 	ticks, err := adapter.ParseMessage([]byte(`{"arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},"data":[{"instId":"BTC-USDT-SWAP","tradeId":"9","px":"70000.5","sz":"2","side":"buy","ts":"1779340001000"}]}`))
