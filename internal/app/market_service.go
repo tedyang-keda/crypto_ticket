@@ -214,7 +214,7 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 
 func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market.Bar) error {
 	nowMS := market.NowMS()
-	for _, tf := range s.frames {
+	for _, tf := range timeframe.Order {
 		if tf == aggregator.OneMinute {
 			continue
 		}

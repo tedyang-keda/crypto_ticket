@@ -96,7 +96,7 @@ go run ./cmd/marketd
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
-| `MARKET_TIMEFRAMES` | 全部支持周期 | 高周期 rollup 的目标周期列表 |
+| `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
 | `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | OKX 订阅刷新间隔；Binance static streams 只在重连时重新拉 symbols |
@@ -298,7 +298,7 @@ WS 时效性：
 - final `1m` 会先写 store，写成功后再推送。
 - `ticker` 基于 `1m` kline 的 close，不是逐笔 trade tick。
 - 高周期 final bar 在周期结束且 final `1m` 入库后推送。
-- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时实时合成并通过 WS 推送。为避免全市场无意义 DB 查询，没有订阅者的高周期不会主动合成。
+- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时实时合成并通过 WS 推送。live 合成覆盖全部支持周期，不受 `MARKET_TIMEFRAMES` 限制；为避免全市场无意义 DB 查询，没有订阅者的高周期不会主动合成。
 - 服务端每 15 秒发送一次 `{"op":"ping"}`；客户端发送 `{"op":"ping"}` 时服务端返回 `{"op":"pong"}`。
 - 每个 subscriber 的事件队列大小是 256；客户端消费太慢时，新事件会被丢弃，不做阻塞和重放。因此前端应该先 HTTP 拉快照，再接 WS 增量。
 - 当前 WS 只有 subscribe，没有 unsubscribe。前端切换 symbol/timeframe 时会关闭旧连接并重新连接。
@@ -466,7 +466,7 @@ livebar:{exchange}:{symbol}:{timeframe}
 
 - 没有 Redis / Kafka 这样的实时缓冲队列；collector、入库、rollup、推送都在 `marketd` 进程内完成。
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
-- 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询。
+- 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
 - 高周期 rollup 当前不严格检查 `1m` 是否每分钟连续无缺口。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。

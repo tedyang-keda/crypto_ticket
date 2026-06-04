@@ -194,6 +194,33 @@ func TestIngestKlinePublishesLiveHigherTimeframeRollup(t *testing.T) {
 	}
 }
 
+func TestIngestKlinePublishesSubscribedLiveRollupOutsideConfiguredFinalFrames(t *testing.T) {
+	ctx := context.Background()
+	hub := realtime.NewHub()
+	service := NewMarketService(storage.NewMemoryHistoricalStore(), hub, []string{"1m"}, 300)
+	sub := hub.Subscribe()
+	defer sub.Close()
+	sub.Add(realtime.KlineChannel("binance", "BTCUSDT", "1H"))
+	base := int64(1_710_000_000_000)
+
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 100, HighPrice: 105, LowPrice: 99, ClosePrice: 102,
+		Volume: 1, QuoteVolume: 100, IsFinal: false,
+	}); err != nil {
+		t.Fatalf("ingest live: %v", err)
+	}
+
+	event := nextTestEvent(t, sub)
+	if event.Type != "kline" || event.Timeframe != "1H" || event.Bar == nil {
+		t.Fatalf("expected live 1H kline event, got %+v", event)
+	}
+	if event.Bar.IsFinal || event.Bar.OpenPrice != 100 || event.Bar.ClosePrice != 102 || event.Bar.Volume != 1 {
+		t.Fatalf("unexpected live 1H rollup outside configured frames: %+v", event.Bar)
+	}
+}
+
 func newTestMarketService() *MarketService {
 	return newTestMarketServiceWithFrames([]string{"1m"})
 }
