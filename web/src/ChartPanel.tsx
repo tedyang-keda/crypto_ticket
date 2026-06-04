@@ -18,6 +18,7 @@ import type { Bar } from "./types";
 
 type Props = {
   bars: Bar[];
+  resetKey: string;
   onSelectBar?: (bar: Bar | null) => void;
   showMovingAverages?: boolean;
   showVolume?: boolean;
@@ -29,7 +30,7 @@ type HoverTip = {
   y: number;
 };
 
-export function ChartPanel({ bars, onSelectBar, showMovingAverages = true, showVolume = true }: Props) {
+export function ChartPanel({ bars, resetKey, onSelectBar, showMovingAverages = true, showVolume = true }: Props) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -38,6 +39,7 @@ export function ChartPanel({ bars, onSelectBar, showMovingAverages = true, showV
   const ema50Ref = useRef<ISeriesApi<"Line"> | null>(null);
   const barsByTimeRef = useRef<Map<number, Bar>>(new Map());
   const onSelectBarRef = useRef<Props["onSelectBar"]>(onSelectBar);
+  const lastFitKeyRef = useRef("");
   const [hoverTip, setHoverTip] = useState<HoverTip | null>(null);
 
   useEffect(() => {
@@ -157,8 +159,11 @@ export function ChartPanel({ bars, onSelectBar, showMovingAverages = true, showV
     volumeRef.current?.setData(showVolume ? volumes : []);
     ema20Ref.current?.setData(showMovingAverages ? movingAverage(closes, bars, 20) : []);
     ema50Ref.current?.setData(showMovingAverages ? movingAverage(closes, bars, 50) : []);
-    chartRef.current?.timeScale().fitContent();
-  }, [bars, showMovingAverages, showVolume]);
+    if (candles.length && lastFitKeyRef.current !== resetKey) {
+      chartRef.current?.timeScale().fitContent();
+      lastFitKeyRef.current = resetKey;
+    }
+  }, [bars, resetKey, showMovingAverages, showVolume]);
 
   return (
     <div className="chart-shell">

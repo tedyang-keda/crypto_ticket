@@ -33,8 +33,12 @@ export function metricsForBar(bar: Bar | null | undefined): BarMetrics | null {
 export function tickLatencyMs(tick: Tick | null | undefined, now = Date.now()) {
   if (!tick) return null;
   const anchor = tick.recv_ms || tick.ts_ms;
-  if (!anchor) return null;
-  return Math.max(0, now - Number(anchor));
+  return latencyFromTimestamp(anchor, now);
+}
+
+export function latencyFromTimestamp(value: number | null | undefined, now = Date.now()) {
+  if (!value) return null;
+  return Math.max(0, now - Number(value));
 }
 
 export function quoteAmountForBar(bar: Bar | null | undefined) {

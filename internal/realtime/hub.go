@@ -53,6 +53,17 @@ func (h *Hub) Publish(event market.Event) {
 	}
 }
 
+func (h *Hub) HasSubscribers(channel string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for sub := range h.subscribers {
+		if sub.hasChannel(channel) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Subscriber) Add(channel string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -79,6 +90,13 @@ func (s *Subscriber) matches(channels []string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Subscriber) hasChannel(channel string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.channels[channel]
+	return ok
 }
 
 func TickerChannel(exchange string, symbol string) string {

@@ -16,7 +16,7 @@ import {
   Wifi,
 } from "lucide-react";
 import { ChartPanel } from "./ChartPanel";
-import { getKlines, getLatestTicker, getSymbols } from "./api";
+import { getAllSymbols, getKlines, getLatestTicker } from "./api";
 import {
   formatCompact,
   formatLatency,
@@ -26,9 +26,9 @@ import {
   formatSignedPrice,
   formatTime,
   formatTimeRange,
+  latencyFromTimestamp,
   metricsForBar,
   quoteAmountForBar,
-  tickLatencyMs,
 } from "./marketMetrics";
 import { useMarketSocket } from "./useMarketSocket";
 import { useMarketStore } from "./store";
@@ -83,8 +83,9 @@ function MarketTerminal() {
   const [selectedBar, setSelectedBar] = useState<Bar | null>(null);
   const [recentTicks, setRecentTicks] = useState<Tick[]>([]);
   const [indicators, setIndicators] = useState<Indicators>({ ema: true, volume: true, momentum: true });
+  const nowMS = useNow();
 
-  const symbolsQuery = useQuery({ queryKey: ["symbols", exchange], queryFn: () => getSymbols(exchange) });
+  const symbolsQuery = useQuery({ queryKey: ["symbols", "all"], queryFn: () => getAllSymbols(exchanges), staleTime: 30_000 });
   const barsQuery = useQuery({
     queryKey: ["klines", exchange, symbol, timeframe],
     queryFn: () => getKlines(exchange, symbol, timeframe),
@@ -126,9 +127,17 @@ function MarketTerminal() {
   const lastMetrics = metricsForBar(lastBar);
   const symbols = symbolsQuery.data ?? [];
   const filteredSymbols = useMemo(() => filterSymbols(symbols, symbolQuery), [symbols, symbolQuery]);
-  const watchlist = useMemo(() => makeWatchlist(symbols, filteredSymbols, symbol), [filteredSymbols, symbol, symbols]);
-  const latency = tickLatencyMs(latestTick);
+  const watchlist = useMemo(() => makeWatchlist(symbols, filteredSymbols, exchange, symbol), [exchange, filteredSymbols, symbol, symbols]);
   const latestPrice = latestTick?.price ?? lastBar?.close_price ?? null;
+  const officialPushAge = latencyFromTimestamp(latestTick?.recv_ms ?? lastBar?.updated_at_ms, nowMS);
+  const exchangeEventAge = latencyFromTimestamp(latestTick?.ts_ms ?? lastBar?.last_tick_ms, nowMS);
+  const browserReceiveAge = latencyFromTimestamp(latestTick?.client_recv_ms ?? lastBar?.client_recv_ms, nowMS);
+  const selectMarketSymbol = (item: SymbolInfo) => {
+    const nextExchange = item.exchange.toLowerCase();
+    if (nextExchange !== exchange) setExchange(nextExchange);
+    setSymbol(item.symbol);
+    setSymbolQuery("");
+  };
 
   const changeLabel = lastMetrics ? `${formatPct(lastMetrics.changePct)} ${formatSignedPrice(lastMetrics.change)}` : "waiting for live bar";
   const subtitle = lastBar ? `${lastBar.is_final ? "final" : "live"} bar | ${formatTime(lastBar.start_ms)} | ${bars.length} rows` : "waiting for live cache";
@@ -159,7 +168,7 @@ function MarketTerminal() {
         <div className="top-actions">
           <label className="terminal-search">
             <Search size={15} />
-            <input value={symbolQuery} onChange={(event) => setSymbolQuery(event.target.value)} placeholder="BTCUSDT, OKX..." />
+            <input value={symbolQuery} onChange={(event) => setSymbolQuery(event.target.value)} placeholder="Search all symbols" />
           </label>
           <IconButton active={indicators.ema} label="Indicators" onClick={() => setIndicators((value) => ({ ...value, ema: !value.ema }))}>
             <Activity size={16} />
@@ -185,13 +194,19 @@ function MarketTerminal() {
 
         <section className="chart-column">
           <ChartReadout bar={activeBar} metrics={activeMetrics} />
-          <ChartPanel bars={bars} onSelectBar={setSelectedBar} showMovingAverages={indicators.ema} showVolume={indicators.volume} />
+          <ChartPanel
+            bars={bars}
+            resetKey={`${exchange}:${symbol}:${timeframe}`}
+            onSelectBar={setSelectedBar}
+            showMovingAverages={indicators.ema}
+            showVolume={indicators.volume}
+          />
           {indicators.momentum ? <MomentumStrip bars={bars} /> : <div className="indicator-strip empty" />}
         </section>
 
         <aside className="sidebar">
-          <Panel title="Watchlist" meta={`${filteredSymbols.length}/${symbols.length}`}>
-            <Watchlist items={watchlist} activeSymbol={symbol} latestTick={latestTick} onSelect={setSymbol} />
+          <Panel title="Watchlist" meta={`${filteredSymbols.length}/${symbols.length} all`}>
+            <Watchlist items={watchlist} activeExchange={exchange} activeSymbol={symbol} latestTick={latestTick} onSelect={selectMarketSymbol} />
           </Panel>
           <Panel title="Indicators" meta="active set">
             <IndicatorToggle label="EMA 20 / 50" active={indicators.ema} onClick={() => setIndicators((value) => ({ ...value, ema: !value.ema }))} />
@@ -215,15 +230,16 @@ function MarketTerminal() {
                 ["Browser WS", connection],
                 ["Latest source", latestTick?.source || lastBar?.source || "stream"],
                 ["Rows", String(bars.length)],
-                ["Tick latency", formatLatency(latency)],
-                ["Cache limit", "300 bars"],
+                ["Official push age", formatLatency(officialPushAge)],
+                ["Exchange event age", formatLatency(exchangeEventAge)],
+                ["Browser recv age", formatLatency(browserReceiveAge)],
               ]}
             />
           </Panel>
         </aside>
       </section>
 
-      <BottomDock activeBar={activeBar} metrics={activeMetrics} latestTick={latestTick} recentTicks={recentTicks} subtitle={subtitle} />
+      <BottomDock activeBar={activeBar} latestBar={lastBar} metrics={activeMetrics} latestTick={latestTick} nowMS={nowMS} recentTicks={recentTicks} subtitle={subtitle} />
     </main>
   );
 }
@@ -328,25 +344,33 @@ function Panel({ title, meta, children }: { title: string; meta?: string; childr
 
 function Watchlist({
   items,
+  activeExchange,
   activeSymbol,
   latestTick,
   onSelect,
 }: {
   items: SymbolInfo[];
+  activeExchange: string;
   activeSymbol: string;
   latestTick: Tick | null;
-  onSelect: (symbol: string) => void;
+  onSelect: (item: SymbolInfo) => void;
 }) {
   if (!items.length) return <div className="empty-state">No symbols</div>;
   return (
     <div className="watchlist">
       {items.map((item) => {
-        const isActive = item.symbol === activeSymbol;
+        const itemExchange = item.exchange.toLowerCase();
+        const isActive = itemExchange === activeExchange.toLowerCase() && item.symbol === activeSymbol;
+        const hasLivePrice = isActive && latestTick && latestTick.exchange.toLowerCase() === itemExchange && latestTick.symbol === item.symbol;
+        const livePrice = hasLivePrice && latestTick ? latestTick.price : null;
         return (
-          <button className={isActive ? "watch-row active" : "watch-row"} key={item.symbol} type="button" onClick={() => onSelect(item.symbol)}>
+          <button className={isActive ? "watch-row active" : "watch-row"} key={`${item.exchange}:${item.symbol}`} type="button" onClick={() => onSelect(item)}>
             <span className={item.is_active ? "status-dot on" : "status-dot"} />
-            <span className="watch-symbol">{symbolDisplay(item.symbol)}</span>
-            <strong>{isActive && latestTick ? formatPrice(latestTick.price) : item.status || "-"}</strong>
+            <span className="watch-symbol">
+              <strong>{symbolDisplay(item.symbol)}</strong>
+              <small>{item.exchange.toUpperCase()}</small>
+            </span>
+            <strong>{livePrice !== null ? formatPrice(livePrice) : item.status || "-"}</strong>
           </button>
         );
       })}
@@ -379,19 +403,25 @@ function MetricRows({ rows }: { rows: Array<[string, string]> }) {
 
 function BottomDock({
   activeBar,
+  latestBar,
   metrics,
   latestTick,
+  nowMS,
   recentTicks,
   subtitle,
 }: {
   activeBar: Bar | null;
+  latestBar: Bar | null;
   metrics: ReturnType<typeof metricsForBar>;
   latestTick: Tick | null;
+  nowMS: number;
   recentTicks: Tick[];
   subtitle: string;
 }) {
   const collectorLatency = latestTick?.recv_ms && latestTick.ts_ms ? Math.max(0, latestTick.recv_ms - latestTick.ts_ms) : null;
-  const exchangeLatency = tickLatencyMs(latestTick);
+  const officialPushAge = latencyFromTimestamp(latestBar?.updated_at_ms ?? latestTick?.recv_ms, nowMS);
+  const exchangeEventAge = latencyFromTimestamp(latestBar?.last_tick_ms ?? latestTick?.ts_ms, nowMS);
+  const browserReceiveAge = latencyFromTimestamp(latestBar?.client_recv_ms ?? latestTick?.client_recv_ms, nowMS);
   return (
     <footer className="bottom-dock">
       <section className="dock-panel">
@@ -410,10 +440,10 @@ function BottomDock({
           Realtime Route <small>end-to-end</small>
         </h2>
         <div className="route">
-          <StatBox label="Exchange WS" value={formatLatency(exchangeLatency)} tone={latencyTone(exchangeLatency)} />
-          <StatBox label="Collector" value={formatLatency(collectorLatency)} tone={latencyTone(collectorLatency)} />
-          <StatBox label="Browser WS" value={latestTick ? "open" : "-"} tone={latestTick ? "positive" : "flat"} />
-          <StatBox label="Kline agg" value={activeBar?.source || "stream"} />
+          <StatBox label="Official push" value={formatLatency(officialPushAge)} tone={latencyTone(officialPushAge)} />
+          <StatBox label="Exchange event" value={formatLatency(exchangeEventAge)} tone={latencyTone(exchangeEventAge)} />
+          <StatBox label="Browser recv" value={formatLatency(browserReceiveAge)} tone={latencyTone(browserReceiveAge)} />
+          <StatBox label="Collector span" value={formatLatency(collectorLatency)} tone={latencyTone(collectorLatency)} />
         </div>
       </section>
       <section className="dock-panel">
@@ -451,13 +481,21 @@ function StatBox({ label, value, tone }: { label: string; value: string; tone?: 
 function filterSymbols(symbols: SymbolInfo[], query: string) {
   const trimmed = query.trim().toLowerCase();
   if (!trimmed) return symbols;
-  return symbols.filter((item) => item.symbol.toLowerCase().includes(trimmed) || item.exchange.toLowerCase().includes(trimmed));
+  return symbols.filter(
+    (item) =>
+      item.symbol.toLowerCase().includes(trimmed) ||
+      item.exchange.toLowerCase().includes(trimmed) ||
+      item.market_type.toLowerCase().includes(trimmed) ||
+      item.status.toLowerCase().includes(trimmed),
+  );
 }
 
-function makeWatchlist(symbols: SymbolInfo[], filteredSymbols: SymbolInfo[], activeSymbol: string) {
-  const active = symbols.find((item) => item.symbol === activeSymbol);
-  const merged = active ? [active, ...filteredSymbols.filter((item) => item.symbol !== activeSymbol)] : filteredSymbols;
-  return merged.slice(0, 8);
+function makeWatchlist(symbols: SymbolInfo[], filteredSymbols: SymbolInfo[], activeExchange: string, activeSymbol: string) {
+  const active = symbols.find((item) => item.exchange.toLowerCase() === activeExchange.toLowerCase() && item.symbol === activeSymbol);
+  const merged = active
+    ? [active, ...filteredSymbols.filter((item) => item.exchange.toLowerCase() !== active.exchange.toLowerCase() || item.symbol !== active.symbol)]
+    : filteredSymbols;
+  return merged.slice(0, 18);
 }
 
 function symbolDisplay(value: string) {
@@ -467,6 +505,15 @@ function symbolDisplay(value: string) {
 
 function tickKey(tick: Tick) {
   return tick.trade_id || `${tick.exchange}:${tick.symbol}:${tick.ts_ms}:${tick.price}:${tick.size}`;
+}
+
+function useNow(intervalMS = 1_000) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMS);
+    return () => window.clearInterval(timer);
+  }, [intervalMS]);
+  return now;
 }
 
 function latencyTone(value: number | null | undefined) {

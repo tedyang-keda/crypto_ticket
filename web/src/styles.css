@@ -528,6 +528,7 @@ button {
 .watch-row {
   grid-template-columns: 9px minmax(0, 1fr) auto;
   width: 100%;
+  min-height: 38px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text);
@@ -541,10 +542,25 @@ button {
 }
 
 .watch-symbol {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.watch-symbol strong,
+.watch-symbol small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.watch-symbol small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0;
 }
 
 .watch-row strong,

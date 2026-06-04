@@ -14,18 +14,16 @@ import (
 
 const (
 	defaultRecentLimit      = 300
-	livePublishIntervalMS   = int64(1_000)
 	officialOneMinuteSource = "exchange_kline"
 )
 
 type MarketService struct {
-	store       storage.HistoricalStore
-	hub         *realtime.Hub
-	mu          sync.RWMutex
-	frames      []string
-	recentMax   int
-	liveBars    map[string]market.Bar
-	lastPublish map[string]int64
+	store     storage.HistoricalStore
+	hub       *realtime.Hub
+	mu        sync.RWMutex
+	frames    []string
+	recentMax int
+	liveBars  map[string]market.Bar
 }
 
 func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
@@ -34,12 +32,11 @@ func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames [
 	}
 	normalized := normalizeFrames(frames)
 	return &MarketService{
-		store:       store,
-		hub:         hub,
-		frames:      normalized,
-		recentMax:   recentLimit,
-		liveBars:    make(map[string]market.Bar),
-		lastPublish: make(map[string]int64),
+		store:     store,
+		hub:       hub,
+		frames:    normalized,
+		recentMax: recentLimit,
+		liveBars:  make(map[string]market.Bar),
 	}
 }
 
@@ -60,10 +57,6 @@ func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
 	} else {
 		s.liveBars[liveKey] = enriched
 	}
-	shouldPublish := enriched.IsFinal || market.NowMS()-s.lastPublish[liveKey] >= livePublishIntervalMS
-	if shouldPublish {
-		s.lastPublish[liveKey] = market.NowMS()
-	}
 	s.mu.Unlock()
 
 	if enriched.IsFinal {
@@ -72,8 +65,11 @@ func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
 		}
 		return nil
 	}
-	if shouldPublish {
-		s.publishBar(enriched)
+	s.publishBar(enriched)
+	if enriched.Timeframe == aggregator.OneMinute {
+		if err := s.publishLiveRollups(ctx, enriched); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -212,6 +208,34 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 			}
 			s.publishBar(enriched)
 		}
+	}
+	return nil
+}
+
+func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market.Bar) error {
+	nowMS := market.NowMS()
+	for _, tf := range s.frames {
+		if tf == aggregator.OneMinute {
+			continue
+		}
+		if !s.hub.HasSubscribers(realtime.KlineChannel(oneMinute.Exchange, oneMinute.Symbol, tf)) {
+			continue
+		}
+		targetStart := timeframe.FloorStartMS(oneMinute.StartMS, tf)
+		partialInputs, err := s.store.BarsInRange(ctx, oneMinute.Exchange, oneMinute.Symbol, aggregator.OneMinute, targetStart, oneMinute.StartMS-1)
+		if err != nil {
+			return err
+		}
+		partialInputs = append(partialInputs, oneMinute)
+		rollup := aggregator.RollupBars(tf, partialInputs, false, "live", nowMS)
+		if rollup == nil {
+			continue
+		}
+		enriched, err := s.enrichBar(ctx, *rollup)
+		if err != nil {
+			return err
+		}
+		s.publishBar(enriched)
 	}
 	return nil
 }

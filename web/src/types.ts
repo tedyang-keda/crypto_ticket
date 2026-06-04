@@ -9,6 +9,7 @@ export type Tick = {
   event_type?: string;
   source?: string;
   recv_ms?: number;
+  client_recv_ms?: number;
 };
 
 export type Bar = {
@@ -29,6 +30,7 @@ export type Bar = {
   source?: string;
   reason?: string;
   updated_at_ms?: number;
+  client_recv_ms?: number;
 };
 
 export type SymbolInfo = {

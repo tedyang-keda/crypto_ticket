@@ -13,9 +13,15 @@ export const getSymbols = async (exchange: string): Promise<SymbolInfo[]> => {
   return payload.symbols ?? [];
 };
 
+export const getAllSymbols = async (exchanges: string[]): Promise<SymbolInfo[]> => {
+  const rows = await Promise.all(exchanges.map((exchange) => getSymbols(exchange)));
+  return rows.flat().sort((a, b) => `${a.exchange}:${a.symbol}`.localeCompare(`${b.exchange}:${b.symbol}`));
+};
+
 export const getLatestTicker = async (exchange: string, symbol: string): Promise<Tick | null> => {
   try {
-    return await json<Tick>(`/api/v1/ticker/latest?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`);
+    const tick = await json<Tick>(`/api/v1/ticker/latest?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`);
+    return { ...tick, client_recv_ms: Date.now() };
   } catch {
     return null;
   }

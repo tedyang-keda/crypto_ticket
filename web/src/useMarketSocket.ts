@@ -33,8 +33,9 @@ export function useMarketSocket() {
     ws.addEventListener("message", (message) => {
       const payload = JSON.parse(message.data) as RealtimeEvent | { op: string };
       if ("op" in payload) return;
-      if (payload.type === "ticker" && payload.tick) setLatestTick(payload.tick);
-      if (payload.type === "kline" && payload.bar) updateBar(payload.bar);
+      const clientRecvMS = Date.now();
+      if (payload.type === "ticker" && payload.tick) setLatestTick({ ...payload.tick, client_recv_ms: clientRecvMS });
+      if (payload.type === "kline" && payload.bar) updateBar({ ...payload.bar, client_recv_ms: clientRecvMS });
     });
 
     ws.addEventListener("close", () => {

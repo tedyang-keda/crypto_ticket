@@ -120,6 +120,80 @@ func TestIngestKlinePublishesKlineAndTickerEvents(t *testing.T) {
 	}
 }
 
+func TestIngestKlinePublishesEveryLiveUpdate(t *testing.T) {
+	ctx := context.Background()
+	hub := realtime.NewHub()
+	service := NewMarketService(storage.NewMemoryHistoricalStore(), hub, []string{"1m"}, 300)
+	sub := hub.Subscribe()
+	defer sub.Close()
+	sub.Add(realtime.KlineChannel("binance", "BTCUSDT", "1m"))
+	sub.Add(realtime.TickerChannel("binance", "BTCUSDT"))
+	base := int64(1_710_000_000_000)
+
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 100, HighPrice: 105, LowPrice: 99, ClosePrice: 102,
+		Volume: 1, QuoteVolume: 102, IsFinal: false,
+	}); err != nil {
+		t.Fatalf("ingest first live: %v", err)
+	}
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 100, HighPrice: 106, LowPrice: 98, ClosePrice: 103,
+		Volume: 2, QuoteVolume: 206, IsFinal: false,
+	}); err != nil {
+		t.Fatalf("ingest second live: %v", err)
+	}
+
+	_ = nextTestEvent(t, sub)
+	_ = nextTestEvent(t, sub)
+	kline := nextTestEvent(t, sub)
+	if kline.Type != "kline" || kline.Bar == nil || kline.Bar.ClosePrice != 103 {
+		t.Fatalf("expected second live kline event, got %+v", kline)
+	}
+	ticker := nextTestEvent(t, sub)
+	if ticker.Type != "ticker" || ticker.Tick == nil || ticker.Tick.Price != 103 {
+		t.Fatalf("expected second live ticker event, got %+v", ticker)
+	}
+}
+
+func TestIngestKlinePublishesLiveHigherTimeframeRollup(t *testing.T) {
+	ctx := context.Background()
+	hub := realtime.NewHub()
+	service := NewMarketService(storage.NewMemoryHistoricalStore(), hub, []string{"1m", "1H"}, 300)
+	sub := hub.Subscribe()
+	defer sub.Close()
+	sub.Add(realtime.KlineChannel("binance", "BTCUSDT", "1H"))
+	base := int64(1_710_000_000_000)
+
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 100, HighPrice: 105, LowPrice: 99, ClosePrice: 102,
+		Volume: 1, QuoteVolume: 100, IsFinal: true,
+	}); err != nil {
+		t.Fatalf("ingest final: %v", err)
+	}
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base + 60_000, EndMS: base + 119_999,
+		OpenPrice: 102, HighPrice: 110, LowPrice: 101, ClosePrice: 108,
+		Volume: 3, QuoteVolume: 300, IsFinal: false,
+	}); err != nil {
+		t.Fatalf("ingest live: %v", err)
+	}
+
+	event := nextTestEvent(t, sub)
+	if event.Type != "kline" || event.Timeframe != "1H" || event.Bar == nil {
+		t.Fatalf("expected live 1H kline event, got %+v", event)
+	}
+	if event.Bar.IsFinal || event.Bar.OpenPrice != 100 || event.Bar.ClosePrice != 108 || event.Bar.Volume != 4 {
+		t.Fatalf("unexpected live 1H rollup: %+v", event.Bar)
+	}
+}
+
 func newTestMarketService() *MarketService {
 	return newTestMarketServiceWithFrames([]string{"1m"})
 }
