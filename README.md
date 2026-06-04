@@ -425,7 +425,7 @@ final 1m received
 
 | 周期 | 保留 |
 | --- | --- |
-| `1m` | 30 天 |
+| `1m` | 15 天 |
 | `5m` / `15m` / `30m` | 90 天 |
 | `1H` / `2H` / `4H` / `6H` / `12H` | 180 天 |
 | `1D` 及以上 | 全部保留 |
@@ -446,16 +446,16 @@ MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
 go run ./cmd/maintain_klines -mode=retention -dry-run=false -batch-size=10000
 ```
 
-`sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`，按 timeframe + month 分区。生成迁移 SQL：
+`sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`。会过期的周期按 timeframe + month 分区，`1D` 及以上只保留 future 分区。生成迁移 SQL：
 
 ```bash
-go run ./cmd/maintain_klines -mode=partition-create-sql -partition-start=2026-01 -partition-months=36 > /tmp/bar_history_timeframe_partition.sql
+go run ./cmd/maintain_klines -mode=partition-create-sql -partition-start=2026-01 -partition-months=12 > /tmp/bar_history_timeframe_partition.sql
 ```
 
 生成按 retention 可直接 drop 的整月过期分区 SQL：
 
 ```bash
-go run ./cmd/maintain_klines -mode=partition-drop-sql -partition-start=2026-01 -partition-months=36
+go run ./cmd/maintain_klines -mode=partition-drop-sql -partition-start=2026-01 -partition-months=12
 ```
 
 把现有 `p_tf_*_future` 分区扩展成新的月分区：

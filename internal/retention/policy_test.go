@@ -7,7 +7,7 @@ import (
 
 func TestRuleForTimeframeBuckets(t *testing.T) {
 	cases := map[string]Rule{
-		"1m":  {Timeframe: "1m", KeepDays: 30},
+		"1m":  {Timeframe: "1m", KeepDays: 15},
 		"5m":  {Timeframe: "5m", KeepDays: 90},
 		"30m": {Timeframe: "30m", KeepDays: 90},
 		"1H":  {Timeframe: "1H", KeepDays: 180},
@@ -29,7 +29,7 @@ func TestCutoffMS(t *testing.T) {
 	if !ok {
 		t.Fatal("expected cutoff")
 	}
-	expected := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC).UnixMilli()
+	expected := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC).UnixMilli()
 	if cutoff != expected {
 		t.Fatalf("expected %d got %d", expected, cutoff)
 	}

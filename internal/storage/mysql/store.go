@@ -68,7 +68,7 @@ func createBarHistoryTableStatement(now time.Time) string {
 		"\n)\n" +
 		BuildTimeframePartitionClause(TimeframePartitionOptions{
 			StartMonth: partitionStart,
-			Months:     36,
+			Months:     12,
 		})
 }
 

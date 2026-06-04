@@ -68,7 +68,7 @@ func parseOptions() (options, error) {
 	flag.StringVar(&nowRaw, "now", "", "optional current time override: unix ms, RFC3339, or YYYY-MM-DD")
 	flag.StringVar(&opts.tableName, "table", "bar_history", "bar history table name for partition SQL")
 	flag.StringVar(&partitionStartRaw, "partition-start", "2026-01", "first generated partition month, YYYY-MM")
-	flag.IntVar(&opts.partitionMonths, "partition-months", 36, "number of month partitions per timeframe")
+	flag.IntVar(&opts.partitionMonths, "partition-months", 12, "number of month partitions per expiring timeframe")
 	flag.Parse()
 
 	opts.timeframes = normalizeTimeframes(timeframesRaw)

@@ -20,6 +20,9 @@ func TestBuildTimeframePartitionClause(t *testing.T) {
 	if !strings.Contains(sql, "PARTITION p_tf_3mon_future VALUES LESS THAN ('4H', 0)") {
 		t.Fatalf("expected lexicographic future partition boundary: %s", sql)
 	}
+	if strings.Contains(sql, "p_tf_1mon_2026_01") {
+		t.Fatalf("did not expect month partitions for keep-forever 1M: %s", sql)
+	}
 }
 
 func TestBuildDropExpiredTimeframePartitionsSQL(t *testing.T) {
@@ -53,6 +56,9 @@ func TestBuildAddTimeframePartitionsSQL(t *testing.T) {
 	}
 	if !strings.Contains(sql, "PARTITION p_tf_1min_future VALUES LESS THAN ('2D', 0)") {
 		t.Fatalf("expected 1m future boundary: %s", sql)
+	}
+	if strings.Contains(sql, "REORGANIZE PARTITION p_tf_1mon_future") {
+		t.Fatalf("did not expect add SQL for keep-forever 1M: %s", sql)
 	}
 }
 

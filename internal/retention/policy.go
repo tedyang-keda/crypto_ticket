@@ -16,7 +16,7 @@ func RuleFor(tf string) Rule {
 	tf = timeframe.MustNormalize(tf)
 	switch tf {
 	case "1m":
-		return Rule{Timeframe: tf, KeepDays: 30}
+		return Rule{Timeframe: tf, KeepDays: 15}
 	case "5m", "15m", "30m":
 		return Rule{Timeframe: tf, KeepDays: 90}
 	case "1H", "2H", "4H", "6H", "12H":

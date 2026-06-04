@@ -37,9 +37,11 @@ func BuildTimeframePartitionClause(options TimeframePartitionOptions) string {
 	out.WriteString("PARTITION BY RANGE COLUMNS(timeframe, start_ms) (\n")
 	frames := lexicographicTimeframes()
 	for frameIndex, tf := range frames {
-		for _, monthStart := range months {
-			partitionEnd := monthStart.AddDate(0, 1, 0)
-			out.WriteString(fmt.Sprintf("  PARTITION %s VALUES LESS THAN ('%s', %d),\n", partitionName(tf, monthStart), tf, partitionEnd.UnixMilli()))
+		if hasMonthlyPartitions(tf) {
+			for _, monthStart := range months {
+				partitionEnd := monthStart.AddDate(0, 1, 0)
+				out.WriteString(fmt.Sprintf("  PARTITION %s VALUES LESS THAN ('%s', %d),\n", partitionName(tf, monthStart), tf, partitionEnd.UnixMilli()))
+			}
 		}
 		out.WriteString("  " + futurePartitionDDL(tf, frameIndex, frames, frameIndex != len(frames)-1) + "\n")
 	}
@@ -53,6 +55,9 @@ func BuildAddTimeframePartitionsSQL(options TimeframePartitionOptions) string {
 	frames := lexicographicTimeframes()
 	var out strings.Builder
 	for frameIndex, tf := range frames {
+		if !hasMonthlyPartitions(tf) {
+			continue
+		}
 		out.WriteString("ALTER TABLE `" + tableName + "` REORGANIZE PARTITION " + futurePartitionName(tf) + " INTO (\n")
 		for _, monthStart := range months {
 			partitionEnd := monthStart.AddDate(0, 1, 0)
@@ -125,6 +130,10 @@ func partitionName(tf string, monthStart time.Time) string {
 
 func futurePartitionName(tf string) string {
 	return "p_tf_" + partitionFrameName(tf) + "_future"
+}
+
+func hasMonthlyPartitions(tf string) bool {
+	return !retention.RuleFor(tf).KeepForever
 }
 
 func futurePartitionDDL(tf string, frameIndex int, frames []string, trailingComma bool) string {
