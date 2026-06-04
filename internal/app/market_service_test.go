@@ -8,6 +8,7 @@ import (
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
+	"crypto-ticket/internal/timeframe"
 )
 
 func TestIngestKlineStoresFinalAndComputesDerivedFields(t *testing.T) {
@@ -218,6 +219,39 @@ func TestIngestKlinePublishesSubscribedLiveRollupOutsideConfiguredFinalFrames(t 
 	}
 	if event.Bar.IsFinal || event.Bar.OpenPrice != 100 || event.Bar.ClosePrice != 102 || event.Bar.Volume != 1 {
 		t.Fatalf("unexpected live 1H rollup outside configured frames: %+v", event.Bar)
+	}
+}
+
+func TestIngestKlineCascadesFinalRollupsThroughIntermediateFrames(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1H"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1H")
+
+	for i := 0; i < 60; i++ {
+		start := base + int64(i)*60_000
+		open := float64(100 + i)
+		if err := service.IngestKline(ctx, market.Bar{
+			Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+			StartMS: start, EndMS: start + 59_999,
+			OpenPrice: open, HighPrice: open + 2, LowPrice: open - 1, ClosePrice: open + 1,
+			Volume: 1, QuoteVolume: 100, IsFinal: true,
+		}); err != nil {
+			t.Fatalf("ingest final minute %d: %v", i, err)
+		}
+	}
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1H", Limit: 10, IncludeLive: false,
+	})
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one final 1H bar, got %+v", bars)
+	}
+	bar := bars[0]
+	if !bar.IsFinal || bar.Timeframe != "1H" || bar.OpenPrice != 100 || bar.ClosePrice != 160 || bar.Volume != 60 {
+		t.Fatalf("unexpected cascaded 1H rollup: %+v", bar)
 	}
 }
 

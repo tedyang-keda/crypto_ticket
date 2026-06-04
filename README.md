@@ -24,7 +24,7 @@ Binance / OKX official 1m kline WebSocket
 HTTP /api/v1/klines?include_live=true
   -> 读取 store 中已持久化的目标周期 bars
   -> 如有当前 live 1m，则把 live bar 合并进去
-  -> 对高周期请求，会临时用 final 1m + live 1m 合成当前未完成高周期
+  -> 对高周期请求，会按级联源周期合成当前未完成高周期
 ```
 
 关键结论：
@@ -35,6 +35,7 @@ HTTP /api/v1/klines?include_live=true
 - MySQL 中存的是 final bar。实时未完成 `1m` 只在当前 Go 进程内。
 - HTTP 可以读不同 timeframe 的行情；默认会包含当前未完成行情。
 - WS 会推 `1m` live，也会对当前有订阅者的高周期实时合成并推送 live bar。
+- 高周期 final/live rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。
 
 ## 支持的周期
 
@@ -96,7 +97,7 @@ go run ./cmd/marketd
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
-| `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
+| `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
 | `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | OKX 订阅刷新间隔；Binance static streams 只在重连时重新拉 symbols |
@@ -297,8 +298,8 @@ WS 时效性：
 - 非 final `1m` kline 不再做服务端 1 秒节流；每次收到交易所官方 kline update 都会转发给订阅者。
 - final `1m` 会先写 store，写成功后再推送。
 - `ticker` 基于 `1m` kline 的 close，不是逐笔 trade tick。
-- 高周期 final bar 在周期结束且 final `1m` 入库后推送。
-- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时实时合成并通过 WS 推送。live 合成覆盖全部支持周期，不受 `MARKET_TIMEFRAMES` 限制；为避免全市场无意义 DB 查询，没有订阅者的高周期不会主动合成。
+- 高周期 final bar 在周期结束且对应源周期 final bar 入库后级联生成并推送，例如 `1D <- 1H`、`1M/3M <- 1D`。
+- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时实时级联合成并通过 WS 推送。live 合成覆盖全部支持周期，不受 `MARKET_TIMEFRAMES` 限制；为避免全市场无意义 DB 查询，没有订阅者的高周期不会主动合成。
 - 服务端每 15 秒发送一次 `{"op":"ping"}`；客户端发送 `{"op":"ping"}` 时服务端返回 `{"op":"pong"}`。
 - 每个 subscriber 的事件队列大小是 256；客户端消费太慢时，新事件会被丢弃，不做阻塞和重放。因此前端应该先 HTTP 拉快照，再接 WS 增量。
 - 当前 WS 只有 subscribe，没有 unsubscribe。前端切换 symbol/timeframe 时会关闭旧连接并重新连接。
@@ -343,7 +344,7 @@ curl 'http://127.0.0.1:8088/api/v1/klines?exchange=binance&symbol=BTCUSDT&timefr
 `include_live=true` 时的返回逻辑：
 
 - `timeframe=1m`：读取 store 中最近 final `1m`，再合并当前进程内 live `1m`。如果 live bar 是新一根，返回数量可能是 `limit + 1`。
-- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再用当前周期内 final `1m` + 当前 live `1m` 临时合成一根未完成高周期 bar 并合并返回。
+- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再按级联源周期临时合成一根未完成高周期 bar 并合并返回。
 - 如果当前进程刚启动且还没收到 live `1m`，则只能返回 store 中已有 final bars。
 - `include_live=false` 时，只返回 store 中已持久化 bars。
 
@@ -351,7 +352,7 @@ curl 'http://127.0.0.1:8088/api/v1/klines?exchange=binance&symbol=BTCUSDT&timefr
 
 - `/api/v1/ticker/latest`：能拿到当前进程最后收到的 live `1m` close；没有 live 时拿最近 final `1m`。
 - `/api/v1/klines&timeframe=1m&include_live=true`：能拿到历史 final `1m` + 当前未完成 `1m`。
-- `/api/v1/klines&timeframe=5m/1H/...&include_live=true`：能拿到历史 final 高周期 + 当前未完成高周期，当前未完成高周期是在请求时用 final `1m` 和 live `1m` 合成的。
+- `/api/v1/klines&timeframe=5m/1H/...&include_live=true`：能拿到历史 final 高周期 + 当前未完成高周期，当前未完成高周期是在请求时按级联源周期合成的。
 - `/api/v1/klines&include_live=false`：只能拿到已经入库的 final bars，最新数据至少落后到最近一次周期收盘。
 
 Symbols：
@@ -418,6 +419,51 @@ final 1m received
 
 如果 final `1m` 写库失败，collector 会收到 error，当前 exchange worker 会重连；该 final bar 不会被推送，也不会触发高周期 rollup。
 
+### Retention 和分区维护
+
+默认历史保留策略：
+
+| 周期 | 保留 |
+| --- | --- |
+| `1m` | 30 天 |
+| `5m` / `15m` / `30m` | 90 天 |
+| `1H` / `2H` / `4H` / `6H` / `12H` | 180 天 |
+| `1D` 及以上 | 全部保留 |
+
+清理命令默认是 dry-run，只统计将删除的行数：
+
+```bash
+USE_MEMORY_STORE=false \
+MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
+go run ./cmd/maintain_klines -mode=retention
+```
+
+真实分批删除：
+
+```bash
+USE_MEMORY_STORE=false \
+MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
+go run ./cmd/maintain_klines -mode=retention -dry-run=false -batch-size=10000
+```
+
+`sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`，按 timeframe + month 分区。生成迁移 SQL：
+
+```bash
+go run ./cmd/maintain_klines -mode=partition-create-sql -partition-start=2026-01 -partition-months=36 > /tmp/bar_history_timeframe_partition.sql
+```
+
+生成按 retention 可直接 drop 的整月过期分区 SQL：
+
+```bash
+go run ./cmd/maintain_klines -mode=partition-drop-sql -partition-start=2026-01 -partition-months=36
+```
+
+把现有 `p_tf_*_future` 分区扩展成新的月分区：
+
+```bash
+go run ./cmd/maintain_klines -mode=partition-add-sql -partition-start=2029-01 -partition-months=12
+```
+
 ## Backfill 和 Redis
 
 历史回填：
@@ -468,6 +514,6 @@ livebar:{exchange}:{symbol}:{timeframe}
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
 - 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
-- 高周期 rollup 当前不严格检查 `1m` 是否每分钟连续无缺口。
+- 高周期 rollup 当前只检查源周期最后一根是否覆盖到目标周期结束，不严格检查源周期中间是否连续无缺口。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。
 - 如果没有先 backfill，HTTP 历史只包含服务启动后成功写入的 final bars。

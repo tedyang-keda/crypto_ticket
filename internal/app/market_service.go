@@ -170,17 +170,23 @@ func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar)
 	for _, bar := range bars {
 		s.publishBar(bar)
 	}
-	return s.rollupFinalOneMinuteBars(ctx, bars)
+	return s.rollupFinalBars(ctx, bars)
 }
 
-func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []market.Bar) error {
+func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar) error {
 	nowMS := market.NowMS()
-	for _, bar := range bars {
-		if bar.Timeframe != aggregator.OneMinute || !bar.IsFinal {
+	queue := append([]market.Bar(nil), bars...)
+	for len(queue) > 0 {
+		bar := queue[0]
+		queue = queue[1:]
+		if !bar.IsFinal {
 			continue
 		}
 		for _, tf := range s.frames {
 			if tf == aggregator.OneMinute {
+				continue
+			}
+			if aggregator.RollupSourceTimeframe(tf) != bar.Timeframe {
 				continue
 			}
 			targetStart := timeframe.FloorStartMS(bar.StartMS, tf)
@@ -188,14 +194,14 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 			if bar.EndMS < targetEnd {
 				continue
 			}
-			oneMinuteBars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, aggregator.OneMinute, targetStart, targetEnd)
+			sourceBars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, bar.Timeframe, targetStart, targetEnd)
 			if err != nil {
 				return err
 			}
-			if len(oneMinuteBars) == 0 || oneMinuteBars[len(oneMinuteBars)-1].EndMS < targetEnd {
+			if len(sourceBars) == 0 || sourceBars[len(sourceBars)-1].EndMS < targetEnd {
 				continue
 			}
-			rollup := aggregator.RollupBars(tf, oneMinuteBars, true, "rollup", nowMS)
+			rollup := aggregator.RollupBars(tf, sourceBars, true, "rollup", nowMS)
 			if rollup == nil {
 				continue
 			}
@@ -207,6 +213,7 @@ func (s *MarketService) rollupFinalOneMinuteBars(ctx context.Context, bars []mar
 				return err
 			}
 			s.publishBar(enriched)
+			queue = append(queue, enriched)
 		}
 	}
 	return nil
@@ -221,23 +228,57 @@ func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market
 		if !s.hub.HasSubscribers(realtime.KlineChannel(oneMinute.Exchange, oneMinute.Symbol, tf)) {
 			continue
 		}
-		targetStart := timeframe.FloorStartMS(oneMinute.StartMS, tf)
-		partialInputs, err := s.store.BarsInRange(ctx, oneMinute.Exchange, oneMinute.Symbol, aggregator.OneMinute, targetStart, oneMinute.StartMS-1)
+		enriched, err := s.buildLiveRollup(ctx, tf, oneMinute, nowMS)
 		if err != nil {
 			return err
 		}
-		partialInputs = append(partialInputs, oneMinute)
-		rollup := aggregator.RollupBars(tf, partialInputs, false, "live", nowMS)
-		if rollup == nil {
-			continue
+		if enriched != nil {
+			s.publishBar(*enriched)
 		}
-		enriched, err := s.enrichBar(ctx, *rollup)
-		if err != nil {
-			return err
-		}
-		s.publishBar(enriched)
 	}
 	return nil
+}
+
+func (s *MarketService) buildLiveRollup(ctx context.Context, target string, liveOneMinute market.Bar, nowMS int64) (*market.Bar, error) {
+	target = timeframe.MustNormalize(target)
+	if target == aggregator.OneMinute {
+		bar := market.DecorateBar(liveOneMinute)
+		return &bar, nil
+	}
+	source := aggregator.RollupSourceTimeframe(target)
+	if source == "" {
+		return nil, nil
+	}
+
+	var liveSource market.Bar
+	if source == aggregator.OneMinute {
+		liveSource = liveOneMinute
+	} else {
+		partial, err := s.buildLiveRollup(ctx, source, liveOneMinute, nowMS)
+		if err != nil {
+			return nil, err
+		}
+		if partial == nil {
+			return nil, nil
+		}
+		liveSource = *partial
+	}
+
+	targetStart := timeframe.FloorStartMS(liveOneMinute.StartMS, target)
+	partialInputs, err := s.store.BarsInRange(ctx, liveOneMinute.Exchange, liveOneMinute.Symbol, source, targetStart, liveSource.StartMS-1)
+	if err != nil {
+		return nil, err
+	}
+	partialInputs = append(partialInputs, liveSource)
+	rollup := aggregator.RollupBars(target, partialInputs, false, "live", nowMS)
+	if rollup == nil {
+		return nil, nil
+	}
+	enriched, err := s.enrichBar(ctx, *rollup)
+	if err != nil {
+		return nil, err
+	}
+	return &enriched, nil
 }
 
 func (s *MarketService) publishBar(bar market.Bar) {
@@ -318,21 +359,14 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		return trimBars(mergeLiveBar(bars, live), query.Limit+1), nil
 	}
 
-	partialStart := timeframe.FloorStartMS(live.StartMS, query.Timeframe)
-	partialInputs, err := s.store.BarsInRange(ctx, query.Exchange, query.Symbol, aggregator.OneMinute, partialStart, live.StartMS-1)
+	partial, err := s.buildLiveRollup(ctx, query.Timeframe, *live, market.NowMS())
 	if err != nil {
 		return nil, err
 	}
-	partialInputs = append(partialInputs, *live)
-	partial := aggregator.RollupBars(query.Timeframe, partialInputs, false, "live", market.NowMS())
 	if partial == nil {
 		return trimBars(bars, query.Limit), nil
 	}
-	enriched, err := s.enrichBar(ctx, *partial)
-	if err != nil {
-		return nil, err
-	}
-	return trimBars(mergeLiveBar(bars, &enriched), query.Limit+1), nil
+	return trimBars(mergeLiveBar(bars, partial), query.Limit+1), nil
 }
 
 func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Bar {
@@ -378,16 +412,33 @@ func normalizeFrames(frames []string) []string {
 		frames = timeframe.Order
 	}
 	seen := map[string]bool{}
-	out := make([]string, 0, len(frames))
+	requested := map[string]bool{}
 	for _, tf := range frames {
 		tf = timeframe.MustNormalize(tf)
-		if seen[tf] {
+		requested[tf] = true
+		addRollupDependencies(tf, requested)
+	}
+	out := make([]string, 0, len(requested))
+	for _, tf := range timeframe.Order {
+		if !requested[tf] || seen[tf] {
 			continue
 		}
 		seen[tf] = true
 		out = append(out, tf)
 	}
 	return out
+}
+
+func addRollupDependencies(tf string, out map[string]bool) {
+	source := aggregator.RollupSourceTimeframe(tf)
+	if source == "" || source == aggregator.OneMinute {
+		return
+	}
+	if out[source] {
+		return
+	}
+	out[source] = true
+	addRollupDependencies(source, out)
 }
 
 func barKey(exchange string, symbol string, tf string) string {

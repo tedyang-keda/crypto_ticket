@@ -31,6 +31,24 @@ func TestRollupBarsFromOneMinuteBars(t *testing.T) {
 	}
 }
 
+func TestRollupSourceTimeframeUsesCascadeInputs(t *testing.T) {
+	cases := map[string]string{
+		"5m":  "1m",
+		"15m": "1m",
+		"30m": "15m",
+		"1H":  "30m",
+		"12H": "1H",
+		"1D":  "1H",
+		"1M":  "1D",
+		"3M":  "1D",
+	}
+	for target, expected := range cases {
+		if got := RollupSourceTimeframe(target); got != expected {
+			t.Fatalf("target=%s expected source=%s got=%s", target, expected, got)
+		}
+	}
+}
+
 func TestApplyDerivedUsesPreviousCloseAndLow(t *testing.T) {
 	bar := ApplyDerived(market.Bar{
 		OpenPrice:  100,

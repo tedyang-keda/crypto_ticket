@@ -10,6 +10,23 @@ import (
 
 const OneMinute = "1m"
 
+func RollupSourceTimeframe(target string) string {
+	switch timeframe.MustNormalize(target) {
+	case "5m", "15m":
+		return "1m"
+	case "30m":
+		return "15m"
+	case "1H":
+		return "30m"
+	case "2H", "4H", "6H", "12H", "1D":
+		return "1H"
+	case "2D", "3D", "5D", "1W", "2W", "1M", "3M":
+		return "1D"
+	default:
+		return ""
+	}
+}
+
 func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updatedAtMS int64) *market.Bar {
 	tf = timeframe.MustNormalize(tf)
 	if len(bars) == 0 {

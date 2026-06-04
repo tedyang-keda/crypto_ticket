@@ -48,33 +48,7 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			PRIMARY KEY (exchange, symbol),
 			KEY idx_registry_active (exchange, is_active, last_seen_at_ms)
 		)`,
-		`CREATE TABLE IF NOT EXISTS bar_history (
-			exchange VARCHAR(16) NOT NULL,
-			symbol VARCHAR(64) NOT NULL,
-			margin_type VARCHAR(16) NOT NULL DEFAULT '',
-			timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-			start_ms BIGINT NOT NULL,
-			end_ms BIGINT NOT NULL,
-			open_price DECIMAL(28, 12) NOT NULL,
-			high_price DECIMAL(28, 12) NOT NULL,
-			low_price DECIMAL(28, 12) NOT NULL,
-			close_price DECIMAL(28, 12) NOT NULL,
-			volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
-			volume_unit VARCHAR(16) NOT NULL DEFAULT '',
-			quote_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
-			quote_unit VARCHAR(16) NOT NULL DEFAULT '',
-			contract_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
-			trade_count BIGINT NOT NULL DEFAULT 0,
-			prev_close DECIMAL(28, 12) NOT NULL DEFAULT 0,
-			chg DECIMAL(18, 8) NOT NULL DEFAULT 0,
-			amp DECIMAL(18, 8) NOT NULL DEFAULT 0,
-			last_tick_ms BIGINT NOT NULL,
-			is_final TINYINT(1) NOT NULL DEFAULT 0,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-			PRIMARY KEY (exchange, symbol, timeframe, start_ms),
-			KEY idx_bar_lookup (exchange, symbol, timeframe, start_ms)
-		)`,
+		createBarHistoryTableStatement(time.Now().UTC()),
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -85,6 +59,17 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func createBarHistoryTableStatement(now time.Time) string {
+	partitionStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	return "CREATE TABLE IF NOT EXISTS bar_history (\n" +
+		barHistoryColumnsDDL() +
+		"\n)\n" +
+		BuildTimeframePartitionClause(TimeframePartitionOptions{
+			StartMonth: partitionStart,
+			Months:     36,
+		})
 }
 
 func (s *Store) ensureBarHistoryColumns(ctx context.Context) error {
@@ -146,6 +131,27 @@ func (s *Store) ClearBars(ctx context.Context) (int64, error) {
 		deleted += count
 	}
 	return deleted, nil
+}
+
+func (s *Store) DeleteBarsBefore(ctx context.Context, timeframe string, cutoffMS int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 10_000
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM bar_history
+		WHERE timeframe = ? AND start_ms < ?
+		ORDER BY start_ms ASC
+		LIMIT ?`, timeframe, cutoffMS, limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Store) CountBarsBefore(ctx context.Context, timeframe string, cutoffMS int64) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bar_history
+		WHERE timeframe = ? AND start_ms < ?`, timeframe, cutoffMS).Scan(&count)
+	return count, err
 }
 
 func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
