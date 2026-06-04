@@ -9,19 +9,25 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                     string
-	RedisURL                     string
-	MySQLDSN                     string
-	UseMemory                    bool
-	RecentCacheLimit             int
-	Timeframes                   []string
-	DashboardDir                 string
-	EnableMockSymbols            bool
-	EnableCollector              bool
-	SymbolRefreshIntervalSeconds int
-	ReconnectBaseDelaySeconds    int
-	ReconnectMaxDelaySeconds     int
-	Exchanges                    []ExchangeConfig
+	HTTPAddr                          string
+	RedisURL                          string
+	MySQLDSN                          string
+	UseMemory                         bool
+	RecentCacheLimit                  int
+	Timeframes                        []string
+	DashboardDir                      string
+	EnableMockSymbols                 bool
+	EnableCollector                   bool
+	EnableKlineGuardian               bool
+	KlineGuardianAuditIntervalSeconds int
+	KlineGuardianWindowMinutes        int
+	KlineGuardianDelaySeconds         int
+	KlineGuardianSymbolsPerRun        int
+	KlineGuardianRequestDelayMS       int
+	SymbolRefreshIntervalSeconds      int
+	ReconnectBaseDelaySeconds         int
+	ReconnectMaxDelaySeconds          int
+	Exchanges                         []ExchangeConfig
 }
 
 type ExchangeConfig struct {
@@ -45,19 +51,25 @@ func Load() Config {
 	}
 	enableCollector := envBool("ENABLE_COLLECTOR", false)
 	return Config{
-		HTTPAddr:                     env("HTTP_ADDR", "127.0.0.1:8088"),
-		RedisURL:                     env("REDIS_URL", "redis://127.0.0.1:6379/0"),
-		MySQLDSN:                     env("MYSQL_DSN", mysqlDSNFromEnv()),
-		UseMemory:                    envBool("USE_MEMORY_STORE", true),
-		RecentCacheLimit:             envInt("RECENT_CACHE_LIMIT", 300),
-		Timeframes:                   outFrames,
-		DashboardDir:                 env("DASHBOARD_DIR", "./web/dist"),
-		EnableMockSymbols:            envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
-		EnableCollector:              enableCollector,
-		SymbolRefreshIntervalSeconds: envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
-		ReconnectBaseDelaySeconds:    envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
-		ReconnectMaxDelaySeconds:     envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
-		Exchanges:                    loadExchangeConfigs(),
+		HTTPAddr:                          env("HTTP_ADDR", "127.0.0.1:8088"),
+		RedisURL:                          env("REDIS_URL", "redis://127.0.0.1:6379/0"),
+		MySQLDSN:                          env("MYSQL_DSN", mysqlDSNFromEnv()),
+		UseMemory:                         envBool("USE_MEMORY_STORE", true),
+		RecentCacheLimit:                  envInt("RECENT_CACHE_LIMIT", 300),
+		Timeframes:                        outFrames,
+		DashboardDir:                      env("DASHBOARD_DIR", "./web/dist"),
+		EnableMockSymbols:                 envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
+		EnableCollector:                   enableCollector,
+		EnableKlineGuardian:               envBool("ENABLE_KLINE_GUARDIAN", enableCollector),
+		KlineGuardianAuditIntervalSeconds: envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 60),
+		KlineGuardianWindowMinutes:        envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
+		KlineGuardianDelaySeconds:         envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
+		KlineGuardianSymbolsPerRun:        envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 50),
+		KlineGuardianRequestDelayMS:       envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
+		SymbolRefreshIntervalSeconds:      envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
+		ReconnectBaseDelaySeconds:         envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
+		ReconnectMaxDelaySeconds:          envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
+		Exchanges:                         loadExchangeConfigs(),
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"crypto-ticket/internal/collector"
 	"crypto-ticket/internal/config"
 	"crypto-ticket/internal/exchange"
+	"crypto-ticket/internal/guardian"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
@@ -95,6 +96,38 @@ func startBackgroundWorkers(
 		}()
 		log.Printf("kline collector started runtimes=%d", len(runtimes))
 	}
+	if cfg.EnableKlineGuardian {
+		guardianStore, ok := store.(guardian.Store)
+		if !ok {
+			log.Printf("kline guardian disabled: store does not implement guardian state interface")
+			return
+		}
+		fetchers := makeKlineGuardianFetchers(cfg.Exchanges)
+		if len(fetchers) == 0 {
+			log.Printf("kline guardian disabled: no REST kline fetchers")
+			return
+		}
+		worker := guardian.New(guardianStore, marketService, fetchers, guardian.Config{
+			Enabled:       true,
+			AuditInterval: time.Duration(cfg.KlineGuardianAuditIntervalSeconds) * time.Second,
+			AuditWindow:   time.Duration(cfg.KlineGuardianWindowMinutes) * time.Minute,
+			AuditDelay:    time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
+			SymbolsPerRun: cfg.KlineGuardianSymbolsPerRun,
+			RequestDelay:  time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
+		})
+		marketService.AddFinalBarObserver(worker)
+		go func() {
+			if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds",
+			len(fetchers),
+			cfg.KlineGuardianAuditIntervalSeconds,
+			cfg.KlineGuardianWindowMinutes,
+			cfg.KlineGuardianDelaySeconds,
+		)
+	}
 }
 
 func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) []collector.Runtime {
@@ -124,4 +157,20 @@ func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) [
 		})
 	}
 	return runtimes
+}
+
+func makeKlineGuardianFetchers(configs []config.ExchangeConfig) []guardian.Fetcher {
+	fetchers := make([]guardian.Fetcher, 0, len(configs))
+	for _, exchangeConfig := range configs {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		switch exchangeConfig.Name {
+		case "binance":
+			fetchers = append(fetchers, exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		case "okx":
+			fetchers = append(fetchers, exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		}
+	}
+	return fetchers
 }

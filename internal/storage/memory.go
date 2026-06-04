@@ -10,15 +10,18 @@ import (
 )
 
 type MemoryHistoricalStore struct {
-	mu      sync.RWMutex
-	bars    map[string]map[int64]market.Bar
-	symbols map[string]market.SymbolInfo
+	mu             sync.RWMutex
+	bars           map[string]map[int64]market.Bar
+	symbols        map[string]market.SymbolInfo
+	guardianStates map[string]market.KlineGuardianState
+	guardianEvents []market.KlineGuardianEvent
 }
 
 func NewMemoryHistoricalStore() *MemoryHistoricalStore {
 	return &MemoryHistoricalStore{
-		bars:    make(map[string]map[int64]market.Bar),
-		symbols: make(map[string]market.SymbolInfo),
+		bars:           make(map[string]map[int64]market.Bar),
+		symbols:        make(map[string]market.SymbolInfo),
+		guardianStates: make(map[string]market.KlineGuardianState),
 	}
 }
 
@@ -113,4 +116,42 @@ func (m *MemoryHistoricalStore) ListSymbols(_ context.Context, exchange string, 
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Symbol < out[j].Symbol })
 	return out, nil
+}
+
+func (m *MemoryHistoricalStore) LoadKlineGuardianState(_ context.Context, exchange string, symbol string, tf string) (*market.KlineGuardianState, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	state, ok := m.guardianStates[guardianStateKey(exchange, symbol, tf)]
+	if !ok {
+		return nil, nil
+	}
+	return &state, nil
+}
+
+func (m *MemoryHistoricalStore) UpsertKlineGuardianState(_ context.Context, state market.KlineGuardianState) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state.Exchange = strings.ToLower(state.Exchange)
+	state.Symbol = strings.ToUpper(state.Symbol)
+	m.guardianStates[guardianStateKey(state.Exchange, state.Symbol, state.Timeframe)] = state
+	return nil
+}
+
+func (m *MemoryHistoricalStore) InsertKlineGuardianEvents(_ context.Context, events []market.KlineGuardianEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, event := range events {
+		event.ID = int64(len(m.guardianEvents) + 1)
+		event.Exchange = strings.ToLower(event.Exchange)
+		event.Symbol = strings.ToUpper(event.Symbol)
+		m.guardianEvents = append(m.guardianEvents, event)
+	}
+	return nil
+}
+
+func guardianStateKey(exchange string, symbol string, tf string) string {
+	return strings.ToLower(exchange) + ":" + strings.ToUpper(symbol) + ":" + tf
 }

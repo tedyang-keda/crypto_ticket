@@ -181,6 +181,42 @@ PARTITION BY RANGE COLUMNS(timeframe, start_ms) (
   PARTITION p_tf_6h_future VALUES LESS THAN (MAXVALUE, MAXVALUE)
 );
 
+CREATE TABLE IF NOT EXISTS kline_guardian_state (
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  last_final_start_ms BIGINT NOT NULL DEFAULT 0,
+  last_final_recv_ms BIGINT NOT NULL DEFAULT 0,
+  last_checked_start_ms BIGINT NOT NULL DEFAULT 0,
+  last_checked_end_ms BIGINT NOT NULL DEFAULT 0,
+  last_checked_at_ms BIGINT NOT NULL DEFAULT 0,
+  last_gap_start_ms BIGINT NOT NULL DEFAULT 0,
+  last_gap_end_ms BIGINT NOT NULL DEFAULT 0,
+  status VARCHAR(32) NOT NULL DEFAULT '',
+  updated_at_ms BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (exchange, symbol, timeframe),
+  KEY idx_guardian_state_status (exchange, status, updated_at)
+);
+
+CREATE TABLE IF NOT EXISTS kline_guardian_event (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  start_ms BIGINT NOT NULL,
+  end_ms BIGINT NOT NULL,
+  event_type VARCHAR(32) NOT NULL,
+  old_value_json JSON NULL,
+  new_value_json JSON NULL,
+  created_at_ms BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_guardian_event_market_time (exchange, symbol, timeframe, start_ms),
+  KEY idx_guardian_event_type (event_type, created_at)
+);
+
 CREATE TABLE IF NOT EXISTS archive_manifest (
   exchange VARCHAR(16) NOT NULL,
   timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,

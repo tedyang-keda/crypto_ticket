@@ -82,6 +82,34 @@ type Event struct {
 	Bar       *Bar   `json:"bar,omitempty"`
 }
 
+type KlineGuardianState struct {
+	Exchange           string `json:"exchange"`
+	Symbol             string `json:"symbol"`
+	Timeframe          string `json:"timeframe"`
+	LastFinalStartMS   int64  `json:"last_final_start_ms"`
+	LastFinalRecvMS    int64  `json:"last_final_recv_ms"`
+	LastCheckedStartMS int64  `json:"last_checked_start_ms"`
+	LastCheckedEndMS   int64  `json:"last_checked_end_ms"`
+	LastCheckedAtMS    int64  `json:"last_checked_at_ms"`
+	LastGapStartMS     int64  `json:"last_gap_start_ms"`
+	LastGapEndMS       int64  `json:"last_gap_end_ms"`
+	Status             string `json:"status"`
+	UpdatedAtMS        int64  `json:"updated_at_ms"`
+}
+
+type KlineGuardianEvent struct {
+	ID           int64  `json:"id,omitempty"`
+	Exchange     string `json:"exchange"`
+	Symbol       string `json:"symbol"`
+	Timeframe    string `json:"timeframe"`
+	StartMS      int64  `json:"start_ms"`
+	EndMS        int64  `json:"end_ms"`
+	EventType    string `json:"event_type"`
+	OldValueJSON string `json:"old_value_json,omitempty"`
+	NewValueJSON string `json:"new_value_json,omitempty"`
+	CreatedAtMS  int64  `json:"created_at_ms"`
+}
+
 func NowMS() int64 {
 	return time.Now().UnixMilli()
 }

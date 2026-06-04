@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 
@@ -18,12 +19,17 @@ const (
 )
 
 type MarketService struct {
-	store     storage.HistoricalStore
-	hub       *realtime.Hub
-	mu        sync.RWMutex
-	frames    []string
-	recentMax int
-	liveBars  map[string]market.Bar
+	store          storage.HistoricalStore
+	hub            *realtime.Hub
+	mu             sync.RWMutex
+	frames         []string
+	recentMax      int
+	liveBars       map[string]market.Bar
+	finalObservers []FinalBarObserver
+}
+
+type FinalBarObserver interface {
+	ObserveFinalBar(ctx context.Context, bar market.Bar) error
 }
 
 func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
@@ -60,14 +66,75 @@ func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
 	s.mu.Unlock()
 
 	if enriched.IsFinal {
-		if err := s.persistFinalBars(ctx, []market.Bar{enriched}); err != nil {
+		if err := s.persistFinalBars(ctx, []market.Bar{enriched}, false); err != nil {
 			return err
 		}
+		s.notifyFinalBarObservers(ctx, enriched)
 		return nil
 	}
 	s.publishBar(enriched)
 	if enriched.Timeframe == aggregator.OneMinute {
 		if err := s.publishLiveRollups(ctx, enriched); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *MarketService) AddFinalBarObserver(observer FinalBarObserver) {
+	if observer == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalObservers = append(s.finalObservers, observer)
+}
+
+func (s *MarketService) notifyFinalBarObservers(ctx context.Context, bar market.Bar) {
+	s.mu.RLock()
+	observers := append([]FinalBarObserver(nil), s.finalObservers...)
+	s.mu.RUnlock()
+	for _, observer := range observers {
+		_ = observer.ObserveFinalBar(ctx, bar)
+	}
+}
+
+func (s *MarketService) RepairFinalBars(ctx context.Context, bars []market.Bar) error {
+	if len(bars) == 0 {
+		return nil
+	}
+	ordered := append([]market.Bar(nil), bars...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Exchange != ordered[j].Exchange {
+			return ordered[i].Exchange < ordered[j].Exchange
+		}
+		if ordered[i].Symbol != ordered[j].Symbol {
+			return ordered[i].Symbol < ordered[j].Symbol
+		}
+		if ordered[i].Timeframe != ordered[j].Timeframe {
+			return ordered[i].Timeframe < ordered[j].Timeframe
+		}
+		return ordered[i].StartMS < ordered[j].StartMS
+	})
+	for _, bar := range ordered {
+		bar.IsFinal = true
+		if bar.Source == "" {
+			bar.Source = "rest"
+		}
+		if bar.Reason == "" {
+			bar.Reason = "guardian_repair"
+		}
+		enriched, err := s.prepareFinalBar(ctx, bar)
+		if err != nil {
+			return err
+		}
+		if !validBar(enriched) {
+			continue
+		}
+		s.mu.Lock()
+		delete(s.liveBars, barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe))
+		s.mu.Unlock()
+		if err := s.persistFinalBars(ctx, []market.Bar{enriched}, true); err != nil {
 			return err
 		}
 	}
@@ -157,7 +224,15 @@ func (s *MarketService) previousClose(ctx context.Context, bar market.Bar) (floa
 	return 0, nil
 }
 
-func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar) error {
+func (s *MarketService) prepareFinalBar(ctx context.Context, bar market.Bar) (market.Bar, error) {
+	bar = normalizeBar(bar)
+	if !validBar(bar) {
+		return bar, nil
+	}
+	return s.enrichBar(ctx, bar)
+}
+
+func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar, repairRollups bool) error {
 	if len(bars) == 0 {
 		return nil
 	}
@@ -170,10 +245,10 @@ func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar)
 	for _, bar := range bars {
 		s.publishBar(bar)
 	}
-	return s.rollupFinalBars(ctx, bars)
+	return s.rollupFinalBars(ctx, bars, repairRollups)
 }
 
-func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar) error {
+func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar, repairRollups bool) error {
 	nowMS := market.NowMS()
 	queue := append([]market.Bar(nil), bars...)
 	for len(queue) > 0 {
@@ -191,14 +266,14 @@ func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar) 
 			}
 			targetStart := timeframe.FloorStartMS(bar.StartMS, tf)
 			targetEnd := timeframe.EndMS(targetStart, tf)
-			if bar.EndMS < targetEnd {
+			if !repairRollups && bar.EndMS < targetEnd {
 				continue
 			}
 			sourceBars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, bar.Timeframe, targetStart, targetEnd)
 			if err != nil {
 				return err
 			}
-			if len(sourceBars) == 0 || sourceBars[len(sourceBars)-1].EndMS < targetEnd {
+			if !sourceBarsComplete(sourceBars, bar.Timeframe, targetStart, targetEnd) {
 				continue
 			}
 			rollup := aggregator.RollupBars(tf, sourceBars, true, "rollup", nowMS)
@@ -217,6 +292,20 @@ func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar) 
 		}
 	}
 	return nil
+}
+
+func sourceBarsComplete(bars []market.Bar, sourceTF string, targetStart int64, targetEnd int64) bool {
+	if len(bars) == 0 {
+		return false
+	}
+	expectedStart := targetStart
+	for _, bar := range bars {
+		if !bar.IsFinal || bar.StartMS != expectedStart {
+			return false
+		}
+		expectedStart = timeframe.NextStartMS(bar.StartMS, sourceTF)
+	}
+	return expectedStart > targetEnd && bars[len(bars)-1].EndMS >= targetEnd
 }
 
 func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market.Bar) error {

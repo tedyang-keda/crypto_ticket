@@ -255,6 +255,47 @@ func TestIngestKlineCascadesFinalRollupsThroughIntermediateFrames(t *testing.T) 
 	}
 }
 
+func TestRepairFinalBarsRebuildsContainingRollups(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "5m"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "5m")
+
+	for i := 0; i < 5; i++ {
+		start := base + int64(i)*60_000
+		if err := service.IngestKline(ctx, market.Bar{
+			Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+			StartMS: start, EndMS: start + 59_999,
+			OpenPrice: 100, HighPrice: 105, LowPrice: 99, ClosePrice: 102,
+			Volume: 1, QuoteVolume: 100, IsFinal: true,
+		}); err != nil {
+			t.Fatalf("ingest final minute %d: %v", i, err)
+		}
+	}
+
+	if err := service.RepairFinalBars(ctx, []market.Bar{{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1m",
+		StartMS: base + 2*60_000, EndMS: base + 3*60_000 - 1,
+		OpenPrice: 102, HighPrice: 130, LowPrice: 98, ClosePrice: 120,
+		Volume: 9, QuoteVolume: 900, IsFinal: true, Source: "rest", Reason: "guardian_repair",
+	}}); err != nil {
+		t.Fatalf("repair final: %v", err)
+	}
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "5m", Limit: 10, IncludeLive: false,
+	})
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+	if len(bars) != 1 {
+		t.Fatalf("expected one final 5m bar, got %+v", bars)
+	}
+	bar := bars[0]
+	if !bar.IsFinal || bar.HighPrice != 130 || bar.LowPrice != 98 || bar.Volume != 13 || bar.QuoteVolume != 1300 {
+		t.Fatalf("expected repaired 5m rollup, got %+v", bar)
+	}
+}
+
 func newTestMarketService() *MarketService {
 	return newTestMarketServiceWithFrames([]string{"1m"})
 }

@@ -20,6 +20,11 @@ Binance / OKX official 1m kline WebSocket
            推送 final 1m kline + ticker WS event
            查询已落库 final 1m，合成已完成的高周期 K 线
            写入高周期 final bar 并推送高周期 kline WS event
+      -> kline guardian:
+           记录 final 1m 水位
+           如果发现水位跳过，使用交易所 REST official 1m kline 补洞
+           定时用近窗口 REST official 1m kline 校验/修复 MySQL
+           修复后复用 MarketService 入库、推送和级联 rollup
 
 HTTP /api/v1/klines?include_live=true
   -> 读取 store 中已持久化的目标周期 bars
@@ -36,6 +41,7 @@ HTTP /api/v1/klines?include_live=true
 - HTTP 可以读不同 timeframe 的行情；默认会包含当前未完成行情。
 - WS 会推 `1m` live，也会对当前有订阅者的高周期实时合成并推送 live bar。
 - 高周期 final/live rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。
+- Kline guardian 不从 trade 重算 OHLCV；它只用交易所官方 REST kline 校验和修复官方 WS 可能漏掉的 final `1m`。
 
 ## 支持的周期
 
@@ -96,6 +102,12 @@ go run ./cmd/marketd
 | `USE_MEMORY_STORE` | `true` | `true` 使用进程内 store；`false` 使用 MySQL |
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
+| `ENABLE_KLINE_GUARDIAN` | 跟随 `ENABLE_COLLECTOR` | 是否启动轻量 K 线守护者 |
+| `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` | `60` | 近窗口 REST 校验周期 |
+| `KLINE_GUARDIAN_WINDOW_MINUTES` | `30` | 每次校验最近多少分钟的 final `1m` |
+| `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
+| `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `50` | 每轮最多校验多少个 active symbol，按轮询 cursor 分批 |
+| `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | symbol 之间 REST 请求节流 |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
 | `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
@@ -179,32 +191,64 @@ final `1m`：
 - MySQL 模式下写入 `bar_history`。
 - 写库成功后推送 final `kline` event 和 `ticker` event。
 - 再触发高周期 rollup。
+- 通知 kline guardian 更新该 symbol 的 final `1m` 水位。
+
+## Kline Guardian
+
+`marketd` 内置轻量 K 线守护者，用来处理 WS 断流、进程重启、写入失败后可能造成的 final `1m` 缺口或字段不一致。
+
+守护者有两条路径：
+
+1. 实时水位检测：每次 final `1m` 成功入库后，检查 `(exchange, symbol, 1m)` 的上一根 final start。若新 final start 跳过了一个或多个分钟桶，则立即用交易所 REST official `1m` kline 拉取缺口区间并修复。
+2. 近窗口 REST 校验：按 `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` 定时轮询 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。
+
+校验字段：
+
+- `open_price` / `high_price` / `low_price` / `close_price`
+- `volume` / `quote_volume` / `contract_volume`
+- Binance 会校验 `trade_count`；OKX REST candles 当前没有 trade count，跳过该字段。
+
+修复逻辑：
+
+1. 缺失或字段不一致时，以交易所 REST official bar 为准。
+2. 调用 `MarketService.RepairFinalBars` upsert final `1m`。
+3. 重新计算包含该 `1m` 的高周期 bucket，并继续级联到更高周期。
+4. 修复后的 final `1m` 和受影响高周期 final bar 都会走正常 WS 推送路径。
+
+守护者只校验 final `1m`，不校验当前未完成 live bar。live 行情仍以官方 WS 最新推送为准。
 
 ## 高周期合并逻辑
 
-高周期合并只由 final `1m` 触发。
+高周期 final 合并由 final 源周期触发。源周期是级联的，不是所有目标周期都直接扫 `1m`：
+
+```text
+5m / 15m <- 1m
+30m      <- 15m
+1H       <- 30m
+2H/4H/6H/12H/1D <- 1H
+2D/3D/5D/1W/2W/1M/3M <- 1D
+```
 
 对每个配置的 timeframe：
 
-1. 跳过 `1m`。
-2. 用当前 final `1m.start_ms` 计算目标周期 `target_start` 和 `target_end`。
-3. 如果当前 `1m.end_ms < target_end`，说明目标周期还没结束，跳过。
-4. 从 store 查询 `[target_start, target_end]` 范围内的 final `1m` bars。
-5. 如果查不到，或者最后一根 `1m.end_ms < target_end`，跳过。
-6. 使用这些 `1m` bars 合成目标周期：
-   - open = 第一根 `1m.open`
-   - high = 所有 `1m.high` 最大值
-   - low = 所有 `1m.low` 最小值
-   - close = 最后一根 `1m.close`
+1. 找出目标周期的级联源周期。
+2. 用当前 final 源 bar 的 `start_ms` 计算目标周期 `target_start` 和 `target_end`。
+3. 正常实时入库时，如果当前源 bar 还没覆盖到目标周期结束，跳过。
+4. 修复模式下，即使被修复的是 bucket 中间的源 bar，也会尝试重算它所在的完整目标 bucket。
+5. 从 store 查询 `[target_start, target_end]` 范围内的 final 源周期 bars。
+6. 严格检查源周期 bars 是否从 `target_start` 开始连续覆盖到 `target_end`；中间缺任何一根都不生成 final rollup。
+7. 使用这些源周期 bars 合成目标周期：
+   - open = 第一根源 bar 的 open
+   - high = 所有源 bar 的 high 最大值
+   - low = 所有源 bar 的 low 最小值
+   - close = 最后一根源 bar 的 close
    - volume / quote_volume / contract_volume / trade_count 求和
    - last_tick_ms 取最大值
    - `is_final=true`
    - `source=rollup`
    - `reason=rollup`
-7. 计算派生字段后写入 store。
-8. 推送该高周期 final `kline` event。
-
-当前实现只检查“最后一根 `1m` 是否覆盖到目标周期结束”，没有严格校验中间每一分钟都存在。如果中间有缺口，rollup 仍会用查到的 final `1m` bars 合成。
+8. 计算派生字段后写入 store。
+9. 推送该高周期 final `kline` event。
 
 ## WebSocket 推送
 
@@ -389,6 +433,8 @@ MySQL 模式下，Go 会确保存在这些表：
 
 - `symbol_registry`
 - `bar_history`
+- `kline_guardian_state`
+- `kline_guardian_event`
 
 `symbol_registry`：
 
@@ -418,6 +464,17 @@ final 1m received
 ```
 
 如果 final `1m` 写库失败，collector 会收到 error，当前 exchange worker 会重连；该 final bar 不会被推送，也不会触发高周期 rollup。
+
+`kline_guardian_state`：
+
+- 主键：`exchange, symbol, timeframe`
+- 存每个 symbol 的 final `1m` 水位、最近校验窗口、最近 gap 范围和状态。
+
+`kline_guardian_event`：
+
+- 自增主键：`id`
+- 存 `gap_detected`、`missing_repair`、`mismatch_repair`、`rest_error`、`repair_error` 等事件。
+- `old_value_json` / `new_value_json` 用来记录修复前后的 bar 快照或错误信息。
 
 ### Retention 和分区维护
 
@@ -514,6 +571,6 @@ livebar:{exchange}:{symbol}:{timeframe}
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
 - 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
-- 高周期 rollup 当前只检查源周期最后一根是否覆盖到目标周期结束，不严格检查源周期中间是否连续无缺口。
+- Kline guardian 会修复近窗口 final `1m` 缺口；超过窗口的历史需要用 backfill 或单独维护命令修复。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。
 - 如果没有先 backfill，HTTP 历史只包含服务启动后成功写入的 final bars。

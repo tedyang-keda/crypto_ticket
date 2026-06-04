@@ -47,8 +47,42 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY (exchange, symbol),
 			KEY idx_registry_active (exchange, is_active, last_seen_at_ms)
-		)`,
+			)`,
 		createBarHistoryTableStatement(time.Now().UTC()),
+		`CREATE TABLE IF NOT EXISTS kline_guardian_state (
+				exchange VARCHAR(16) NOT NULL,
+				symbol VARCHAR(64) NOT NULL,
+				timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+				last_final_start_ms BIGINT NOT NULL DEFAULT 0,
+				last_final_recv_ms BIGINT NOT NULL DEFAULT 0,
+				last_checked_start_ms BIGINT NOT NULL DEFAULT 0,
+				last_checked_end_ms BIGINT NOT NULL DEFAULT 0,
+				last_checked_at_ms BIGINT NOT NULL DEFAULT 0,
+				last_gap_start_ms BIGINT NOT NULL DEFAULT 0,
+				last_gap_end_ms BIGINT NOT NULL DEFAULT 0,
+				status VARCHAR(32) NOT NULL DEFAULT '',
+				updated_at_ms BIGINT NOT NULL DEFAULT 0,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (exchange, symbol, timeframe),
+				KEY idx_guardian_state_status (exchange, status, updated_at)
+			)`,
+		`CREATE TABLE IF NOT EXISTS kline_guardian_event (
+				id BIGINT NOT NULL AUTO_INCREMENT,
+				exchange VARCHAR(16) NOT NULL,
+				symbol VARCHAR(64) NOT NULL,
+				timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+				start_ms BIGINT NOT NULL,
+				end_ms BIGINT NOT NULL,
+				event_type VARCHAR(32) NOT NULL,
+				old_value_json JSON NULL,
+				new_value_json JSON NULL,
+				created_at_ms BIGINT NOT NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				KEY idx_guardian_event_market_time (exchange, symbol, timeframe, start_ms),
+				KEY idx_guardian_event_type (event_type, created_at)
+			)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -283,6 +317,86 @@ func (s *Store) ListSymbols(ctx context.Context, exchange string, activeOnly *bo
 	return symbols, rows.Err()
 }
 
+func (s *Store) LoadKlineGuardianState(ctx context.Context, exchange string, symbol string, tf string) (*market.KlineGuardianState, error) {
+	var state market.KlineGuardianState
+	err := s.db.QueryRowContext(ctx, `SELECT exchange, symbol, timeframe, last_final_start_ms, last_final_recv_ms,
+		last_checked_start_ms, last_checked_end_ms, last_checked_at_ms, last_gap_start_ms, last_gap_end_ms, status, updated_at_ms
+		FROM kline_guardian_state WHERE exchange = ? AND symbol = ? AND timeframe = ?`,
+		strings.ToLower(exchange), strings.ToUpper(symbol), tf,
+	).Scan(
+		&state.Exchange, &state.Symbol, &state.Timeframe, &state.LastFinalStartMS, &state.LastFinalRecvMS,
+		&state.LastCheckedStartMS, &state.LastCheckedEndMS, &state.LastCheckedAtMS, &state.LastGapStartMS,
+		&state.LastGapEndMS, &state.Status, &state.UpdatedAtMS,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+func (s *Store) UpsertKlineGuardianState(ctx context.Context, state market.KlineGuardianState) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO kline_guardian_state
+		(exchange, symbol, timeframe, last_final_start_ms, last_final_recv_ms, last_checked_start_ms,
+		 last_checked_end_ms, last_checked_at_ms, last_gap_start_ms, last_gap_end_ms, status, updated_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		 last_final_start_ms=GREATEST(last_final_start_ms, VALUES(last_final_start_ms)),
+		 last_final_recv_ms=VALUES(last_final_recv_ms),
+		 last_checked_start_ms=VALUES(last_checked_start_ms),
+		 last_checked_end_ms=VALUES(last_checked_end_ms),
+		 last_checked_at_ms=VALUES(last_checked_at_ms),
+		 last_gap_start_ms=VALUES(last_gap_start_ms),
+		 last_gap_end_ms=VALUES(last_gap_end_ms),
+		 status=VALUES(status),
+		 updated_at_ms=VALUES(updated_at_ms)`,
+		strings.ToLower(state.Exchange),
+		strings.ToUpper(state.Symbol),
+		state.Timeframe,
+		state.LastFinalStartMS,
+		state.LastFinalRecvMS,
+		state.LastCheckedStartMS,
+		state.LastCheckedEndMS,
+		state.LastCheckedAtMS,
+		state.LastGapStartMS,
+		state.LastGapEndMS,
+		state.Status,
+		state.UpdatedAtMS,
+	)
+	return err
+}
+
+func (s *Store) InsertKlineGuardianEvents(ctx context.Context, events []market.KlineGuardianEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	stmt := `INSERT INTO kline_guardian_event
+		(exchange, symbol, timeframe, start_ms, end_ms, event_type, old_value_json, new_value_json, created_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, event := range events {
+		createdAtMS := event.CreatedAtMS
+		if createdAtMS == 0 {
+			createdAtMS = market.NowMS()
+		}
+		if _, err := s.db.ExecContext(ctx, stmt,
+			strings.ToLower(event.Exchange),
+			strings.ToUpper(event.Symbol),
+			event.Timeframe,
+			event.StartMS,
+			event.EndMS,
+			event.EventType,
+			nullableJSON(event.OldValueJSON),
+			nullableJSON(event.NewValueJSON),
+			createdAtMS,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func barArgs(bar market.Bar) []any {
 	return []any{
 		strings.ToLower(bar.Exchange),
@@ -307,4 +421,11 @@ func barArgs(bar market.Bar) []any {
 		bar.LastTickMS,
 		bar.IsFinal,
 	}
+}
+
+func nullableJSON(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }
