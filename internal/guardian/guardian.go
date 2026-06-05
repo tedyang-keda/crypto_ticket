@@ -25,6 +25,7 @@ const (
 	defaultHTTPTimeout    = 20 * time.Second
 	defaultQueueSize      = 4096
 	defaultSymbolsPerRun  = 50
+	defaultSymbolMaxAge   = 10 * time.Minute
 	defaultFloatTolerance = 1e-8
 )
 
@@ -37,6 +38,7 @@ type Config struct {
 	HTTPTimeout    time.Duration
 	QueueSize      int
 	SymbolsPerRun  int
+	SymbolMaxAge   time.Duration
 	FloatTolerance float64
 }
 
@@ -124,6 +126,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.SymbolsPerRun <= 0 {
 		cfg.SymbolsPerRun = defaultSymbolsPerRun
+	}
+	if cfg.SymbolMaxAge <= 0 {
+		cfg.SymbolMaxAge = defaultSymbolMaxAge
 	}
 	if cfg.FloatTolerance <= 0 {
 		cfg.FloatTolerance = defaultFloatTolerance
@@ -331,6 +336,7 @@ func (g *Guardian) auditEndStart() int64 {
 
 func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 	activeOnly := true
+	now := market.NowMS()
 	var targets []auditTarget
 	for exchangeName := range g.fetchersByExchange {
 		symbols, err := g.store.ListSymbols(ctx, exchangeName, &activeOnly)
@@ -339,6 +345,9 @@ func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 		}
 		for _, symbol := range symbols {
 			if !symbol.IsActive {
+				continue
+			}
+			if symbol.LastSeenAtMS > 0 && now-symbol.LastSeenAtMS > int64(g.cfg.SymbolMaxAge/time.Millisecond) {
 				continue
 			}
 			fetcher := g.fetcherFor(symbol.Exchange, symbol.MarketType)

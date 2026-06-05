@@ -24,6 +24,7 @@ type Config struct {
 	KlineGuardianDelaySeconds         int
 	KlineGuardianSymbolsPerRun        int
 	KlineGuardianRequestDelayMS       int
+	KlineGuardianSymbolMaxAgeSeconds  int
 	SymbolRefreshIntervalSeconds      int
 	ReconnectBaseDelaySeconds         int
 	ReconnectMaxDelaySeconds          int
@@ -66,6 +67,7 @@ func Load() Config {
 		KlineGuardianDelaySeconds:         envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
 		KlineGuardianSymbolsPerRun:        envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 50),
 		KlineGuardianRequestDelayMS:       envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
+		KlineGuardianSymbolMaxAgeSeconds:  envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
 		SymbolRefreshIntervalSeconds:      envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
 		ReconnectBaseDelaySeconds:         envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
 		ReconnectMaxDelaySeconds:          envInt("RECONNECT_MAX_DELAY_SECONDS", 60),

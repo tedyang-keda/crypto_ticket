@@ -114,6 +114,7 @@ func startBackgroundWorkers(
 			AuditDelay:    time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
 			SymbolsPerRun: cfg.KlineGuardianSymbolsPerRun,
 			RequestDelay:  time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
+			SymbolMaxAge:  time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
 		})
 		marketService.AddFinalBarObserver(worker)
 		go func() {

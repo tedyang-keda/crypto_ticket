@@ -108,6 +108,7 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
 | `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `50` | 每轮最多校验多少个 active symbol，按轮询 cursor 分批 |
 | `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | symbol 之间 REST 请求节流 |
+| `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` | `600` | 只审计最近被 collector 刷新过的 active symbol，避免旧脏 symbol 进入 REST 校验 |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
 | `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
@@ -201,6 +202,8 @@ final `1m`：
 
 1. 实时水位检测：每次 final `1m` 成功入库后，检查 `(exchange, symbol, 1m)` 的上一根 final start。若新 final start 跳过了一个或多个分钟桶，则立即用交易所 REST official `1m` kline 拉取缺口区间并修复。
 2. 近窗口 REST 校验：按 `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` 定时轮询 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。
+
+为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
 
 校验字段：
 

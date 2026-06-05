@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
@@ -87,6 +88,27 @@ func TestRepairRangeRepairsMissingAndMismatchedBars(t *testing.T) {
 	}
 	if state == nil || state.Status != "repaired" || state.LastCheckedStartMS != base || state.LastCheckedEndMS != base+60_000 {
 		t.Fatalf("unexpected state: %+v", state)
+	}
+}
+
+func TestAuditTargetsSkipStaleSymbols(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	now := market.NowMS()
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{
+		{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", Status: "TRADING", IsActive: true, LastSeenAtMS: now},
+		{Exchange: "binance", Symbol: "OLDUSDT", MarketType: "um_futures", Status: "TRADING", IsActive: true, LastSeenAtMS: now - int64(time.Hour/time.Millisecond)},
+	}); err != nil {
+		t.Fatalf("upsert symbols: %v", err)
+	}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{&fakeFetcher{}}, Config{Enabled: true, SymbolMaxAge: 10 * time.Minute})
+
+	targets, err := g.auditTargets(ctx)
+	if err != nil {
+		t.Fatalf("audit targets: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Symbol != "BTCUSDT" {
+		t.Fatalf("expected only fresh symbol, got %+v", targets)
 	}
 }
 
