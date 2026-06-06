@@ -46,6 +46,13 @@ export const useMarketStore = create<MarketState>((set) => ({
   setBars: (bars) => set({ bars }),
   updateBar: (bar) =>
     set((state) => {
+      if (
+        bar.exchange.toLowerCase() !== state.exchange.toLowerCase() ||
+        bar.symbol.toUpperCase() !== state.symbol.toUpperCase() ||
+        bar.timeframe !== state.timeframe
+      ) {
+        return state;
+      }
       const bars = [...state.bars];
       const index = bars.findIndex((item) => item.start_ms === bar.start_ms);
       if (index >= 0) {

@@ -66,7 +66,7 @@ button {
 
 .topbar {
   display: grid;
-  grid-template-columns: minmax(320px, 0.85fr) minmax(720px, 1.7fr) minmax(320px, 0.95fr);
+  grid-template-columns: minmax(320px, 0.8fr) minmax(0, 2fr) minmax(300px, 0.85fr);
   align-items: center;
   gap: 12px;
   padding: 8px 12px;
@@ -87,8 +87,15 @@ button {
 }
 
 .market-switchboard {
+  gap: 4px;
   overflow-x: auto;
   scrollbar-width: none;
+}
+
+.market-switchboard button {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
 .market-switchboard::-webkit-scrollbar {
@@ -154,6 +161,8 @@ button {
 
 .segmented {
   flex-wrap: nowrap;
+  flex: 0 0 auto;
+  gap: 4px;
 }
 
 .segmented button,
@@ -171,8 +180,8 @@ button {
 }
 
 .segmented button {
-  min-width: 42px;
-  padding: 0 10px;
+  min-width: 34px;
+  padding: 0 7px;
 }
 
 .segmented button:hover,
@@ -194,8 +203,9 @@ button {
 }
 
 .live-button {
-  min-width: 74px;
-  padding: 0 13px;
+  flex: 0 0 auto;
+  min-width: 54px;
+  padding: 0 8px;
   color: var(--green);
   font-weight: 700;
 }
