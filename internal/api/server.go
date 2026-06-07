@@ -47,7 +47,7 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.Handle("/", s.dashboard())
-	return cors(mux)
+	return gzipResponses(cors(mux))
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
