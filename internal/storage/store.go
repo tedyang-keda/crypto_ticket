@@ -13,4 +13,7 @@ type HistoricalStore interface {
 	BarsInRange(ctx context.Context, exchange string, symbol string, timeframe string, startMS int64, endMS int64) ([]market.Bar, error)
 	UpsertSymbols(ctx context.Context, symbols []market.SymbolInfo) error
 	ListSymbols(ctx context.Context, exchange string, activeOnly *bool) ([]market.SymbolInfo, error)
+	AdjustmentFactorAt(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, tsMS int64) (*market.AdjustmentFactor, error)
+	UpsertAdjustmentFactors(ctx context.Context, factors []market.AdjustmentFactor) error
+	UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error
 }

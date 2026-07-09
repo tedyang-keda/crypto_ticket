@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -36,8 +37,13 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS symbol_registry (
 			exchange VARCHAR(16) NOT NULL,
+			source_market VARCHAR(48) NOT NULL DEFAULT '',
 			symbol VARCHAR(64) NOT NULL,
 			market_type VARCHAR(16) NOT NULL,
+			instrument_type VARCHAR(32) NOT NULL DEFAULT '',
+			asset_class VARCHAR(24) NOT NULL DEFAULT '',
+			rule_type VARCHAR(24) NOT NULL DEFAULT '',
+			lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '',
 			is_active TINYINT(1) NOT NULL DEFAULT 1,
 			first_seen_at_ms BIGINT NOT NULL DEFAULT 0,
 			last_seen_at_ms BIGINT NOT NULL DEFAULT 0,
@@ -46,9 +52,47 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 			PRIMARY KEY (exchange, symbol),
-			KEY idx_registry_active (exchange, is_active, last_seen_at_ms)
+			KEY idx_registry_active (exchange, is_active, last_seen_at_ms),
+			KEY idx_registry_source_market (exchange, source_market, is_active),
+			KEY idx_registry_asset_class (exchange, asset_class, rule_type, lifecycle_phase)
 			)`,
 		createBarHistoryTableStatement(time.Now().UTC()),
+		createAdjustedBarHistoryTableStatement(time.Now().UTC()),
+		`CREATE TABLE IF NOT EXISTS adjustment_factor (
+				provider VARCHAR(64) NOT NULL,
+				provider_version VARCHAR(64) NOT NULL,
+				exchange VARCHAR(16) NOT NULL,
+				source_market VARCHAR(48) NOT NULL DEFAULT '',
+				symbol VARCHAR(64) NOT NULL,
+				adj_mode VARCHAR(24) NOT NULL,
+				effective_from_ms BIGINT NOT NULL,
+				effective_to_ms BIGINT NOT NULL DEFAULT 0,
+				price_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+				volume_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+				event_type VARCHAR(32) NOT NULL DEFAULT '',
+				raw_json JSON NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
+				KEY idx_adjustment_lookup (exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
+				KEY idx_adjustment_event (event_type, updated_at)
+			)`,
+		`CREATE TABLE IF NOT EXISTS instrument_change_event (
+				id BIGINT NOT NULL AUTO_INCREMENT,
+				exchange VARCHAR(16) NOT NULL,
+				source_market VARCHAR(48) NOT NULL DEFAULT '',
+				symbol VARCHAR(64) NOT NULL,
+				event_ts_ms BIGINT NOT NULL,
+				event_type VARCHAR(32) NOT NULL,
+				previous_hash CHAR(64) NOT NULL DEFAULT '',
+				current_hash CHAR(64) NOT NULL DEFAULT '',
+				previous_json JSON NULL,
+				current_json JSON NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				KEY idx_instrument_event_symbol (exchange, source_market, symbol, event_ts_ms),
+				KEY idx_instrument_event_type (event_type, event_ts_ms)
+			)`,
 		`CREATE TABLE IF NOT EXISTS kline_guardian_state (
 				exchange VARCHAR(16) NOT NULL,
 				symbol VARCHAR(64) NOT NULL,
@@ -89,6 +133,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureSymbolRegistryColumns(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureBarHistoryColumns(ctx); err != nil {
 		return err
 	}
@@ -106,8 +153,40 @@ func createBarHistoryTableStatement(now time.Time) string {
 		})
 }
 
+func createAdjustedBarHistoryTableStatement(now time.Time) string {
+	partitionStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	return "CREATE TABLE IF NOT EXISTS bar_history_adjusted (\n" +
+		adjustedBarHistoryColumnsDDL() +
+		"\n)\n" +
+		BuildTimeframePartitionClause(TimeframePartitionOptions{
+			StartMonth: partitionStart,
+			Months:     12,
+		})
+}
+
+func (s *Store) ensureSymbolRegistryColumns(ctx context.Context) error {
+	columns := []string{
+		`ALTER TABLE symbol_registry ADD COLUMN source_market VARCHAR(48) NOT NULL DEFAULT '' AFTER exchange`,
+		`ALTER TABLE symbol_registry ADD COLUMN instrument_type VARCHAR(32) NOT NULL DEFAULT '' AFTER market_type`,
+		`ALTER TABLE symbol_registry ADD COLUMN asset_class VARCHAR(24) NOT NULL DEFAULT '' AFTER instrument_type`,
+		`ALTER TABLE symbol_registry ADD COLUMN rule_type VARCHAR(24) NOT NULL DEFAULT '' AFTER asset_class`,
+		`ALTER TABLE symbol_registry ADD COLUMN lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '' AFTER rule_type`,
+	}
+	for _, statement := range columns {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil && !isDuplicateColumnError(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ensureBarHistoryColumns(ctx context.Context) error {
 	columns := []string{
+		`ALTER TABLE bar_history ADD COLUMN source_market VARCHAR(48) NOT NULL DEFAULT '' AFTER exchange`,
+		`ALTER TABLE bar_history ADD COLUMN instrument_type VARCHAR(32) NOT NULL DEFAULT '' AFTER symbol`,
+		`ALTER TABLE bar_history ADD COLUMN asset_class VARCHAR(24) NOT NULL DEFAULT '' AFTER instrument_type`,
+		`ALTER TABLE bar_history ADD COLUMN rule_type VARCHAR(24) NOT NULL DEFAULT '' AFTER asset_class`,
+		`ALTER TABLE bar_history ADD COLUMN lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '' AFTER rule_type`,
 		`ALTER TABLE bar_history ADD COLUMN margin_type VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol`,
 		`ALTER TABLE bar_history ADD COLUMN volume_unit VARCHAR(16) NOT NULL DEFAULT '' AFTER volume`,
 		`ALTER TABLE bar_history ADD COLUMN quote_unit VARCHAR(16) NOT NULL DEFAULT '' AFTER quote_volume`,
@@ -117,7 +196,7 @@ func (s *Store) ensureBarHistoryColumns(ctx context.Context) error {
 		`ALTER TABLE bar_history ADD COLUMN amp DECIMAL(18, 8) NOT NULL DEFAULT 0 AFTER chg`,
 	}
 	for _, statement := range columns {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil && !isDuplicateColumnError(err) {
 			return err
 		}
 	}
@@ -135,10 +214,13 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 	defer tx.Rollback()
 
 	historySQL := `INSERT INTO bar_history
-		(exchange, symbol, margin_type, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
+		(exchange, source_market, symbol, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
+		 timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
 		 volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
+		 source_market=VALUES(source_market), instrument_type=VALUES(instrument_type), asset_class=VALUES(asset_class),
+		 rule_type=VALUES(rule_type), lifecycle_phase=VALUES(lifecycle_phase),
 		 margin_type=VALUES(margin_type), end_ms=VALUES(end_ms), open_price=VALUES(open_price), high_price=VALUES(high_price),
 		 low_price=VALUES(low_price), close_price=VALUES(close_price), volume=VALUES(volume),
 		 volume_unit=VALUES(volume_unit), quote_volume=VALUES(quote_volume), quote_unit=VALUES(quote_unit),
@@ -189,6 +271,13 @@ func (s *Store) CountBarsBefore(ctx context.Context, timeframe string, cutoffMS 
 }
 
 func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
+	priceMode, err := market.NormalizePriceMode(query.PriceMode)
+	if err != nil {
+		return nil, err
+	}
+	if priceMode != market.PriceModeRaw {
+		return s.recentAdjustedBars(ctx, query, priceMode)
+	}
 	limit := query.Limit
 	if limit <= 0 {
 		limit = 300
@@ -196,9 +285,7 @@ func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]mark
 	if limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT exchange, symbol, margin_type, timeframe, start_ms, end_ms,
-		open_price, high_price, low_price, close_price, volume, volume_unit, quote_volume, quote_unit,
-		contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final
+	rows, err := s.db.QueryContext(ctx, `SELECT `+rawBarSelectColumns()+`
 		FROM bar_history
 		WHERE exchange = ? AND symbol = ? AND timeframe = ?
 		ORDER BY start_ms DESC
@@ -210,19 +297,11 @@ func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]mark
 
 	var bars []market.Bar
 	for rows.Next() {
-		var bar market.Bar
-		var isFinal bool
-		if err := rows.Scan(
-			&bar.Exchange, &bar.Symbol, &bar.MarginType, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
-			&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume, &bar.VolumeUnit,
-			&bar.QuoteVolume, &bar.QuoteUnit, &bar.ContractVolume, &bar.TradeCount, &bar.PrevClose,
-			&bar.Chg, &bar.Amp, &bar.LastTickMS, &isFinal,
-		); err != nil {
+		bar, err := scanRawBar(rows)
+		if err != nil {
 			return nil, err
 		}
-		bar.IsFinal = isFinal
-		bar.Source = "mysql"
-		bars = append(bars, market.DecorateBar(bar))
+		bars = append(bars, market.MarkBarAdjustmentStatus(bar, priceMode, market.AdjustmentStatusRaw))
 	}
 	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
 		bars[i], bars[j] = bars[j], bars[i]
@@ -231,9 +310,7 @@ func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]mark
 }
 
 func (s *Store) BarsInRange(ctx context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64) ([]market.Bar, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT exchange, symbol, margin_type, timeframe, start_ms, end_ms,
-		open_price, high_price, low_price, close_price, volume, volume_unit, quote_volume, quote_unit,
-		contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final
+	rows, err := s.db.QueryContext(ctx, `SELECT `+rawBarSelectColumns()+`
 		FROM bar_history
 		WHERE exchange = ? AND symbol = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ? AND is_final = 1
 		ORDER BY start_ms ASC`, strings.ToLower(exchange), strings.ToUpper(symbol), tf, startMS, endMS)
@@ -244,18 +321,10 @@ func (s *Store) BarsInRange(ctx context.Context, exchange string, symbol string,
 
 	var bars []market.Bar
 	for rows.Next() {
-		var bar market.Bar
-		var isFinal bool
-		if err := rows.Scan(
-			&bar.Exchange, &bar.Symbol, &bar.MarginType, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
-			&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume, &bar.VolumeUnit,
-			&bar.QuoteVolume, &bar.QuoteUnit, &bar.ContractVolume, &bar.TradeCount, &bar.PrevClose,
-			&bar.Chg, &bar.Amp, &bar.LastTickMS, &isFinal,
-		); err != nil {
+		bar, err := scanRawBar(rows)
+		if err != nil {
 			return nil, err
 		}
-		bar.IsFinal = isFinal
-		bar.Source = "mysql"
 		bars = append(bars, market.DecorateBar(bar))
 	}
 	return bars, rows.Err()
@@ -266,19 +335,31 @@ func (s *Store) UpsertSymbols(ctx context.Context, symbols []market.SymbolInfo) 
 		return nil
 	}
 	stmt := `INSERT INTO symbol_registry
-		(exchange, symbol, market_type, is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		(exchange, source_market, symbol, market_type, instrument_type, asset_class, rule_type, lifecycle_phase,
+		 is_active, first_seen_at_ms, last_seen_at_ms, last_status, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
-		 market_type=VALUES(market_type), is_active=VALUES(is_active),
+		 source_market=VALUES(source_market), market_type=VALUES(market_type),
+		 instrument_type=VALUES(instrument_type), asset_class=VALUES(asset_class),
+		 rule_type=VALUES(rule_type), lifecycle_phase=VALUES(lifecycle_phase), is_active=VALUES(is_active),
 		 first_seen_at_ms=IF(first_seen_at_ms = 0, VALUES(first_seen_at_ms), LEAST(first_seen_at_ms, VALUES(first_seen_at_ms))),
 		 last_seen_at_ms=GREATEST(last_seen_at_ms, VALUES(last_seen_at_ms)),
 		 last_status=VALUES(last_status), raw_json=VALUES(raw_json)`
 	for _, symbol := range symbols {
-		rawJSON, _ := json.Marshal(symbol)
+		symbol.SourceMarket = firstNonEmpty(symbol.SourceMarket, market.SourceMarket(symbol.Exchange, symbol.MarketType))
+		rawJSON := []byte(symbol.Raw)
+		if len(rawJSON) == 0 {
+			rawJSON, _ = json.Marshal(symbol)
+		}
 		if _, err := s.db.ExecContext(ctx, stmt,
 			strings.ToLower(symbol.Exchange),
+			symbol.SourceMarket,
 			strings.ToUpper(symbol.Symbol),
 			symbol.MarketType,
+			symbol.InstrumentType,
+			symbol.AssetClass,
+			symbol.RuleType,
+			symbol.LifecyclePhase,
 			symbol.IsActive,
 			symbol.FirstSeenAtMS,
 			symbol.LastSeenAtMS,
@@ -299,7 +380,8 @@ func (s *Store) ListSymbols(ctx context.Context, exchange string, activeOnly *bo
 		args = append(args, *activeOnly)
 	}
 	query := fmt.Sprintf(`SELECT exchange, symbol, market_type, is_active, first_seen_at_ms,
-		last_seen_at_ms, last_status FROM symbol_registry %s ORDER BY is_active DESC, symbol`, filter)
+		last_seen_at_ms, last_status, source_market, instrument_type, asset_class, rule_type, lifecycle_phase
+		FROM symbol_registry %s ORDER BY is_active DESC, symbol`, filter)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -309,7 +391,11 @@ func (s *Store) ListSymbols(ctx context.Context, exchange string, activeOnly *bo
 	var symbols []market.SymbolInfo
 	for rows.Next() {
 		var symbol market.SymbolInfo
-		if err := rows.Scan(&symbol.Exchange, &symbol.Symbol, &symbol.MarketType, &symbol.IsActive, &symbol.FirstSeenAtMS, &symbol.LastSeenAtMS, &symbol.Status); err != nil {
+		if err := rows.Scan(
+			&symbol.Exchange, &symbol.Symbol, &symbol.MarketType, &symbol.IsActive, &symbol.FirstSeenAtMS,
+			&symbol.LastSeenAtMS, &symbol.Status, &symbol.SourceMarket, &symbol.InstrumentType,
+			&symbol.AssetClass, &symbol.RuleType, &symbol.LifecyclePhase,
+		); err != nil {
 			return nil, err
 		}
 		symbols = append(symbols, symbol)
@@ -397,10 +483,124 @@ func (s *Store) InsertKlineGuardianEvents(ctx context.Context, events []market.K
 	return nil
 }
 
+func (s *Store) AdjustmentFactorAt(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, tsMS int64) (*market.AdjustmentFactor, error) {
+	priceMode, err := market.NormalizePriceMode(priceMode)
+	if err != nil {
+		return nil, err
+	}
+	if priceMode == market.PriceModeRaw {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT provider, provider_version, exchange, source_market, symbol, adj_mode,
+		effective_from_ms, effective_to_ms, price_multiplier, volume_multiplier, event_type, raw_json
+		FROM adjustment_factor
+		WHERE exchange = ? AND symbol = ? AND adj_mode = ?
+		  AND (source_market = ? OR source_market = '')
+		  AND effective_from_ms <= ? AND (effective_to_ms = 0 OR effective_to_ms >= ?)
+		ORDER BY source_market DESC, effective_from_ms DESC
+		LIMIT 1`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode, sourceMarket, tsMS, tsMS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	factor, err := scanAdjustmentFactor(rows)
+	if err != nil {
+		return nil, err
+	}
+	return &factor, rows.Err()
+}
+
+func (s *Store) UpsertAdjustmentFactors(ctx context.Context, factors []market.AdjustmentFactor) error {
+	if len(factors) == 0 {
+		return nil
+	}
+	stmt := `INSERT INTO adjustment_factor
+		(provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms,
+		 price_multiplier, volume_multiplier, event_type, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		 price_multiplier=VALUES(price_multiplier), volume_multiplier=VALUES(volume_multiplier),
+		 event_type=VALUES(event_type), raw_json=VALUES(raw_json)`
+	for _, factor := range factors {
+		mode, err := market.NormalizePriceMode(factor.AdjMode)
+		if err != nil {
+			return err
+		}
+		raw := any(nil)
+		if len(factor.Raw) > 0 {
+			raw = string(factor.Raw)
+		}
+		if _, err := s.db.ExecContext(ctx, stmt,
+			factor.Provider,
+			factor.ProviderVersion,
+			strings.ToLower(factor.Exchange),
+			factor.SourceMarket,
+			strings.ToUpper(factor.Symbol),
+			mode,
+			factor.EffectiveFromMS,
+			factor.EffectiveToMS,
+			nonZeroFloat(factor.PriceMultiplier, 1),
+			nonZeroFloat(factor.VolumeMultiplier, 1),
+			factor.EventType,
+			raw,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error {
+	if len(bars) == 0 {
+		return nil
+	}
+	stmt := `INSERT INTO bar_history_adjusted
+		(exchange, source_market, symbol, adj_mode, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
+		 timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
+		 volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms,
+		 is_final, adjustment_status, adjustment_provider, adjustment_provider_version, adjustment_event_type,
+		 price_multiplier, volume_multiplier, raw_open_price, raw_high_price, raw_low_price, raw_close_price, raw_volume, raw_quote_volume)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		 instrument_type=VALUES(instrument_type), asset_class=VALUES(asset_class), rule_type=VALUES(rule_type),
+		 lifecycle_phase=VALUES(lifecycle_phase), margin_type=VALUES(margin_type), end_ms=VALUES(end_ms),
+		 open_price=VALUES(open_price), high_price=VALUES(high_price), low_price=VALUES(low_price), close_price=VALUES(close_price),
+		 volume=VALUES(volume), volume_unit=VALUES(volume_unit), quote_volume=VALUES(quote_volume), quote_unit=VALUES(quote_unit),
+		 contract_volume=VALUES(contract_volume), trade_count=VALUES(trade_count), prev_close=VALUES(prev_close),
+		 chg=VALUES(chg), amp=VALUES(amp), last_tick_ms=VALUES(last_tick_ms), is_final=VALUES(is_final),
+		 adjustment_status=VALUES(adjustment_status), adjustment_provider=VALUES(adjustment_provider),
+		 adjustment_provider_version=VALUES(adjustment_provider_version), adjustment_event_type=VALUES(adjustment_event_type),
+		 price_multiplier=VALUES(price_multiplier), volume_multiplier=VALUES(volume_multiplier),
+		 raw_open_price=VALUES(raw_open_price), raw_high_price=VALUES(raw_high_price), raw_low_price=VALUES(raw_low_price),
+		 raw_close_price=VALUES(raw_close_price), raw_volume=VALUES(raw_volume), raw_quote_volume=VALUES(raw_quote_volume)`
+	for _, bar := range bars {
+		mode, err := market.NormalizePriceMode(bar.PriceMode)
+		if err != nil {
+			return err
+		}
+		if mode == market.PriceModeRaw {
+			continue
+		}
+		args := adjustedBarArgs(market.DecorateBar(bar), mode)
+		if _, err := s.db.ExecContext(ctx, stmt, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func barArgs(bar market.Bar) []any {
 	return []any{
 		strings.ToLower(bar.Exchange),
+		bar.SourceMarket,
 		strings.ToUpper(bar.Symbol),
+		bar.InstrumentType,
+		bar.AssetClass,
+		bar.RuleType,
+		bar.LifecyclePhase,
 		bar.MarginType,
 		bar.Timeframe,
 		bar.StartMS,
@@ -423,9 +623,275 @@ func barArgs(bar market.Bar) []any {
 	}
 }
 
+func adjustedBarArgs(bar market.Bar, mode string) []any {
+	if bar.AdjustmentStatus == "" {
+		bar.AdjustmentStatus = market.AdjustmentStatusAdjusted
+	}
+	if bar.PriceMultiplier == 0 {
+		bar.PriceMultiplier = 1
+	}
+	if bar.VolumeMultiplier == 0 {
+		bar.VolumeMultiplier = 1
+	}
+	return []any{
+		strings.ToLower(bar.Exchange),
+		bar.SourceMarket,
+		strings.ToUpper(bar.Symbol),
+		mode,
+		bar.InstrumentType,
+		bar.AssetClass,
+		bar.RuleType,
+		bar.LifecyclePhase,
+		bar.MarginType,
+		bar.Timeframe,
+		bar.StartMS,
+		bar.EndMS,
+		bar.OpenPrice,
+		bar.HighPrice,
+		bar.LowPrice,
+		bar.ClosePrice,
+		bar.Volume,
+		bar.VolumeUnit,
+		bar.QuoteVolume,
+		bar.QuoteUnit,
+		bar.ContractVolume,
+		bar.TradeCount,
+		bar.PrevClose,
+		bar.Chg,
+		bar.Amp,
+		bar.LastTickMS,
+		bar.IsFinal,
+		bar.AdjustmentStatus,
+		bar.AdjustmentProvider,
+		bar.AdjustmentProviderVersion,
+		bar.AdjustmentEventType,
+		bar.PriceMultiplier,
+		bar.VolumeMultiplier,
+		bar.RawOpenPrice,
+		bar.RawHighPrice,
+		bar.RawLowPrice,
+		bar.RawClosePrice,
+		bar.RawVolume,
+		bar.RawQuoteVolume,
+	}
+}
+
+func (s *Store) recentAdjustedBars(ctx context.Context, query market.KlineQuery, priceMode string) ([]market.Bar, error) {
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 300
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	bars, err := s.recentMaterializedAdjustedBars(ctx, query, priceMode, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(bars) > 0 {
+		return recalculateDerived(bars), nil
+	}
+	rawQuery := query
+	rawQuery.PriceMode = market.PriceModeRaw
+	rawBars, err := s.recentRawBars(ctx, rawQuery, limit)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rawBars {
+		factor, err := s.AdjustmentFactorAt(ctx, rawBars[i].Exchange, firstNonEmpty(query.SourceMarket, rawBars[i].SourceMarket), rawBars[i].Symbol, priceMode, rawBars[i].StartMS)
+		if err != nil {
+			return nil, err
+		}
+		if factor == nil {
+			rawBars[i] = market.MarkBarAdjustmentStatus(rawBars[i], priceMode, market.AdjustmentStatusMissing)
+			continue
+		}
+		rawBars[i] = market.ApplyFactorToBar(rawBars[i], *factor)
+	}
+	return recalculateDerived(rawBars), nil
+}
+
+func (s *Store) recentRawBars(ctx context.Context, query market.KlineQuery, limit int) ([]market.Bar, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+rawBarSelectColumns()+`
+		FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ?
+		ORDER BY start_ms DESC
+		LIMIT ?`, strings.ToLower(query.Exchange), strings.ToUpper(query.Symbol), query.Timeframe, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bars []market.Bar
+	for rows.Next() {
+		bar, err := scanRawBar(rows)
+		if err != nil {
+			return nil, err
+		}
+		bars = append(bars, bar)
+	}
+	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
+		bars[i], bars[j] = bars[j], bars[i]
+	}
+	return bars, rows.Err()
+}
+
+func (s *Store) recentMaterializedAdjustedBars(ctx context.Context, query market.KlineQuery, priceMode string, limit int) ([]market.Bar, error) {
+	filter := "exchange = ? AND symbol = ? AND adj_mode = ? AND timeframe = ?"
+	args := []any{strings.ToLower(query.Exchange), strings.ToUpper(query.Symbol), priceMode, query.Timeframe}
+	if strings.TrimSpace(query.SourceMarket) != "" {
+		filter += " AND source_market = ?"
+		args = append(args, query.SourceMarket)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+adjustedBarSelectColumns()+`
+		FROM bar_history_adjusted
+		WHERE `+filter+`
+		ORDER BY start_ms DESC
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bars []market.Bar
+	for rows.Next() {
+		bar, err := scanAdjustedBar(rows)
+		if err != nil {
+			return nil, err
+		}
+		bars = append(bars, market.DecorateBar(bar))
+	}
+	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
+		bars[i], bars[j] = bars[j], bars[i]
+	}
+	return bars, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func rawBarSelectColumns() string {
+	return `exchange, source_market, symbol, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
+		timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
+		volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final`
+}
+
+func adjustedBarSelectColumns() string {
+	return `exchange, source_market, symbol, adj_mode, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
+		timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
+		volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final,
+		adjustment_status, adjustment_provider, adjustment_provider_version, adjustment_event_type,
+		price_multiplier, volume_multiplier, raw_open_price, raw_high_price, raw_low_price, raw_close_price, raw_volume, raw_quote_volume`
+}
+
+func scanRawBar(row rowScanner) (market.Bar, error) {
+	var bar market.Bar
+	var isFinal bool
+	err := row.Scan(
+		&bar.Exchange, &bar.SourceMarket, &bar.Symbol, &bar.InstrumentType, &bar.AssetClass,
+		&bar.RuleType, &bar.LifecyclePhase, &bar.MarginType, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
+		&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume, &bar.VolumeUnit,
+		&bar.QuoteVolume, &bar.QuoteUnit, &bar.ContractVolume, &bar.TradeCount, &bar.PrevClose,
+		&bar.Chg, &bar.Amp, &bar.LastTickMS, &isFinal,
+	)
+	if err != nil {
+		return bar, err
+	}
+	bar.IsFinal = isFinal
+	bar.Source = "mysql"
+	return market.DecorateBar(bar), nil
+}
+
+func scanAdjustedBar(row rowScanner) (market.Bar, error) {
+	var bar market.Bar
+	var isFinal bool
+	err := row.Scan(
+		&bar.Exchange, &bar.SourceMarket, &bar.Symbol, &bar.PriceMode, &bar.InstrumentType, &bar.AssetClass,
+		&bar.RuleType, &bar.LifecyclePhase, &bar.MarginType, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
+		&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume, &bar.VolumeUnit,
+		&bar.QuoteVolume, &bar.QuoteUnit, &bar.ContractVolume, &bar.TradeCount, &bar.PrevClose,
+		&bar.Chg, &bar.Amp, &bar.LastTickMS, &isFinal, &bar.AdjustmentStatus,
+		&bar.AdjustmentProvider, &bar.AdjustmentProviderVersion, &bar.AdjustmentEventType,
+		&bar.PriceMultiplier, &bar.VolumeMultiplier, &bar.RawOpenPrice, &bar.RawHighPrice,
+		&bar.RawLowPrice, &bar.RawClosePrice, &bar.RawVolume, &bar.RawQuoteVolume,
+	)
+	if err != nil {
+		return bar, err
+	}
+	bar.IsFinal = isFinal
+	bar.Source = "mysql_adjusted"
+	return market.DecorateBar(bar), nil
+}
+
+func scanAdjustmentFactor(row rowScanner) (market.AdjustmentFactor, error) {
+	var factor market.AdjustmentFactor
+	var raw sql.NullString
+	err := row.Scan(
+		&factor.Provider, &factor.ProviderVersion, &factor.Exchange, &factor.SourceMarket, &factor.Symbol,
+		&factor.AdjMode, &factor.EffectiveFromMS, &factor.EffectiveToMS, &factor.PriceMultiplier,
+		&factor.VolumeMultiplier, &factor.EventType, &raw,
+	)
+	if err != nil {
+		return factor, err
+	}
+	if raw.Valid {
+		factor.Raw = []byte(raw.String)
+	}
+	return factor, nil
+}
+
+func recalculateDerived(bars []market.Bar) []market.Bar {
+	out := append([]market.Bar(nil), bars...)
+	var previousClose float64
+	for i := range out {
+		out[i].PrevClose = previousClose
+		if previousClose > 0 {
+			out[i].Chg = roundPercent((out[i].ClosePrice - previousClose) / previousClose * 100)
+		} else {
+			out[i].Chg = 0
+		}
+		if out[i].LowPrice > 0 {
+			out[i].Amp = roundPercent((out[i].HighPrice - out[i].LowPrice) / out[i].LowPrice * 100)
+		} else {
+			out[i].Amp = 0
+		}
+		previousClose = out[i].ClosePrice
+		out[i] = market.DecorateBar(out[i])
+	}
+	return out
+}
+
+func roundPercent(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return math.Round(value*1_000_000) / 1_000_000
+}
+
+func nonZeroFloat(value float64, fallback float64) float64 {
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
 func nullableJSON(value string) any {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
 	return value
+}
+
+func isDuplicateColumnError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

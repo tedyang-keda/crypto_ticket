@@ -1,6 +1,17 @@
 export type Tick = {
   exchange: string;
+  source_market?: string;
   symbol: string;
+  instrument_type?: string;
+  asset_class?: string;
+  rule_type?: string;
+  lifecycle_phase?: string;
+  price_mode?: PriceMode;
+  adjustment_status?: "raw" | "adjusted" | "missing_factor" | "live_raw" | string;
+  raw_price?: number;
+  adjusted_price?: number;
+  raw_size?: number;
+  adjusted_size?: number;
   ts_ms: number;
   price: number;
   size: number;
@@ -14,7 +25,23 @@ export type Tick = {
 
 export type Bar = {
   exchange: string;
+  source_market?: string;
   symbol: string;
+  instrument_type?: string;
+  asset_class?: string;
+  rule_type?: string;
+  lifecycle_phase?: string;
+  price_mode?: PriceMode;
+  adjustment_status?: "raw" | "adjusted" | "missing_factor" | "live_raw" | string;
+  adjustment_provider?: string;
+  adjustment_provider_version?: string;
+  adjustment_event_type?: string;
+  raw_open_price?: number;
+  raw_high_price?: number;
+  raw_low_price?: number;
+  raw_close_price?: number;
+  raw_volume?: number;
+  raw_quote_volume?: number;
   timeframe: string;
   start_ms: number;
   end_ms: number;
@@ -35,13 +62,20 @@ export type Bar = {
 
 export type SymbolInfo = {
   exchange: string;
+  source_market?: string;
   symbol: string;
   market_type: string;
+  instrument_type?: string;
+  asset_class?: string;
+  rule_type?: string;
+  lifecycle_phase?: string;
   status: string;
   is_active: boolean;
   first_seen_at_ms?: number;
   last_seen_at_ms?: number;
 };
+
+export type PriceMode = "raw" | "forward_adjusted" | "backward_adjusted";
 
 export type RealtimeEvent = {
   type: "ticker" | "kline";

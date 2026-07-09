@@ -38,6 +38,7 @@ import "./styles.css";
 const queryClient = new QueryClient();
 const timeframes = ["1m", "5m", "15m", "30m", "1H", "4H", "12H", "1D"];
 const exchanges = ["binance", "okx"];
+const priceModes = ["raw", "backward_adjusted", "forward_adjusted"] as const;
 const modes = ["Candles", "Depth", "Replay"];
 const tools = [
   ["crosshair", "Crosshair", <Crosshair size={16} />],
@@ -69,12 +70,14 @@ function MarketTerminal() {
   const exchange = useMarketStore((state) => state.exchange);
   const symbol = useMarketStore((state) => state.symbol);
   const timeframe = useMarketStore((state) => state.timeframe);
+  const priceMode = useMarketStore((state) => state.priceMode);
   const latestTick = useMarketStore((state) => state.latestTick);
   const bars = useMarketStore((state) => state.bars);
   const connection = useMarketStore((state) => state.connection);
   const setExchange = useMarketStore((state) => state.setExchange);
   const setSymbol = useMarketStore((state) => state.setSymbol);
   const setTimeframe = useMarketStore((state) => state.setTimeframe);
+  const setPriceMode = useMarketStore((state) => state.setPriceMode);
   const setLatestTick = useMarketStore((state) => state.setLatestTick);
   const setBars = useMarketStore((state) => state.setBars);
   const [mode, setMode] = useState("Candles");
@@ -87,13 +90,13 @@ function MarketTerminal() {
 
   const symbolsQuery = useQuery({ queryKey: ["symbols", "all"], queryFn: () => getAllSymbols(exchanges), staleTime: 30_000 });
   const barsQuery = useQuery({
-    queryKey: ["klines", exchange, symbol, timeframe],
-    queryFn: () => getKlines(exchange, symbol, timeframe),
+    queryKey: ["klines", exchange, symbol, timeframe, priceMode],
+    queryFn: () => getKlines(exchange, symbol, timeframe, priceMode),
     refetchInterval: 30_000,
   });
   const tickerQuery = useQuery({
-    queryKey: ["ticker", exchange, symbol],
-    queryFn: () => getLatestTicker(exchange, symbol),
+    queryKey: ["ticker", exchange, symbol, priceMode],
+    queryFn: () => getLatestTicker(exchange, symbol, priceMode),
     refetchInterval: 5_000,
   });
 
@@ -108,7 +111,7 @@ function MarketTerminal() {
   useEffect(() => {
     setSelectedBar(null);
     setRecentTicks([]);
-  }, [exchange, symbol, timeframe]);
+  }, [exchange, symbol, timeframe, priceMode]);
 
   useEffect(() => {
     if (!latestTick) return;
@@ -159,6 +162,7 @@ function MarketTerminal() {
         <div className="market-switchboard">
           <SegmentedControl values={exchanges} active={exchange} onSelect={(item) => setExchange(item)} labelFormatter={(item) => item.toUpperCase()} />
           <SegmentedControl values={timeframes} active={timeframe} onSelect={setTimeframe} />
+          <SegmentedControl values={priceModes} active={priceMode} onSelect={setPriceMode} labelFormatter={formatPriceModeLabel} />
           <button className={`live-button ${connection === "open" ? "active" : ""}`} type="button">
             LIVE
           </button>
@@ -229,6 +233,9 @@ function MarketTerminal() {
                 ["Exchange", exchange.toUpperCase()],
                 ["Browser WS", connection],
                 ["Latest source", latestTick?.source || lastBar?.source || "stream"],
+                ["Price mode", formatPriceModeLabel(priceMode)],
+                ["Adjustment", lastBar?.adjustment_status || latestTick?.adjustment_status || "raw"],
+                ["Asset class", lastBar?.asset_class || "unknown"],
                 ["Rows", String(bars.length)],
                 ["Official push age", formatLatency(officialPushAge)],
                 ["Exchange event age", formatLatency(exchangeEventAge)],
@@ -266,6 +273,12 @@ function SegmentedControl<T extends string>({
   );
 }
 
+function formatPriceModeLabel(value: string) {
+  if (value === "backward_adjusted") return "B-ADJ";
+  if (value === "forward_adjusted") return "F-ADJ";
+  return "RAW";
+}
+
 function IconButton({ active, label, children, onClick }: { active?: boolean; label: string; children: ReactNode; onClick?: () => void }) {
   return (
     <button className={active ? "icon-action active" : "icon-action"} title={label} type="button" onClick={onClick}>
@@ -298,6 +311,9 @@ function ChartReadout({ bar, metrics }: { bar: Bar | null; metrics: ReturnType<t
         </span>
         <span>
           T <strong>{formatCompact(bar?.trade_count)}</strong>
+        </span>
+        <span>
+          Adj <strong>{bar?.adjustment_status || "raw"}</strong>
         </span>
         <span className={metrics?.direction ?? "flat"}>{metrics ? formatPct(metrics.changePct) : "-"}</span>
       </div>

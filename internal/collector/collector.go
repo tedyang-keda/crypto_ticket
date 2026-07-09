@@ -40,6 +40,11 @@ type Runner struct {
 	client    *http.Client
 }
 
+type activeSymbols struct {
+	List []string
+	Meta map[string]market.SymbolInfo
+}
+
 func NewRunner(runtimes []Runtime, store storage.HistoricalStore, publisher KlinePublisher) *Runner {
 	return &Runner{
 		runtimes:  runtimes,
@@ -105,7 +110,7 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	if err != nil {
 		return err
 	}
-	if len(symbols) == 0 {
+	if len(symbols.List) == 0 {
 		return errors.New("no active symbols")
 	}
 	if staticAdapter, ok := adapter.(exchange.StaticStreamAdapter); ok {
@@ -119,11 +124,11 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	defer conn.Close()
 
 	requestID := time.Now().UnixNano() % math.MaxInt32
-	requestID, err = sendSubscriptions(conn, adapter, symbols, requestID, cfg.SubscriptionChunkSize)
+	requestID, err = sendSubscriptions(conn, adapter, symbols.List, requestID, cfg.SubscriptionChunkSize)
 	if err != nil {
 		return err
 	}
-	log.Printf("%s %s kline collector connected symbols=%d", adapter.Name(), adapter.MarketType(), len(symbols))
+	log.Printf("%s %s kline collector connected symbols=%d", adapter.Name(), adapter.MarketType(), len(symbols.List))
 
 	refreshAt := time.Now().Add(cfg.SymbolRefreshInterval)
 	for {
@@ -148,6 +153,7 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 			continue
 		}
 		for _, bar := range bars {
+			bar = enrichBarFromSymbols(bar, symbols.Meta)
 			if err := r.publisher.IngestKline(ctx, bar); err != nil {
 				return err
 			}
@@ -155,8 +161,8 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	}
 }
 
-func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols []string, cfg Config) error {
-	chunks := chunkSymbols(symbols, cfg.SubscriptionChunkSize)
+func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols activeSymbols, cfg Config) error {
+	chunks := chunkSymbols(symbols.List, cfg.SubscriptionChunkSize)
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errCh := make(chan error, len(chunks))
@@ -164,7 +170,7 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 		index := index
 		chunk := append([]string(nil), chunk...)
 		go func() {
-			errCh <- r.readStaticStream(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk))
+			errCh <- r.readStaticStream(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk), symbols.Meta)
 		}()
 	}
 	err := <-errCh
@@ -172,7 +178,7 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 	return err
 }
 
-func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) error {
+func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int, meta map[string]market.SymbolInfo) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return err
@@ -194,6 +200,7 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 			continue
 		}
 		for _, bar := range bars {
+			bar = enrichBarFromSymbols(bar, meta)
 			if err := r.publisher.IngestKline(ctx, bar); err != nil {
 				return err
 			}
@@ -205,44 +212,59 @@ func (r *Runner) refreshConnectionSubscriptions(
 	ctx context.Context,
 	conn *websocket.Conn,
 	adapter exchange.Adapter,
-	current []string,
+	current activeSymbols,
 	requestID int64,
 	cfg Config,
-) ([]string, int64, error) {
+) (activeSymbols, int64, error) {
 	next, err := r.refreshSymbols(ctx, adapter)
 	if err != nil {
 		return current, requestID, err
 	}
-	if len(next) == 0 {
+	if len(next.List) == 0 {
 		return current, requestID, errors.New("no active symbols")
 	}
-	requestID, subscribed, unsubscribed, err := syncSubscriptions(conn, adapter, current, next, requestID, cfg.SubscriptionChunkSize)
+	requestID, subscribed, unsubscribed, err := syncSubscriptions(conn, adapter, current.List, next.List, requestID, cfg.SubscriptionChunkSize)
 	if err != nil {
 		return current, requestID, err
 	}
 	if subscribed > 0 || unsubscribed > 0 {
-		log.Printf("%s %s subscriptions refreshed active=%d subscribe=%d unsubscribe=%d", adapter.Name(), adapter.MarketType(), len(next), subscribed, unsubscribed)
+		log.Printf("%s %s subscriptions refreshed active=%d subscribe=%d unsubscribe=%d", adapter.Name(), adapter.MarketType(), len(next.List), subscribed, unsubscribed)
 	}
 	return next, requestID, nil
 }
 
-func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) ([]string, error) {
+func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) (activeSymbols, error) {
 	symbols, err := adapter.FetchSymbols(ctx, r.client)
 	if err != nil {
-		return nil, err
+		return activeSymbols{}, err
 	}
 	if r.store != nil {
 		if err := r.store.UpsertSymbols(ctx, symbols); err != nil {
-			return nil, err
+			return activeSymbols{}, err
 		}
 	}
 	active := make([]string, 0, len(symbols))
+	meta := make(map[string]market.SymbolInfo, len(symbols))
 	for _, symbol := range symbols {
+		if symbol.SourceMarket == "" {
+			symbol.SourceMarket = market.SourceMarket(symbol.Exchange, symbol.MarketType)
+		}
+		meta[strings.ToUpper(symbol.Symbol)] = symbol
 		if symbol.IsActive {
 			active = append(active, symbol.Symbol)
 		}
 	}
-	return active, nil
+	return activeSymbols{List: active, Meta: meta}, nil
+}
+
+func enrichBarFromSymbols(bar market.Bar, symbols map[string]market.SymbolInfo) market.Bar {
+	if len(symbols) == 0 {
+		return market.DecorateBar(bar)
+	}
+	if symbol, ok := symbols[strings.ToUpper(bar.Symbol)]; ok {
+		return market.ApplyClassificationToBar(bar, symbol)
+	}
+	return market.DecorateBar(bar)
 }
 
 func sendSubscriptions(conn *websocket.Conn, adapter exchange.Adapter, symbols []string, requestID int64, chunkSize int) (int64, error) {

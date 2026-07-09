@@ -43,6 +43,35 @@ HTTP /api/v1/klines?include_live=true
 - 高周期 final/live rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。
 - Kline guardian 不从 trade 重算 OHLCV；它只用交易所官方 REST kline 校验和修复官方 WS 可能漏掉的 final `1m`。
 
+## 品种分类与复权
+
+symbol 元数据会写入 `symbol_registry`，并带上以下分类字段：
+
+- `source_market`：交易所和市场类型，例如 `binance:um_futures`、`okx:SWAP`。
+- `instrument_type`：交易所原始合约/品种类型，例如 `PERPETUAL`、`TRADIFI_PERPETUAL`、`SWAP`。
+- `asset_class`：归一化资产类别，例如 `crypto`、`equity`、`commodity`、`index`、`pre_market`。
+- `rule_type`：交易规则类型，当前支持 `normal` / `pre_market`。
+- `lifecycle_phase`：生命周期状态，例如 `continuous`、`pre_market`、`preopen`、`suspend`、`expired`。
+
+当前分类来源：
+
+- Binance `exchangeInfo`：读取 `contractType`、`underlyingType`、`underlyingSubType`、`status/contractStatus`。`underlyingType=EQUITY` 会标为 `equity`，`underlyingType=PREMARKET` 会标为 `pre_market`。
+- OKX `public/instruments`：读取 `instType`、`instCategory`、`ruleType`、`state`。`instCategory=3` 会标为 `equity`，`ruleType=pre_market` 会标为 `pre_market`。
+
+bar 查询支持 `price_mode`：
+
+```text
+raw | backward_adjusted | forward_adjusted
+```
+
+默认是 `raw`。`/api/v1/klines` 和 `/api/v1/ticker/latest` 都接受 `price_mode` 参数。复权第一版只对 bar 做派生，不重写原始 tick/trade：
+
+- `bar_history` 永远保存交易所 raw final bar。
+- `adjustment_factor` 保存复权因子，`bar_history_adjusted` 可保存物化后的复权 bar。
+- 请求 adjusted 模式时，服务优先读 `bar_history_adjusted`；如果没有物化行，会按 `adjustment_factor` 读时派生，并返回 `adjustment_status`。
+- WebSocket 实时推送仍是 raw。dashboard 切到 adjusted 模式后会停止消费 raw WS，改用 HTTP `price_mode` 查询，避免 raw live 覆盖复权视图。
+- 当前 `ticker/latest` 的 price 来自最新 `1m` kline close，不是真实 trade tick。adjusted 模式下如果找得到当前 bar 的 factor，会按 bar 规则派生；找不到时会返回 `adjustment_status=live_raw`。
+
 ## 支持的周期
 
 运行时 timeframe 支持：

@@ -53,6 +53,55 @@ func TestIngestKlineStoresFinalAndComputesDerivedFields(t *testing.T) {
 	}
 }
 
+func TestKlinesAppliesAdjustmentFactorForAdjustedPriceMode(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	service := NewMarketService(store, realtime.NewHub(), []string{"1m"}, 300)
+	base := int64(1_710_000_000_000)
+	if err := store.UpsertAdjustmentFactors(ctx, []market.AdjustmentFactor{{
+		Provider:         "vendor",
+		ProviderVersion:  "v1",
+		Exchange:         "binance",
+		SourceMarket:     "binance:um_futures",
+		Symbol:           "TSLAUSDT",
+		AdjMode:          market.PriceModeBackwardAdjusted,
+		EffectiveFromMS:  base,
+		EffectiveToMS:    base + 119_999,
+		PriceMultiplier:  0.5,
+		VolumeMultiplier: 2,
+		EventType:        "split",
+	}}); err != nil {
+		t.Fatalf("upsert factor: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		start := base + int64(i)*60_000
+		if err := service.IngestKline(ctx, market.Bar{
+			Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "TSLAUSDT", Timeframe: "1m",
+			StartMS: start, EndMS: start + 59_999,
+			OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 104,
+			Volume: 10, QuoteVolume: 1000, IsFinal: true,
+		}); err != nil {
+			t.Fatalf("ingest final: %v", err)
+		}
+	}
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange: "binance", Symbol: "TSLAUSDT", Timeframe: "1m", Limit: 10, PriceMode: market.PriceModeBackwardAdjusted,
+	})
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+	if len(bars) != 2 {
+		t.Fatalf("expected two bars, got %+v", bars)
+	}
+	if bars[0].OpenPrice != 50 || bars[0].Volume != 20 || bars[0].RawOpenPrice != 100 {
+		t.Fatalf("unexpected adjusted first bar: %+v", bars[0])
+	}
+	if bars[1].PrevClose != 52 || bars[1].AdjustmentStatus != market.AdjustmentStatusAdjusted {
+		t.Fatalf("expected adjusted derived fields, got %+v", bars[1])
+	}
+}
+
 func TestKlinesBuildsHigherTimeframeFromFinalOneMinuteAndLiveOneMinute(t *testing.T) {
 	ctx := context.Background()
 	service := newTestMarketServiceWithFrames([]string{"1m", "1H"})

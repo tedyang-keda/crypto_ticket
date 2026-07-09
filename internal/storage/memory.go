@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -10,17 +11,20 @@ import (
 )
 
 type MemoryHistoricalStore struct {
-	mu             sync.RWMutex
-	bars           map[string]map[int64]market.Bar
-	symbols        map[string]market.SymbolInfo
-	guardianStates map[string]market.KlineGuardianState
-	guardianEvents []market.KlineGuardianEvent
+	mu                sync.RWMutex
+	bars              map[string]map[int64]market.Bar
+	symbols           map[string]market.SymbolInfo
+	adjustmentFactors []market.AdjustmentFactor
+	adjustedBars      map[string]map[int64]market.Bar
+	guardianStates    map[string]market.KlineGuardianState
+	guardianEvents    []market.KlineGuardianEvent
 }
 
 func NewMemoryHistoricalStore() *MemoryHistoricalStore {
 	return &MemoryHistoricalStore{
 		bars:           make(map[string]map[int64]market.Bar),
 		symbols:        make(map[string]market.SymbolInfo),
+		adjustedBars:   make(map[string]map[int64]market.Bar),
 		guardianStates: make(map[string]market.KlineGuardianState),
 	}
 }
@@ -33,6 +37,9 @@ func (m *MemoryHistoricalStore) UpsertBars(_ context.Context, bars []market.Bar)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, bar := range bars {
+		if bar.SourceMarket == "" {
+			bar.SourceMarket = market.SourceMarket(bar.Exchange, "")
+		}
 		key := strings.ToLower(bar.Exchange) + ":" + strings.ToUpper(bar.Symbol) + ":" + bar.Timeframe
 		if m.bars[key] == nil {
 			m.bars[key] = make(map[int64]market.Bar)
@@ -46,7 +53,13 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	key := strings.ToLower(query.Exchange) + ":" + strings.ToUpper(query.Symbol) + ":" + query.Timeframe
+	mode := market.MustNormalizePriceMode(query.PriceMode)
 	rows := m.bars[key]
+	if mode != market.PriceModeRaw {
+		if adjustedRows := m.adjustedBars[adjustedKey(query.Exchange, query.SourceMarket, query.Symbol, query.Timeframe, mode)]; len(adjustedRows) > 0 {
+			rows = adjustedRows
+		}
+	}
 	if len(rows) == 0 {
 		return nil, nil
 	}
@@ -62,7 +75,16 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 	starts = starts[len(starts)-limit:]
 	bars := make([]market.Bar, 0, len(starts))
 	for _, start := range starts {
-		bars = append(bars, market.DecorateBar(rows[start]))
+		bar := market.DecorateBar(rows[start])
+		if mode != market.PriceModeRaw && (bar.PriceMode != mode || bar.AdjustmentStatus != market.AdjustmentStatusAdjusted) {
+			bar = m.applyFactorLocked(bar, query.SourceMarket, mode)
+		} else if mode == market.PriceModeRaw {
+			bar = market.MarkBarAdjustmentStatus(bar, mode, market.AdjustmentStatusRaw)
+		}
+		bars = append(bars, bar)
+	}
+	if mode != market.PriceModeRaw {
+		bars = recalculateMemoryDerived(bars)
 	}
 	return bars, nil
 }
@@ -96,6 +118,9 @@ func (m *MemoryHistoricalStore) UpsertSymbols(_ context.Context, symbols []marke
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, symbol := range symbols {
+		if symbol.SourceMarket == "" {
+			symbol.SourceMarket = market.SourceMarket(symbol.Exchange, symbol.MarketType)
+		}
 		m.symbols[strings.ToLower(symbol.Exchange)+":"+strings.ToUpper(symbol.Symbol)] = symbol
 	}
 	return nil
@@ -116,6 +141,92 @@ func (m *MemoryHistoricalStore) ListSymbols(_ context.Context, exchange string, 
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Symbol < out[j].Symbol })
 	return out, nil
+}
+
+func (m *MemoryHistoricalStore) AdjustmentFactorAt(_ context.Context, exchange string, sourceMarket string, symbol string, priceMode string, tsMS int64) (*market.AdjustmentFactor, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.adjustmentFactorAtLocked(exchange, sourceMarket, symbol, priceMode, tsMS), nil
+}
+
+func (m *MemoryHistoricalStore) UpsertAdjustmentFactors(_ context.Context, factors []market.AdjustmentFactor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, factor := range factors {
+		factor.Exchange = strings.ToLower(factor.Exchange)
+		factor.Symbol = strings.ToUpper(factor.Symbol)
+		factor.AdjMode = market.MustNormalizePriceMode(factor.AdjMode)
+		replaced := false
+		for i := range m.adjustmentFactors {
+			current := m.adjustmentFactors[i]
+			if current.Provider == factor.Provider &&
+				current.ProviderVersion == factor.ProviderVersion &&
+				current.Exchange == factor.Exchange &&
+				current.SourceMarket == factor.SourceMarket &&
+				current.Symbol == factor.Symbol &&
+				current.AdjMode == factor.AdjMode &&
+				current.EffectiveFromMS == factor.EffectiveFromMS &&
+				current.EffectiveToMS == factor.EffectiveToMS {
+				m.adjustmentFactors[i] = factor
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			m.adjustmentFactors = append(m.adjustmentFactors, factor)
+		}
+	}
+	return nil
+}
+
+func (m *MemoryHistoricalStore) UpsertAdjustedBars(_ context.Context, bars []market.Bar) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, bar := range bars {
+		mode := market.MustNormalizePriceMode(bar.PriceMode)
+		if mode == market.PriceModeRaw {
+			continue
+		}
+		key := adjustedKey(bar.Exchange, bar.SourceMarket, bar.Symbol, bar.Timeframe, mode)
+		if m.adjustedBars[key] == nil {
+			m.adjustedBars[key] = make(map[int64]market.Bar)
+		}
+		m.adjustedBars[key][bar.StartMS] = market.DecorateBar(bar)
+	}
+	return nil
+}
+
+func (m *MemoryHistoricalStore) applyFactorLocked(bar market.Bar, sourceMarket string, priceMode string) market.Bar {
+	factor := m.adjustmentFactorAtLocked(bar.Exchange, firstNonEmpty(sourceMarket, bar.SourceMarket), bar.Symbol, priceMode, bar.StartMS)
+	if factor == nil {
+		return market.MarkBarAdjustmentStatus(bar, priceMode, market.AdjustmentStatusMissing)
+	}
+	return market.ApplyFactorToBar(bar, *factor)
+}
+
+func (m *MemoryHistoricalStore) adjustmentFactorAtLocked(exchange string, sourceMarket string, symbol string, priceMode string, tsMS int64) *market.AdjustmentFactor {
+	mode := market.MustNormalizePriceMode(priceMode)
+	if mode == market.PriceModeRaw {
+		return nil
+	}
+	exchange = strings.ToLower(exchange)
+	symbol = strings.ToUpper(symbol)
+	for _, factor := range m.adjustmentFactors {
+		if strings.ToLower(factor.Exchange) != exchange || strings.ToUpper(factor.Symbol) != symbol {
+			continue
+		}
+		if factor.SourceMarket != "" && sourceMarket != "" && !strings.EqualFold(factor.SourceMarket, sourceMarket) {
+			continue
+		}
+		if market.MustNormalizePriceMode(factor.AdjMode) != mode {
+			continue
+		}
+		if factor.EffectiveFromMS <= tsMS && (factor.EffectiveToMS == 0 || tsMS <= factor.EffectiveToMS) {
+			factorCopy := factor
+			return &factorCopy
+		}
+	}
+	return nil
 }
 
 func (m *MemoryHistoricalStore) LoadKlineGuardianState(_ context.Context, exchange string, symbol string, tf string) (*market.KlineGuardianState, error) {
@@ -154,4 +265,44 @@ func (m *MemoryHistoricalStore) InsertKlineGuardianEvents(_ context.Context, eve
 
 func guardianStateKey(exchange string, symbol string, tf string) string {
 	return strings.ToLower(exchange) + ":" + strings.ToUpper(symbol) + ":" + tf
+}
+
+func adjustedKey(exchange string, sourceMarket string, symbol string, tf string, mode string) string {
+	return strings.ToLower(exchange) + ":" + sourceMarket + ":" + strings.ToUpper(symbol) + ":" + tf + ":" + market.MustNormalizePriceMode(mode)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func recalculateMemoryDerived(bars []market.Bar) []market.Bar {
+	var previousClose float64
+	for i := range bars {
+		bars[i].PrevClose = previousClose
+		if previousClose > 0 {
+			bars[i].Chg = roundMemoryPercent((bars[i].ClosePrice - previousClose) / previousClose * 100)
+		} else {
+			bars[i].Chg = 0
+		}
+		if bars[i].LowPrice > 0 {
+			bars[i].Amp = roundMemoryPercent((bars[i].HighPrice - bars[i].LowPrice) / bars[i].LowPrice * 100)
+		} else {
+			bars[i].Amp = 0
+		}
+		previousClose = bars[i].ClosePrice
+		bars[i] = market.DecorateBar(bars[i])
+	}
+	return bars
+}
+
+func roundMemoryPercent(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return math.Round(value*1_000_000) / 1_000_000
 }

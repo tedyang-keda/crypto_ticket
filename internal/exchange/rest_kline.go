@@ -188,6 +188,7 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 			Reason:         "exchange_kline_backfill",
 			UpdatedAtMS:    now,
 		}
+		bar = market.ApplyClassificationFieldsToBar(bar, binanceDefaultClassification(a.marketType))
 		if validOHLC(bar) {
 			bars = append(bars, market.DecorateBar(bar))
 		}
@@ -369,6 +370,11 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 			Source:         "rest",
 			Reason:         "exchange_kline_backfill",
 			UpdatedAtMS:    now,
+		}
+		if ok {
+			bar = market.ApplyClassificationFieldsToBar(bar, spec.classification)
+		} else {
+			bar = market.ApplyClassificationFieldsToBar(bar, okxDefaultClassification(a.instType))
 		}
 		if validOHLC(bar) {
 			bars = append(bars, market.DecorateBar(bar))

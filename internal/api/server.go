@@ -60,7 +60,12 @@ func (s *Server) latestTicker(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	tick, err := s.market.LatestTick(r.Context(), exchange, symbol)
+	priceMode, err := priceModeParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	tick, err := s.market.LatestTick(r.Context(), exchange, symbol, priceMode)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -96,22 +101,29 @@ func (s *Server) klines(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query().Get("include_live"); raw != "" {
 		includeLive = raw != "false" && raw != "0"
 	}
+	priceMode, err := priceModeParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	bars, err := s.market.Klines(r.Context(), market.KlineQuery{
 		Exchange:    exchange,
 		Symbol:      symbol,
 		Timeframe:   tf,
 		Limit:       limit,
 		IncludeLive: includeLive,
+		PriceMode:   priceMode,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"exchange":  exchange,
-		"symbol":    symbol,
-		"timeframe": tf,
-		"bars":      bars,
+		"exchange":   exchange,
+		"symbol":     symbol,
+		"timeframe":  tf,
+		"price_mode": priceMode,
+		"bars":       bars,
 	})
 }
 
@@ -219,6 +231,14 @@ func requiredMarketParams(r *http.Request) (string, string, error) {
 		return "", "", errors.New("missing symbol")
 	}
 	return exchange, symbol, nil
+}
+
+func priceModeParam(r *http.Request) (string, error) {
+	mode, err := market.NormalizePriceMode(r.URL.Query().Get("price_mode"))
+	if err != nil {
+		return "", err
+	}
+	return mode, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

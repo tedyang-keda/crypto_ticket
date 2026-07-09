@@ -1,21 +1,33 @@
 CREATE TABLE IF NOT EXISTS symbol_registry (
   exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
   symbol VARCHAR(64) NOT NULL,
   market_type VARCHAR(16) NOT NULL,
+  instrument_type VARCHAR(32) NOT NULL DEFAULT '',
+  asset_class VARCHAR(24) NOT NULL DEFAULT '',
+  rule_type VARCHAR(24) NOT NULL DEFAULT '',
+  lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '',
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   first_seen_at_ms BIGINT NOT NULL,
   last_seen_at_ms BIGINT NOT NULL,
   last_status VARCHAR(32) NOT NULL,
-  raw_json JSON NOT NULL,
+  raw_json JSON NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (exchange, symbol),
-  KEY idx_registry_active (exchange, is_active, last_seen_at_ms)
+  KEY idx_registry_active (exchange, is_active, last_seen_at_ms),
+  KEY idx_registry_source_market (exchange, source_market, is_active),
+  KEY idx_registry_asset_class (exchange, asset_class, rule_type, lifecycle_phase)
 );
 
 CREATE TABLE IF NOT EXISTS latest_quote (
   exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
   symbol VARCHAR(64) NOT NULL,
+  instrument_type VARCHAR(32) NOT NULL DEFAULT '',
+  asset_class VARCHAR(24) NOT NULL DEFAULT '',
+  rule_type VARCHAR(24) NOT NULL DEFAULT '',
+  lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '',
   ts_ms BIGINT NOT NULL,
   price DECIMAL(28, 12) NOT NULL,
   size DECIMAL(28, 12) DEFAULT NULL,
@@ -24,12 +36,18 @@ CREATE TABLE IF NOT EXISTS latest_quote (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (exchange, symbol),
-  KEY idx_latest_quote_ts (exchange, ts_ms)
+  KEY idx_latest_quote_ts (exchange, ts_ms),
+  KEY idx_latest_quote_source_market (exchange, source_market, symbol)
 );
 
 CREATE TABLE IF NOT EXISTS bar_history (
   exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
   symbol VARCHAR(64) NOT NULL,
+  instrument_type VARCHAR(32) NOT NULL DEFAULT '',
+  asset_class VARCHAR(24) NOT NULL DEFAULT '',
+  rule_type VARCHAR(24) NOT NULL DEFAULT '',
+  lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '',
   margin_type VARCHAR(16) NOT NULL DEFAULT '',
   timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   start_ms BIGINT NOT NULL,
@@ -51,7 +69,8 @@ CREATE TABLE IF NOT EXISTS bar_history (
   is_final TINYINT(1) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (exchange, symbol, timeframe, start_ms)
+  PRIMARY KEY (exchange, symbol, timeframe, start_ms),
+  KEY idx_bar_source_market (exchange, source_market, symbol, timeframe, start_ms)
 )
 PARTITION BY RANGE COLUMNS(timeframe, start_ms) (
   PARTITION p_tf_12h_2026_01 VALUES LESS THAN ('12H', 1769904000000),
@@ -179,6 +198,92 @@ PARTITION BY RANGE COLUMNS(timeframe, start_ms) (
   PARTITION p_tf_6h_2026_11 VALUES LESS THAN ('6H', 1796083200000),
   PARTITION p_tf_6h_2026_12 VALUES LESS THAN ('6H', 1798761600000),
   PARTITION p_tf_6h_future VALUES LESS THAN (MAXVALUE, MAXVALUE)
+);
+
+CREATE TABLE IF NOT EXISTS bar_history_adjusted (
+  exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
+  symbol VARCHAR(64) NOT NULL,
+  adj_mode VARCHAR(24) NOT NULL,
+  instrument_type VARCHAR(32) NOT NULL DEFAULT '',
+  asset_class VARCHAR(24) NOT NULL DEFAULT '',
+  rule_type VARCHAR(24) NOT NULL DEFAULT '',
+  lifecycle_phase VARCHAR(24) NOT NULL DEFAULT '',
+  margin_type VARCHAR(16) NOT NULL DEFAULT '',
+  timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  start_ms BIGINT NOT NULL,
+  end_ms BIGINT NOT NULL,
+  open_price DECIMAL(28, 12) NOT NULL,
+  high_price DECIMAL(28, 12) NOT NULL,
+  low_price DECIMAL(28, 12) NOT NULL,
+  close_price DECIMAL(28, 12) NOT NULL,
+  volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
+  volume_unit VARCHAR(16) NOT NULL DEFAULT '',
+  quote_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
+  quote_unit VARCHAR(16) NOT NULL DEFAULT '',
+  contract_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
+  trade_count BIGINT NOT NULL DEFAULT 0,
+  prev_close DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  chg DECIMAL(18, 8) NOT NULL DEFAULT 0,
+  amp DECIMAL(18, 8) NOT NULL DEFAULT 0,
+  last_tick_ms BIGINT NOT NULL,
+  is_final TINYINT(1) NOT NULL DEFAULT 0,
+  adjustment_status VARCHAR(24) NOT NULL DEFAULT 'adjusted',
+  adjustment_provider VARCHAR(64) NOT NULL DEFAULT '',
+  adjustment_provider_version VARCHAR(64) NOT NULL DEFAULT '',
+  adjustment_event_type VARCHAR(32) NOT NULL DEFAULT '',
+  price_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+  volume_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+  raw_open_price DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  raw_high_price DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  raw_low_price DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  raw_close_price DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  raw_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
+  raw_quote_volume DECIMAL(30, 12) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (exchange, source_market, symbol, adj_mode, timeframe, start_ms),
+  KEY idx_adjusted_lookup (exchange, symbol, adj_mode, timeframe, start_ms)
+)
+PARTITION BY RANGE COLUMNS(timeframe, start_ms) (
+  PARTITION p_tf_adjusted_future VALUES LESS THAN (MAXVALUE, MAXVALUE)
+);
+
+CREATE TABLE IF NOT EXISTS adjustment_factor (
+  provider VARCHAR(64) NOT NULL,
+  provider_version VARCHAR(64) NOT NULL,
+  exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
+  symbol VARCHAR(64) NOT NULL,
+  adj_mode VARCHAR(24) NOT NULL,
+  effective_from_ms BIGINT NOT NULL,
+  effective_to_ms BIGINT NOT NULL DEFAULT 0,
+  price_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+  volume_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
+  event_type VARCHAR(32) NOT NULL DEFAULT '',
+  raw_json JSON NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
+  KEY idx_adjustment_lookup (exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
+  KEY idx_adjustment_event (event_type, updated_at)
+);
+
+CREATE TABLE IF NOT EXISTS instrument_change_event (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  exchange VARCHAR(16) NOT NULL,
+  source_market VARCHAR(48) NOT NULL DEFAULT '',
+  symbol VARCHAR(64) NOT NULL,
+  event_ts_ms BIGINT NOT NULL,
+  event_type VARCHAR(32) NOT NULL,
+  previous_hash CHAR(64) NOT NULL DEFAULT '',
+  current_hash CHAR(64) NOT NULL DEFAULT '',
+  previous_json JSON NULL,
+  current_json JSON NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_instrument_event_symbol (exchange, source_market, symbol, event_ts_ms),
+  KEY idx_instrument_event_type (event_type, event_ts_ms)
 );
 
 CREATE TABLE IF NOT EXISTS kline_guardian_state (

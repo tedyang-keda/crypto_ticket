@@ -21,11 +21,12 @@ type OKXAdapter struct {
 }
 
 type okxInstrumentSpec struct {
-	baseCcy   string
-	quoteCcy  string
-	settleCcy string
-	ctVal     float64
-	ctValCcy  string
+	baseCcy        string
+	quoteCcy       string
+	settleCcy      string
+	ctVal          float64
+	ctValCcy       string
+	classification market.InstrumentClassification
 }
 
 func NewOKXAdapter(instType string, restURL string, wsURL string) *OKXAdapter {
@@ -75,13 +76,16 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 	}
 	var payload struct {
 		Data []struct {
-			InstID    string `json:"instId"`
-			State     string `json:"state"`
-			BaseCcy   string `json:"baseCcy"`
-			QuoteCcy  string `json:"quoteCcy"`
-			SettleCcy string `json:"settleCcy"`
-			CtVal     string `json:"ctVal"`
-			CtValCcy  string `json:"ctValCcy"`
+			InstID       string `json:"instId"`
+			InstType     string `json:"instType"`
+			InstCategory string `json:"instCategory"`
+			RuleType     string `json:"ruleType"`
+			State        string `json:"state"`
+			BaseCcy      string `json:"baseCcy"`
+			QuoteCcy     string `json:"quoteCcy"`
+			SettleCcy    string `json:"settleCcy"`
+			CtVal        string `json:"ctVal"`
+			CtValCcy     string `json:"ctValCcy"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -100,15 +104,29 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 		if baseCcy == "" || quoteCcy == "" {
 			baseCcy, quoteCcy = inferOKXSymbolCurrencies(symbol)
 		}
+		raw := map[string]any{
+			"instId":       item.InstID,
+			"instType":     item.InstType,
+			"instCategory": item.InstCategory,
+			"ruleType":     item.RuleType,
+			"state":        item.State,
+			"baseCcy":      item.BaseCcy,
+			"quoteCcy":     item.QuoteCcy,
+			"settleCcy":    item.SettleCcy,
+			"ctVal":        item.CtVal,
+			"ctValCcy":     item.CtValCcy,
+		}
+		classification := market.ClassifyOKXSymbol(a.instType, raw)
 		specs[symbol] = okxInstrumentSpec{
-			baseCcy:   baseCcy,
-			quoteCcy:  quoteCcy,
-			settleCcy: strings.ToUpper(strings.TrimSpace(item.SettleCcy)),
-			ctVal:     parseFloat(item.CtVal),
-			ctValCcy:  strings.ToUpper(strings.TrimSpace(item.CtValCcy)),
+			baseCcy:        baseCcy,
+			quoteCcy:       quoteCcy,
+			settleCcy:      strings.ToUpper(strings.TrimSpace(item.SettleCcy)),
+			ctVal:          parseFloat(item.CtVal),
+			ctValCcy:       strings.ToUpper(strings.TrimSpace(item.CtValCcy)),
+			classification: classification,
 		}
 		status := strings.ToLower(item.State)
-		symbols = append(symbols, market.SymbolInfo{
+		info := market.SymbolInfo{
 			Exchange:      a.Name(),
 			Symbol:        symbol,
 			MarketType:    a.instType,
@@ -117,7 +135,9 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 			FirstSeenAtMS: now,
 			LastSeenAtMS:  now,
 			UpdatedAtMS:   now,
-		})
+			Raw:           rawJSON(raw),
+		}
+		symbols = append(symbols, market.ApplyClassificationFieldsToSymbol(info, classification))
 	}
 	a.replaceInstrumentSpecs(specs)
 	return symbols, nil
@@ -278,6 +298,11 @@ func (a *OKXAdapter) ParseKlineMessage(payload []byte) ([]market.Bar, error) {
 			Source:         "exchange_kline",
 			Reason:         reason,
 			UpdatedAtMS:    now,
+		}
+		if ok {
+			bar = market.ApplyClassificationFieldsToBar(bar, spec.classification)
+		} else {
+			bar = market.ApplyClassificationFieldsToBar(bar, okxDefaultClassification(a.instType))
 		}
 		bars = append(bars, market.DecorateBar(bar))
 	}

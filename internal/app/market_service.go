@@ -146,6 +146,14 @@ func normalizeBar(bar market.Bar) market.Bar {
 	bar.Symbol = strings.ToUpper(strings.TrimSpace(bar.Symbol))
 	bar.Timeframe = timeframe.MustNormalize(bar.Timeframe)
 	bar.MarginType = normalizeMarginType(bar.MarginType)
+	if mode, err := market.NormalizePriceMode(bar.PriceMode); err == nil {
+		bar.PriceMode = mode
+	} else {
+		bar.PriceMode = market.PriceModeRaw
+	}
+	if bar.PriceMode == market.PriceModeRaw && bar.AdjustmentStatus == "" {
+		bar.AdjustmentStatus = market.AdjustmentStatusRaw
+	}
 	if bar.EndMS == 0 && bar.StartMS > 0 {
 		bar.EndMS = timeframe.EndMS(bar.StartMS, bar.Timeframe)
 	}
@@ -390,16 +398,24 @@ func (s *MarketService) publishBar(bar market.Bar) {
 	})
 }
 
-func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string) (*market.Tick, error) {
+func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string, priceMode string) (*market.Tick, error) {
 	exchange = strings.ToLower(strings.TrimSpace(exchange))
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	mode, err := market.NormalizePriceMode(priceMode)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	live, ok := s.liveBars[barKey(exchange, symbol, aggregator.OneMinute)]
 	s.mu.RUnlock()
 	if ok {
-		return tickFromBar(live), nil
+		bar, err := s.applyQueryPriceMode(ctx, live, mode)
+		if err != nil {
+			return nil, err
+		}
+		return tickFromBar(bar), nil
 	}
-	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1})
+	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1, PriceMode: mode})
 	if err != nil || len(bars) == 0 {
 		return nil, err
 	}
@@ -407,22 +423,41 @@ func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol 
 }
 
 func tickFromBar(bar market.Bar) *market.Tick {
-	return &market.Tick{
-		Exchange:  bar.Exchange,
-		Symbol:    bar.Symbol,
-		TsMS:      bar.LastTickMS,
-		Price:     bar.ClosePrice,
-		Size:      bar.Volume,
-		EventType: "kline",
-		Source:    bar.Source,
-		RecvMS:    bar.UpdatedAtMS,
+	tick := &market.Tick{
+		Exchange:         bar.Exchange,
+		SourceMarket:     bar.SourceMarket,
+		Symbol:           bar.Symbol,
+		InstrumentType:   bar.InstrumentType,
+		AssetClass:       bar.AssetClass,
+		RuleType:         bar.RuleType,
+		LifecyclePhase:   bar.LifecyclePhase,
+		PriceMode:        bar.PriceMode,
+		AdjustmentStatus: bar.AdjustmentStatus,
+		TsMS:             bar.LastTickMS,
+		Price:            bar.ClosePrice,
+		Size:             bar.Volume,
+		EventType:        "kline",
+		Source:           bar.Source,
+		RecvMS:           bar.UpdatedAtMS,
 	}
+	if bar.AdjustmentStatus == market.AdjustmentStatusAdjusted {
+		tick.RawPrice = bar.RawClosePrice
+		tick.AdjustedPrice = bar.ClosePrice
+		tick.RawSize = bar.RawVolume
+		tick.AdjustedSize = bar.Volume
+	}
+	return tick
 }
 
 func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
 	query.Exchange = strings.ToLower(query.Exchange)
 	query.Symbol = strings.ToUpper(query.Symbol)
 	query.Timeframe = timeframe.MustNormalize(query.Timeframe)
+	mode, err := market.NormalizePriceMode(query.PriceMode)
+	if err != nil {
+		return nil, err
+	}
+	query.PriceMode = mode
 	if query.Limit <= 0 {
 		query.Limit = defaultRecentLimit
 	}
@@ -445,7 +480,11 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		return trimBars(bars, query.Limit), nil
 	}
 	if query.Timeframe == aggregator.OneMinute {
-		return trimBars(mergeLiveBar(bars, live), query.Limit+1), nil
+		queryLive, err := s.applyQueryPriceMode(ctx, *live, query.PriceMode)
+		if err != nil {
+			return nil, err
+		}
+		return trimBars(mergeLiveBar(bars, &queryLive), query.Limit+1), nil
 	}
 
 	partial, err := s.buildLiveRollup(ctx, query.Timeframe, *live, market.NowMS())
@@ -455,7 +494,30 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	if partial == nil {
 		return trimBars(bars, query.Limit), nil
 	}
-	return trimBars(mergeLiveBar(bars, partial), query.Limit+1), nil
+	queryPartial, err := s.applyQueryPriceMode(ctx, *partial, query.PriceMode)
+	if err != nil {
+		return nil, err
+	}
+	return trimBars(mergeLiveBar(bars, &queryPartial), query.Limit+1), nil
+}
+
+func (s *MarketService) applyQueryPriceMode(ctx context.Context, bar market.Bar, priceMode string) (market.Bar, error) {
+	mode, err := market.NormalizePriceMode(priceMode)
+	if err != nil {
+		return bar, err
+	}
+	if mode == market.PriceModeRaw {
+		return market.MarkBarAdjustmentStatus(market.DecorateBar(bar), mode, market.AdjustmentStatusRaw), nil
+	}
+	factor, err := s.store.AdjustmentFactorAt(ctx, bar.Exchange, bar.SourceMarket, bar.Symbol, mode, bar.StartMS)
+	if err != nil {
+		return bar, err
+	}
+	if factor == nil {
+		bar = market.MarkBarAdjustmentStatus(market.DecorateBar(bar), mode, market.AdjustmentStatusLiveRaw)
+		return bar, nil
+	}
+	return market.ApplyFactorToBar(bar, *factor), nil
 }
 
 func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Bar {

@@ -61,9 +61,12 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 	}
 	var payload struct {
 		Symbols []struct {
-			Symbol         string `json:"symbol"`
-			Status         string `json:"status"`
-			ContractStatus string `json:"contractStatus"`
+			Symbol            string   `json:"symbol"`
+			Status            string   `json:"status"`
+			ContractStatus    string   `json:"contractStatus"`
+			ContractType      string   `json:"contractType"`
+			UnderlyingType    string   `json:"underlyingType"`
+			UnderlyingSubType []string `json:"underlyingSubType"`
 		} `json:"symbols"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -77,7 +80,16 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 			continue
 		}
 		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
-		symbols = append(symbols, market.SymbolInfo{
+		raw := map[string]any{
+			"symbol":            item.Symbol,
+			"status":            item.Status,
+			"contractStatus":    item.ContractStatus,
+			"contractType":      item.ContractType,
+			"underlyingType":    item.UnderlyingType,
+			"underlyingSubType": item.UnderlyingSubType,
+		}
+		classification := market.ClassifyBinanceSymbol(a.marketType, raw)
+		info := market.SymbolInfo{
 			Exchange:      a.Name(),
 			Symbol:        symbol,
 			MarketType:    a.marketType,
@@ -86,7 +98,9 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 			FirstSeenAtMS: now,
 			LastSeenAtMS:  now,
 			UpdatedAtMS:   now,
-		})
+			Raw:           rawJSON(raw),
+		}
+		symbols = append(symbols, market.ApplyClassificationFieldsToSymbol(info, classification))
 	}
 	return symbols, nil
 }
@@ -268,6 +282,7 @@ func (a *BinanceFuturesAdapter) ParseKlineMessage(payload []byte) ([]market.Bar,
 		Reason:         reason,
 		UpdatedAtMS:    now,
 	}
+	bar = market.ApplyClassificationFieldsToBar(bar, binanceDefaultClassification(a.marketType))
 	return []market.Bar{market.DecorateBar(bar)}, nil
 }
 
