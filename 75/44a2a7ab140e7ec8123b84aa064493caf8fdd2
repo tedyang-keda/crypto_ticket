@@ -1,0 +1,59 @@
+internal/aggregator/engine.go
+  s_d09edf7f9a54ab::t_5e4a70519ad8f1 40-61
+internal/api/server.go
+  s_d09edf7f9a54ab::t_eb77d6869830da 63-68,104-108,115,122-126,236-243
+internal/api/server_test.go
+  s_d09edf7f9a54ab::t_e0ea965a63e9b1 1-28
+internal/app/market_service_test.go
+  s_d09edf7f9a54ab::t_609010af7ad3bd 56-104
+internal/collector/collector.go
+  s_d09edf7f9a54ab::t_620bbd38649a0d 43-47,113,127,131,156,164-165,173,181,203,215,218,223,226,231,236,239,243,247,249-252,257-267
+internal/exchange/binance.go
+  s_d09edf7f9a54ab::t_75f7b2d0f83538 64-69,83-92,101-103,285
+internal/exchange/instrument_meta.go
+  s_d09edf7f9a54ab::t_f886a92168606c 1-37
+internal/exchange/okx.go
+  s_d09edf7f9a54ab::t_b3bab0970d02d6 24-29,79-88,107-119,121-126,129,138-140,302-306
+internal/exchange/rest_kline.go
+  s_d09edf7f9a54ab::t_05f2dbf4cefa97 191,374-378
+internal/market/instruments.go
+  s_d09edf7f9a54ab::t_f8596b8e7a4bc2 1-201
+internal/market/instruments_test.go
+  s_d09edf7f9a54ab::t_3379558227a2f3 1-90
+internal/storage/memory.go
+  s_d09edf7f9a54ab::t_9b5c4084e54624 5,14-20,27,40-42,56,58-62,78-87,121-123,146-231,269-308
+internal/storage/mysql/partitions.go
+  s_d09edf7f9a54ab::t_f84f444b745f27 163,165-168,190-237
+internal/storage/mysql/store.go
+  s_d09edf7f9a54ab::t_e7114fc888afca 8,40,43-46,55-57,60-95,136-138,156-182,185-189,199,217-218,220,222-223,274-280,288,300-301,304,313,324-325,338-340,342-344,349-353,356,359-362,383-384,394-398,486-594,598,600-603,626-878,885-897
+internal/storage/store.go
+  s_d09edf7f9a54ab::t_2faa64d5e2f324 16-18
+sql/schema.sql
+  s_d09edf7f9a54ab::t_3d22986a074612 3,6-9,14,18-20,25,27-30,39-40,45,47-50,72-73,203-288
+tests/test_schema.py
+  s_d09edf7f9a54ab::t_f22c1acae31f75 7,12-16
+web/src/api.ts
+  s_d09edf7f9a54ab::t_511ac45ad36c42 1,21,23-25,32,34
+web/src/store.ts
+  s_d09edf7f9a54ab::t_804b84b9269a29 2,8,15,26,33,37,57-58
+web/src/useMarketSocket.ts
+  s_d09edf7f9a54ab::t_939c1bc4a74abe 9,15-18,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7544a2a7ab140e7ec8123b84aa064493caf8fdd2",
+  "prompts": {},
+  "sessions": {
+    "s_d09edf7f9a54ab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f458d-8380-7fe2-a1de-0623f5f66fa4",
+        "model": "unknown"
+      },
+      "human_author": "tedyang-kedakeda <tedyangjob@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
