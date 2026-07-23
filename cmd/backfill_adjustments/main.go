@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 )
 
 type options struct {
+	exchange             string
 	symbols              []string
 	startMS              int64
 	endMS                int64
@@ -38,7 +40,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid options: %v", err)
 	}
-	exchangeConfig, err := binanceUMConfig(cfg.Exchanges)
+	exchangeConfig, err := adjustmentExchangeConfig(cfg.Exchanges, opts.exchange)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -55,34 +57,29 @@ func main() {
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	announcements := exchange.NewBinanceAnnouncementVerifier(cfg.BinanceCMSURL, client)
-	actions, err := announcements.ListCorporateActions(ctx, exchange.BinanceAnnouncementQuery{
-		StartMS: opts.startMS, EndMS: opts.endMS, Symbols: opts.symbols,
-		MaxPages: opts.maxPages, RequestDelay: opts.requestDelay,
-	})
+	actions, source, err := historicalActions(ctx, cfg, exchangeConfig, client, opts)
 	if err != nil {
-		log.Fatalf("scan Binance announcements: %v", err)
+		log.Fatalf("scan %s announcements: %v", opts.exchange, err)
+	}
+	if !opts.dryRun {
+		if err := recordNoActionCoverage(ctx, store, opts, exchangeConfig, actions); err != nil {
+			log.Fatalf("record %s no-action coverage: %v", opts.exchange, err)
+		}
 	}
 	if len(actions) == 0 {
-		log.Printf("no Binance corporate actions found range=[%d,%d] symbols=%v", opts.startMS, opts.endMS, opts.symbols)
+		log.Printf("no %s corporate actions found range=[%d,%d] symbols=%v", opts.exchange, opts.startMS, opts.endMS, opts.symbols)
 		return
 	}
 
-	adapter := exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
-	backfiller := adjustment.NewHistoricalBackfiller(store, adapter, client, adjustment.HistoricalBackfillConfig{
+	backfiller := adjustment.NewHistoricalBackfiller(store, source, client, adjustment.HistoricalBackfillConfig{
 		BoundaryTolerancePct: opts.boundaryTolerancePct,
 		DryRun:               opts.dryRun,
 	})
-	sourceMarket := market.SourceMarket("binance", exchangeConfig.MarketType)
 	succeeded := 0
 	skipped := 0
 	failed := 0
 	for _, action := range actions {
-		result, err := backfiller.Backfill(ctx, adjustment.HistoricalAction{
-			Exchange: "binance", SourceMarket: sourceMarket, Symbol: action.Symbol, Ratio: action.Ratio,
-			WindowStartMS: action.WindowStartMS, WindowEndMS: action.WindowEndMS, PublishedMS: action.PublishedMS,
-			AnnouncementCode: action.AnnouncementCode, Title: action.Title, Raw: action.Raw,
-		})
+		result, err := backfiller.Backfill(ctx, action)
 		if err != nil {
 			failed++
 			if opts.continueOnError {
@@ -109,21 +106,64 @@ func main() {
 	log.Printf("done found=%d succeeded=%d existing=%d failed=%d dry_run=%v", len(actions), succeeded, skipped, failed, opts.dryRun)
 }
 
+func recordNoActionCoverage(ctx context.Context, store adjustment.HistoricalBackfillStore, opts options, exchangeConfig config.ExchangeConfig, actions []adjustment.HistoricalAction) error {
+	if opts.exchange != "okx" || len(opts.symbols) == 0 {
+		return nil
+	}
+	actionSymbols := make(map[string]bool, len(actions)*2)
+	for _, action := range actions {
+		actionSymbols[strings.ToUpper(action.Symbol)] = true
+		if action.PredecessorSymbol != "" {
+			actionSymbols[strings.ToUpper(action.PredecessorSymbol)] = true
+		}
+	}
+	sourceMarket := market.SourceMarket(opts.exchange, exchangeConfig.MarketType)
+	for _, requested := range opts.symbols {
+		symbol := strings.ToUpper(strings.TrimSpace(requested))
+		if opts.exchange == "okx" {
+			symbol = exchange.NormalizeOKXInstrumentID(symbol)
+		}
+		if symbol == "" || actionSymbols[symbol] {
+			continue
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"method": "historical_announcement_scan", "exchange": opts.exchange,
+			"start_ms": opts.startMS, "end_ms": opts.endMS, "result": "no_corporate_action",
+		})
+		event := market.CorporateActionEvent{
+			ActionID: fmt.Sprintf("%s|%s|%s|coverage|%d|%d", opts.exchange, sourceMarket, symbol, opts.startMS, opts.endMS),
+			Exchange: opts.exchange, SourceMarket: sourceMarket, Symbol: symbol,
+			EventType: market.CorporateActionEventHistoricalCoverage, State: market.CorporateActionStateNotRequired,
+			FirstSeenMS: opts.startMS, LastEventMS: opts.endMS, Raw: raw, UpdatedAtMS: market.NowMS(),
+		}
+		if err := store.UpsertCorporateActionEvent(ctx, event); err != nil {
+			return err
+		}
+		log.Printf("COVERED no-action symbol=%s range=[%d,%d]", symbol, opts.startMS, opts.endMS)
+	}
+	return nil
+}
+
 func parseOptions() (options, error) {
 	var out options
 	var symbolsRaw string
 	var startRaw string
 	var endRaw string
 	var requestDelayMS int
-	flag.StringVar(&symbolsRaw, "symbols", "", "optional comma-separated exact Binance symbols")
+	flag.StringVar(&out.exchange, "exchange", "binance", "announcement and kline exchange: binance or okx")
+	flag.StringVar(&symbolsRaw, "symbols", "", "optional comma-separated exact exchange symbols")
 	flag.StringVar(&startRaw, "start", "", "required inclusive start: unix ms, RFC3339, or YYYY-MM-DD")
 	flag.StringVar(&endRaw, "end", "", "optional inclusive end; default now")
-	flag.IntVar(&out.maxPages, "max-pages", 50, "maximum Binance CMS pages to scan")
-	flag.IntVar(&requestDelayMS, "request-delay-ms", 200, "delay between Binance requests")
+	flag.IntVar(&out.maxPages, "max-pages", 50, "maximum announcement pages to scan")
+	flag.IntVar(&requestDelayMS, "request-delay-ms", 200, "delay between announcement requests")
 	flag.Float64Var(&out.boundaryTolerancePct, "boundary-tolerance-pct", 0.25, "maximum observed/official ratio divergence as a fraction")
 	flag.BoolVar(&out.dryRun, "dry-run", false, "calculate and log without writing bars, factors, or events")
 	flag.BoolVar(&out.continueOnError, "continue-on-error", false, "continue when one announcement cannot be backfilled")
 	flag.Parse()
+	out.exchange = strings.ToLower(strings.TrimSpace(out.exchange))
+	if out.exchange != "binance" && out.exchange != "okx" {
+		return out, errors.New("-exchange must be binance or okx")
+	}
 
 	if strings.TrimSpace(startRaw) == "" {
 		return out, errors.New("-start is required")
@@ -159,13 +199,55 @@ func parseOptions() (options, error) {
 	return out, nil
 }
 
-func binanceUMConfig(configs []config.ExchangeConfig) (config.ExchangeConfig, error) {
+func adjustmentExchangeConfig(configs []config.ExchangeConfig, exchangeName string) (config.ExchangeConfig, error) {
 	for _, cfg := range configs {
-		if cfg.Name == "binance" && !strings.Contains(strings.ToLower(cfg.MarketType), "coin") {
-			return cfg, nil
+		if cfg.Name != exchangeName {
+			continue
 		}
+		if exchangeName == "binance" && strings.Contains(strings.ToLower(cfg.MarketType), "coin") {
+			continue
+		}
+		if exchangeName == "okx" && !strings.EqualFold(cfg.MarketType, "SWAP") {
+			continue
+		}
+		return cfg, nil
 	}
-	return config.ExchangeConfig{}, errors.New("Binance USD-M exchange config not found")
+	return config.ExchangeConfig{}, fmt.Errorf("%s adjustment exchange config not found", exchangeName)
+}
+
+func historicalActions(ctx context.Context, cfg config.Config, exchangeConfig config.ExchangeConfig, client *http.Client, opts options) ([]adjustment.HistoricalAction, adjustment.HistoricalKlineSource, error) {
+	sourceMarket := market.SourceMarket(opts.exchange, exchangeConfig.MarketType)
+	if opts.exchange == "okx" {
+		verifier := exchange.NewOKXAnnouncementVerifier(exchangeConfig.RestURL, client)
+		found, err := verifier.ListCorporateActions(ctx, exchange.OKXAnnouncementQuery{
+			StartMS: opts.startMS, EndMS: opts.endMS, Symbols: opts.symbols,
+			MaxPages: opts.maxPages, RequestDelay: opts.requestDelay,
+		})
+		actions := make([]adjustment.HistoricalAction, 0, len(found))
+		for _, action := range found {
+			actions = append(actions, adjustment.HistoricalAction{
+				Exchange: "okx", SourceMarket: sourceMarket, Symbol: action.Symbol, PredecessorSymbol: action.PredecessorSymbol,
+				Ratio: action.Ratio, WindowStartMS: action.WindowStartMS, WindowEndMS: action.WindowEndMS,
+				PublishedMS: action.PublishedMS, AnnouncementCode: action.AnnouncementCode, Title: action.Title, Raw: action.Raw,
+			})
+		}
+		return actions, exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL), err
+	}
+
+	verifier := exchange.NewBinanceAnnouncementVerifier(cfg.BinanceCMSURL, client)
+	found, err := verifier.ListCorporateActions(ctx, exchange.BinanceAnnouncementQuery{
+		StartMS: opts.startMS, EndMS: opts.endMS, Symbols: opts.symbols,
+		MaxPages: opts.maxPages, RequestDelay: opts.requestDelay,
+	})
+	actions := make([]adjustment.HistoricalAction, 0, len(found))
+	for _, action := range found {
+		actions = append(actions, adjustment.HistoricalAction{
+			Exchange: "binance", SourceMarket: sourceMarket, Symbol: action.Symbol, Ratio: action.Ratio,
+			WindowStartMS: action.WindowStartMS, WindowEndMS: action.WindowEndMS, PublishedMS: action.PublishedMS,
+			AnnouncementCode: action.AnnouncementCode, Title: action.Title, Raw: action.Raw,
+		})
+	}
+	return actions, exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL), err
 }
 
 func parseTimeMS(raw string) (int64, error) {

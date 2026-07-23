@@ -90,3 +90,68 @@ func TestLocateHistoricalBoundaryRejectsUnrelatedGap(t *testing.T) {
 		t.Fatalf("2:1 observed gap must not match official 20:1 ratio: %+v", got)
 	}
 }
+
+func TestHistoricalBackfillerSupportsOKXOfficialAction(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	bars := []market.Bar{
+		historicalBar(100_000, 100, 100, 1),
+		historicalBar(160_000, 10, 10.2, 10),
+	}
+	backfiller := NewHistoricalBackfiller(store, historicalKlineStub{bars: bars}, nil, HistoricalBackfillConfig{})
+	result, err := backfiller.Backfill(ctx, HistoricalAction{
+		Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Ratio: 10,
+		WindowStartMS: 1, WindowEndMS: 300_000, AnnouncementCode: "openai-rebase",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Segments) != 2 || result.Segments[0].Provider != OKXProviderName || result.Segments[0].EventType != HistoricalEventOKXRebase {
+		t.Fatalf("unexpected OKX factors: %+v", result.Segments)
+	}
+}
+
+func TestRebuildBoundaryBarsRollsUpAdjustedOneMinute(t *testing.T) {
+	const minute = int64(60_000)
+	boundary := int64(10 * minute)
+	raw := make([]market.Bar, 0, 15)
+	for i := 0; i < 15; i++ {
+		price := 100 + float64(i)/10
+		if int64(i)*minute >= boundary {
+			price = 10 + float64(i-10)/10
+		}
+		raw = append(raw, market.Bar{
+			Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Timeframe: "1m",
+			StartMS: int64(i) * minute, EndMS: int64(i+1)*minute - 1,
+			OpenPrice: price, HighPrice: price, LowPrice: price, ClosePrice: price,
+			Volume: 1, IsFinal: true,
+		})
+	}
+	segments := CumulativeBackwardSegments(market.AdjustmentFactor{
+		Provider: OKXProviderName, ProviderVersion: ProviderVersion, Exchange: "okx", SourceMarket: "okx:SWAP",
+		Symbol: "OPENAI-USDT-SWAP", EventType: HistoricalEventOKXRebase,
+	}, []LedgerEvent{{EffectiveMS: boundary, PriceMultiplier: 0.1, VolumeMultiplier: 10, EventType: HistoricalEventOKXRebase}})
+	rawBars, adjustedBars := rebuildBoundaryBars(HistoricalAction{
+		Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP",
+	}, boundary, raw, segments)
+	raw15 := findTestBar(rawBars, "15m", 0)
+	adjusted15 := findTestBar(adjustedBars, "15m", 0)
+	if raw15 == nil || adjusted15 == nil {
+		t.Fatalf("missing boundary rollups raw=%v adjusted=%v", raw15, adjusted15)
+	}
+	if raw15.HighPrice < 100 || adjusted15.HighPrice > 11 {
+		t.Fatalf("boundary scale was not repaired raw=%+v adjusted=%+v", *raw15, *adjusted15)
+	}
+	if adjusted15.RawHighPrice != raw15.HighPrice || adjusted15.AdjustmentStatus != market.AdjustmentStatusAdjusted {
+		t.Fatalf("materialized raw evidence missing: %+v", *adjusted15)
+	}
+}
+
+func findTestBar(bars []market.Bar, tf string, startMS int64) *market.Bar {
+	for i := range bars {
+		if bars[i].Timeframe == tf && bars[i].StartMS == startMS {
+			return &bars[i]
+		}
+	}
+	return nil
+}

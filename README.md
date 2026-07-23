@@ -68,17 +68,21 @@ raw | backward_adjusted | forward_adjusted
 
 - `bar_history` 永远保存交易所 raw final bar。
 - `adjustment_factor` 保存复权因子，`bar_history_adjusted` 可保存物化后的复权 bar。
-- 请求 adjusted 模式时，服务优先读 `bar_history_adjusted`；如果没有物化行，会按 `adjustment_factor` 读时派生，并返回 `adjustment_status`。
+- 请求 adjusted 模式时，服务按 `start_ms` 合并 `bar_history_adjusted` 和 raw 行；物化行覆盖对应边界桶，其余行继续按 `adjustment_factor` 动态派生。
+- `adjustment_status=not_required` 表示该品种和时间范围已经完成官方公告扫描且没有复权动作；未完成覆盖扫描且没有因子的品种仍返回 `missing_factor`。
 - WebSocket 实时推送仍是 raw。dashboard 切到 adjusted 模式后会停止消费 raw WS，改用 HTTP `price_mode` 查询，避免 raw live 覆盖复权视图。
 - 当前 `ticker/latest` 的 price 来自最新 `1m` kline close，不是真实 trade tick。adjusted 模式下如果找得到当前 bar 的 factor，会按 bar 规则派生；找不到时会返回 `adjustment_status=live_raw`。
 
-### Binance 历史复权因子补录
+### 历史复权因子补录
 
-历史补偿不会修改 `bar_history`。命令分页扫描 Binance 公告，读取官方调整比例，使用公告窗口内的官方 `1m` K 线定位边界，然后幂等写入 `corporate_action_event` 和累计 `adjustment_factor`：
+命令支持 Binance 和 OKX。它分页扫描官方公告、读取官方调整比例，使用公告窗口内的官方 `1m` K 线定位精确边界，然后幂等写入 `corporate_action_event` 和累计 `adjustment_factor`。
+
+回填会用官方 `1m` 修复边界所在 UTC 日的 raw `1m`，并重建跨边界的 raw 高周期桶；复权侧先逐根复权 `1m`，再物化边界所在的 `5m` 到 `1D` 桶，避免对混合尺度高周期 K 线整体乘单一因子。
 
 ```bash
 # 先预览，不写数据库
 go run ./cmd/backfill_adjustments \
+	-exchange binance \
   -symbols KORUUSDT \
   -start 2026-07-01 \
   -end 2026-07-31 \
@@ -86,12 +90,21 @@ go run ./cmd/backfill_adjustments \
 
 # 确认结果后写入
 go run ./cmd/backfill_adjustments \
+	-exchange binance \
   -symbols KORUUSDT \
   -start 2026-07-01 \
   -end 2026-07-31
+
+# OKX rebase / rename；先 dry-run，再去掉 -dry-run 写入
+go run ./cmd/backfill_adjustments \
+	-exchange okx \
+	-symbols OPENAI-USDT-SWAP,ANTHROPIC-USDT-SWAP,SPCX-USDT-SWAP,ZHIPU-USDT-SWAP \
+	-start 2026-06-01 \
+	-end 2026-07-01 \
+	-dry-run
 ```
 
-不传 `-symbols` 时会处理日期范围内扫描到的全部 Binance 合约调整。`-continue-on-error` 可跳过无法确认 K 线边界的公告。写入后通过 `price_mode=backward_adjusted` 动态复权，无需物化 `bar_history_adjusted`。
+不传 `-symbols` 时会处理日期范围内扫描到的全部合约调整。`-continue-on-error` 可跳过无法确认 K 线边界的公告。OKX 显式传入的品种如果扫描范围内没有复权公告，会写入 no-action coverage；例如 ZHIPU 后续 adjusted 查询会返回 raw 数值和 `adjustment_status=not_required`。
 
 ## 支持的周期
 

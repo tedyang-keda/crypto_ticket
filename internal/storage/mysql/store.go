@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -615,8 +616,8 @@ func (s *Store) ListOpenCorporateActionEvents(ctx context.Context) ([]market.Cor
 		first_seen_ms, last_event_ms, resume_ms, boundary_ms, announced_ratio, attempts, last_error,
 		raw_json, updated_at_ms
 		FROM corporate_action_event
-		WHERE state NOT IN (?, ?)
-		ORDER BY first_seen_ms ASC`, market.CorporateActionStateFactor, market.CorporateActionStateManualReview)
+		WHERE state NOT IN (?, ?, ?)
+		ORDER BY first_seen_ms ASC`, market.CorporateActionStateFactor, market.CorporateActionStateManualReview, market.CorporateActionStateNotRequired)
 	if err != nil {
 		return nil, err
 	}
@@ -638,6 +639,23 @@ func (s *Store) ListOpenCorporateActionEvents(ctx context.Context) ([]market.Cor
 		out = append(out, event)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) HasAdjustmentCoverage(ctx context.Context, exchange string, sourceMarket string, symbol string, startMS int64, endMS int64) (bool, error) {
+	filter := `exchange = ? AND symbol = ? AND event_type = ? AND state = ?
+		AND first_seen_ms <= ? AND last_event_ms >= ?`
+	args := []any{strings.ToLower(exchange), strings.ToUpper(symbol), market.CorporateActionEventHistoricalCoverage,
+		market.CorporateActionStateNotRequired, startMS, endMS}
+	if strings.TrimSpace(sourceMarket) != "" {
+		filter += " AND (source_market = ? OR source_market = '')"
+		args = append(args, sourceMarket)
+	}
+	var found int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM corporate_action_event WHERE `+filter+` LIMIT 1`, args...).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && found == 1, err
 }
 
 func (s *Store) ListAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error) {
@@ -848,26 +866,43 @@ func (s *Store) recentAdjustedBars(ctx context.Context, query market.KlineQuery,
 	if limit > 1000 {
 		limit = 1000
 	}
-	bars, err := s.recentMaterializedAdjustedBars(ctx, query, priceMode, limit)
-	if err != nil {
-		return nil, err
-	}
-	if len(bars) > 0 {
-		return recalculateDerived(bars), nil
-	}
 	rawQuery := query
 	rawQuery.PriceMode = market.PriceModeRaw
 	rawBars, err := s.recentRawBars(ctx, rawQuery, limit)
 	if err != nil {
 		return nil, err
 	}
+	if len(rawBars) == 0 {
+		return nil, nil
+	}
+	materialized, err := s.materializedAdjustedBarsInRange(ctx, query, priceMode, rawBars[0].StartMS, rawBars[len(rawBars)-1].StartMS)
+	if err != nil {
+		return nil, err
+	}
+	materializedByStart := make(map[int64]market.Bar, len(materialized))
+	for _, bar := range materialized {
+		materializedByStart[bar.StartMS] = bar
+	}
+	covered, err := s.HasAdjustmentCoverage(ctx, query.Exchange, query.SourceMarket, query.Symbol,
+		market.BarAdjustmentTimestamp(rawBars[0]), market.BarAdjustmentTimestamp(rawBars[len(rawBars)-1]))
+	if err != nil {
+		return nil, err
+	}
 	for i := range rawBars {
+		if bar, ok := materializedByStart[rawBars[i].StartMS]; ok {
+			rawBars[i] = bar
+			continue
+		}
 		factor, err := s.AdjustmentFactorAt(ctx, rawBars[i].Exchange, firstNonEmpty(query.SourceMarket, rawBars[i].SourceMarket), rawBars[i].Symbol, priceMode, market.BarAdjustmentTimestamp(rawBars[i]))
 		if err != nil {
 			return nil, err
 		}
 		if factor == nil {
-			rawBars[i] = market.MarkBarAdjustmentStatus(rawBars[i], priceMode, market.AdjustmentStatusMissing)
+			status := market.AdjustmentStatusMissing
+			if covered {
+				status = market.AdjustmentStatusNotRequired
+			}
+			rawBars[i] = market.MarkBarAdjustmentStatus(rawBars[i], priceMode, status)
 			continue
 		}
 		rawBars[i] = market.ApplyFactorToBar(rawBars[i], *factor)
@@ -900,19 +935,17 @@ func (s *Store) recentRawBars(ctx context.Context, query market.KlineQuery, limi
 	return bars, rows.Err()
 }
 
-func (s *Store) recentMaterializedAdjustedBars(ctx context.Context, query market.KlineQuery, priceMode string, limit int) ([]market.Bar, error) {
-	filter := "exchange = ? AND symbol = ? AND adj_mode = ? AND timeframe = ?"
-	args := []any{strings.ToLower(query.Exchange), strings.ToUpper(query.Symbol), priceMode, query.Timeframe}
+func (s *Store) materializedAdjustedBarsInRange(ctx context.Context, query market.KlineQuery, priceMode string, startMS int64, endMS int64) ([]market.Bar, error) {
+	filter := "exchange = ? AND symbol = ? AND adj_mode = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ?"
+	args := []any{strings.ToLower(query.Exchange), strings.ToUpper(query.Symbol), priceMode, query.Timeframe, startMS, endMS}
 	if strings.TrimSpace(query.SourceMarket) != "" {
 		filter += " AND source_market = ?"
 		args = append(args, query.SourceMarket)
 	}
-	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+adjustedBarSelectColumns()+`
 		FROM bar_history_adjusted
 		WHERE `+filter+`
-		ORDER BY start_ms DESC
-		LIMIT ?`, args...)
+		ORDER BY start_ms ASC`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -924,9 +957,6 @@ func (s *Store) recentMaterializedAdjustedBars(ctx context.Context, query market
 			return nil, err
 		}
 		bars = append(bars, market.DecorateBar(bar))
-	}
-	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
-		bars[i], bars[j] = bars[j], bars[i]
 	}
 	return bars, rows.Err()
 }

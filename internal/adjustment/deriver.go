@@ -20,6 +20,9 @@ const (
 	// BinanceProviderName identifies factors whose ratio comes from Binance's
 	// official adjustment announcement. Klines only locate the boundary.
 	BinanceProviderName = "binance_official_announcement"
+	// OKXProviderName identifies historical factors whose ratio comes from an
+	// official OKX announcement. Official candles only locate the boundary.
+	OKXProviderName = "okx_official_announcement"
 	// ProviderVersion tracks the derivation algorithm so factors can be
 	// recomputed if the method changes.
 	ProviderVersion = "v1"

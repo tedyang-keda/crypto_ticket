@@ -38,11 +38,12 @@ const (
 	PriceModeForwardAdjusted  = "forward_adjusted"
 	PriceModeBackwardAdjusted = "backward_adjusted"
 
-	AdjustmentStatusRaw       = "raw"
-	AdjustmentStatusAdjusted  = "adjusted"
-	AdjustmentStatusMissing   = "missing_factor"
-	AdjustmentStatusLiveRaw   = "live_raw"
-	AdjustmentProviderRuntime = "runtime_factor"
+	AdjustmentStatusRaw         = "raw"
+	AdjustmentStatusAdjusted    = "adjusted"
+	AdjustmentStatusMissing     = "missing_factor"
+	AdjustmentStatusNotRequired = "not_required"
+	AdjustmentStatusLiveRaw     = "live_raw"
+	AdjustmentProviderRuntime   = "runtime_factor"
 
 	// OKX exposes rebase-eligible contracts via ruleType; rebase itself is a
 	// lifecycle state. These are the machine-readable signals for a corporate
@@ -64,6 +65,9 @@ const (
 	CorporateActionStateResumed      = "RESUMED"
 	CorporateActionStateFactor       = "FACTOR_WRITTEN"
 	CorporateActionStateManualReview = "MANUAL_REVIEW"
+	CorporateActionStateNotRequired  = "NO_ACTION_REQUIRED"
+
+	CorporateActionEventHistoricalCoverage = "historical_adjustment_coverage"
 )
 
 var ErrUnsupportedPriceMode = errors.New("unsupported price mode")

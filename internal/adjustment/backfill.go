@@ -6,29 +6,37 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 
+	"crypto-ticket/internal/aggregator"
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
+	"crypto-ticket/internal/timeframe"
 )
 
-const HistoricalEventBinanceContractSize = "binance_contract_size_adjustment"
+const (
+	HistoricalEventBinanceContractSize = "binance_contract_size_adjustment"
+	HistoricalEventOKXRebase           = "okx_rebase"
+)
 
 type HistoricalAction struct {
-	Exchange         string
-	SourceMarket     string
-	Symbol           string
-	Ratio            float64
-	WindowStartMS    int64
-	WindowEndMS      int64
-	PublishedMS      int64
-	AnnouncementCode string
-	Title            string
-	Raw              json.RawMessage
+	Exchange          string
+	SourceMarket      string
+	Symbol            string
+	PredecessorSymbol string
+	Ratio             float64
+	WindowStartMS     int64
+	WindowEndMS       int64
+	PublishedMS       int64
+	AnnouncementCode  string
+	Title             string
+	Raw               json.RawMessage
 }
 
 type HistoricalBackfillStore interface {
 	UpsertBars(ctx context.Context, bars []market.Bar) error
+	UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error
 	ListAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error)
 	ReplaceAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, factors []market.AdjustmentFactor) error
 	UpsertCorporateActionEvent(ctx context.Context, event market.CorporateActionEvent) error
@@ -51,11 +59,13 @@ func (c HistoricalBackfillConfig) withDefaults() HistoricalBackfillConfig {
 }
 
 type HistoricalBackfillResult struct {
-	Action        HistoricalAction
-	Boundary      Derivation
-	Segments      []market.AdjustmentFactor
-	AlreadyExists bool
-	BarsFetched   int
+	Action                   HistoricalAction
+	Boundary                 Derivation
+	Segments                 []market.AdjustmentFactor
+	AlreadyExists            bool
+	BarsFetched              int
+	RawBarsRebuilt           int
+	AdjustedBarsMaterialized int
 }
 
 type HistoricalBackfiller struct {
@@ -75,9 +85,10 @@ func NewHistoricalBackfiller(store HistoricalBackfillStore, source HistoricalKli
 func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAction) (HistoricalBackfillResult, error) {
 	action.Exchange = strings.ToLower(strings.TrimSpace(action.Exchange))
 	action.Symbol = strings.ToUpper(strings.TrimSpace(action.Symbol))
+	action.PredecessorSymbol = strings.ToUpper(strings.TrimSpace(action.PredecessorSymbol))
 	result := HistoricalBackfillResult{Action: action}
-	if action.Exchange != "binance" {
-		return result, fmt.Errorf("historical adjustment backfill only supports binance")
+	if action.Exchange != "binance" && action.Exchange != "okx" {
+		return result, fmt.Errorf("historical adjustment backfill does not support exchange %q", action.Exchange)
 	}
 	if action.Symbol == "" || action.Ratio <= 0 || action.WindowStartMS <= 0 || action.WindowEndMS <= action.WindowStartMS {
 		return result, fmt.Errorf("invalid historical action symbol=%q ratio=%f window=[%d,%d]", action.Symbol, action.Ratio, action.WindowStartMS, action.WindowEndMS)
@@ -95,6 +106,11 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 		return result, fmt.Errorf("no kline boundary matches announced ratio %.8f within %.2f%%", action.Ratio, b.cfg.BoundaryTolerancePct*100)
 	}
 	result.Boundary = boundary
+	officialOneMinute, err := b.fetchMaterializationWindow(ctx, action, boundary.BoundaryMS)
+	if err != nil {
+		return result, err
+	}
+	result.BarsFetched = len(officialOneMinute)
 
 	existing, err := b.store.ListAdjustmentFactors(ctx, action.Exchange, action.SourceMarket, action.Symbol, market.PriceModeBackwardAdjusted)
 	if err != nil {
@@ -105,8 +121,8 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 		result.AlreadyExists = true
 		result.Segments = existing
 		if !b.cfg.DryRun {
-			if err := b.store.UpsertBars(ctx, bars); err != nil {
-				return result, fmt.Errorf("upsert boundary klines: %w", err)
+			if err := b.persistBoundaryBars(ctx, action, boundary, officialOneMinute, existing, &result); err != nil {
+				return result, err
 			}
 			if err := b.persistEvent(ctx, action, boundary, historicalEvidence(action, boundary)); err != nil {
 				return result, err
@@ -116,24 +132,24 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 	}
 	ledger = append(ledger, LedgerEvent{
 		EffectiveMS: boundary.BoundaryMS, PriceMultiplier: 1 / action.Ratio,
-		VolumeMultiplier: action.Ratio, EventType: HistoricalEventBinanceContractSize,
+		VolumeMultiplier: action.Ratio, EventType: historicalEventType(action.Exchange),
 	})
 	evidence := historicalEvidence(action, boundary)
 	base := market.AdjustmentFactor{
-		Provider: BinanceProviderName, ProviderVersion: ProviderVersion,
+		Provider: historicalProvider(action.Exchange), ProviderVersion: ProviderVersion,
 		Exchange: action.Exchange, SourceMarket: action.SourceMarket, Symbol: action.Symbol,
-		EventType: HistoricalEventBinanceContractSize, Raw: evidence,
+		EventType: historicalEventType(action.Exchange), Raw: evidence,
 	}
 	result.Segments = CumulativeBackwardSegments(base, ledger)
 	if b.cfg.DryRun {
 		return result, nil
 	}
-	if err := b.store.UpsertBars(ctx, bars); err != nil {
-		return result, fmt.Errorf("upsert boundary klines: %w", err)
-	}
 	if err := b.store.ReplaceAdjustmentFactors(ctx, action.Exchange, action.SourceMarket, action.Symbol,
 		market.PriceModeBackwardAdjusted, result.Segments); err != nil {
 		return result, fmt.Errorf("replace adjustment factors: %w", err)
+	}
+	if err := b.persistBoundaryBars(ctx, action, boundary, officialOneMinute, result.Segments, &result); err != nil {
+		return result, err
 	}
 	if err := b.persistEvent(ctx, action, boundary, evidence); err != nil {
 		return result, err
@@ -148,13 +164,147 @@ func (b *HistoricalBackfiller) persistEvent(ctx context.Context, action Historic
 	}
 	if err := b.store.UpsertCorporateActionEvent(ctx, market.CorporateActionEvent{
 		ActionID: historicalActionID(action), Exchange: action.Exchange, SourceMarket: action.SourceMarket,
-		Symbol: action.Symbol, EventType: HistoricalEventBinanceContractSize, State: market.CorporateActionStateFactor,
+		Symbol: action.Symbol, EventType: historicalEventType(action.Exchange), State: market.CorporateActionStateFactor,
 		FirstSeenMS: firstSeenMS, LastEventMS: boundary.BoundaryMS, ResumeMS: boundary.BoundaryMS,
 		BoundaryMS: boundary.BoundaryMS, AnnouncedRatio: action.Ratio, Raw: evidence, UpdatedAtMS: market.NowMS(),
 	}); err != nil {
 		return fmt.Errorf("persist historical corporate action: %w", err)
 	}
 	return nil
+}
+
+func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, action HistoricalAction, boundaryMS int64) ([]market.Bar, error) {
+	startMS := timeframe.FloorStartMS(boundaryMS, "1D")
+	endMS := timeframe.EndMS(startMS, "1D")
+	bars, err := b.source.FetchKlines(ctx, b.client, exchange.KlineRequest{
+		Symbol: action.Symbol, Timeframe: deriverTimeframe, StartMS: startMS, EndMS: endMS,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch official 1m materialization window: %w", err)
+	}
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("official 1m materialization window is empty")
+	}
+	for i := range bars {
+		bars[i].Exchange = action.Exchange
+		bars[i].SourceMarket = action.SourceMarket
+		bars[i].Symbol = action.Symbol
+		bars[i].Timeframe = deriverTimeframe
+	}
+	sort.Slice(bars, func(i, j int) bool { return bars[i].StartMS < bars[j].StartMS })
+	return bars, nil
+}
+
+func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action HistoricalAction, boundary Derivation, rawOneMinute []market.Bar, segments []market.AdjustmentFactor, result *HistoricalBackfillResult) error {
+	rawBars, adjustedBars := rebuildBoundaryBars(action, boundary.BoundaryMS, rawOneMinute, segments)
+	result.RawBarsRebuilt = len(rawBars)
+	result.AdjustedBarsMaterialized = len(adjustedBars)
+	if err := b.store.UpsertBars(ctx, rawBars); err != nil {
+		return fmt.Errorf("upsert repaired boundary bars: %w", err)
+	}
+	if err := b.store.UpsertAdjustedBars(ctx, adjustedBars); err != nil {
+		return fmt.Errorf("upsert materialized adjusted boundary bars: %w", err)
+	}
+	return nil
+}
+
+func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, segments []market.AdjustmentFactor) ([]market.Bar, []market.Bar) {
+	nowMS := market.NowMS()
+	rawBars := append([]market.Bar(nil), rawOneMinute...)
+	adjustedOneMinute := make([]market.Bar, 0, len(rawOneMinute))
+	for _, raw := range rawOneMinute {
+		factor := factorAt(segments, market.BarAdjustmentTimestamp(raw))
+		if factor == nil {
+			continue
+		}
+		adjustedOneMinute = append(adjustedOneMinute, market.ApplyFactorToBar(raw, *factor))
+	}
+	adjustedBars := append([]market.Bar(nil), adjustedOneMinute...)
+
+	for _, tf := range boundaryMaterializationTimeframes() {
+		bucketStart := timeframe.FloorStartMS(boundaryMS, tf)
+		bucketEnd := timeframe.EndMS(bucketStart, tf)
+		rawBucket := barsWithin(rawOneMinute, bucketStart, bucketEnd)
+		adjustedBucket := barsWithin(adjustedOneMinute, bucketStart, bucketEnd)
+		if len(rawBucket) == 0 || len(adjustedBucket) != len(rawBucket) {
+			continue
+		}
+		rawRollup := aggregator.RollupBars(tf, rawBucket, true, "official_boundary_rebuild", nowMS)
+		adjustedRollup := aggregator.RollupBars(tf, adjustedBucket, true, "adjusted_1m_boundary_rebuild", nowMS)
+		if rawRollup == nil || adjustedRollup == nil {
+			continue
+		}
+		rawRollup.Exchange = action.Exchange
+		rawRollup.SourceMarket = action.SourceMarket
+		rawRollup.Symbol = action.Symbol
+		adjustedRollup.Exchange = action.Exchange
+		adjustedRollup.SourceMarket = action.SourceMarket
+		adjustedRollup.Symbol = action.Symbol
+		adjustedRollup.PriceMode = market.PriceModeBackwardAdjusted
+		adjustedRollup.AdjustmentStatus = market.AdjustmentStatusAdjusted
+		adjustedRollup.AdjustmentProvider = historicalProvider(action.Exchange)
+		adjustedRollup.AdjustmentProviderVersion = ProviderVersion
+		adjustedRollup.AdjustmentEventType = historicalEventType(action.Exchange)
+		adjustedRollup.PriceMultiplier = 1
+		adjustedRollup.VolumeMultiplier = 1
+		adjustedRollup.RawOpenPrice = rawRollup.OpenPrice
+		adjustedRollup.RawHighPrice = rawRollup.HighPrice
+		adjustedRollup.RawLowPrice = rawRollup.LowPrice
+		adjustedRollup.RawClosePrice = rawRollup.ClosePrice
+		adjustedRollup.RawVolume = rawRollup.Volume
+		adjustedRollup.RawQuoteVolume = rawRollup.QuoteVolume
+		rawBars = append(rawBars, market.DecorateBar(*rawRollup))
+		adjustedBars = append(adjustedBars, market.DecorateBar(*adjustedRollup))
+	}
+	return rawBars, adjustedBars
+}
+
+func boundaryMaterializationTimeframes() []string {
+	frames := make([]string, 0)
+	for _, tf := range timeframe.Order {
+		if tf == "1m" {
+			continue
+		}
+		frames = append(frames, tf)
+		if tf == "1D" {
+			break
+		}
+	}
+	return frames
+}
+
+func barsWithin(bars []market.Bar, startMS int64, endMS int64) []market.Bar {
+	out := make([]market.Bar, 0)
+	for _, bar := range bars {
+		if bar.StartMS >= startMS && bar.StartMS <= endMS {
+			out = append(out, bar)
+		}
+	}
+	return out
+}
+
+func factorAt(segments []market.AdjustmentFactor, tsMS int64) *market.AdjustmentFactor {
+	for i := range segments {
+		factor := &segments[i]
+		if factor.EffectiveFromMS <= tsMS && (factor.EffectiveToMS == 0 || tsMS <= factor.EffectiveToMS) {
+			return factor
+		}
+	}
+	return nil
+}
+
+func historicalProvider(exchangeName string) string {
+	if strings.EqualFold(exchangeName, "binance") {
+		return BinanceProviderName
+	}
+	return OKXProviderName
+}
+
+func historicalEventType(exchangeName string) string {
+	if strings.EqualFold(exchangeName, "binance") {
+		return HistoricalEventBinanceContractSize
+	}
+	return HistoricalEventOKXRebase
 }
 
 // LocateHistoricalBoundary finds the adjacent active bars whose observed gap
@@ -192,9 +342,10 @@ func LocateHistoricalBoundary(bars []market.Bar, officialRatio float64, toleranc
 
 func historicalEvidence(action HistoricalAction, boundary Derivation) json.RawMessage {
 	body, _ := json.Marshal(map[string]any{
-		"method": "binance_historical_announcement", "announcement_code": action.AnnouncementCode,
+		"method": action.Exchange + "_historical_announcement", "announcement_code": action.AnnouncementCode,
 		"announcement_title": action.Title, "official_ratio": action.Ratio,
-		"boundary_ms": boundary.BoundaryMS, "observed_ratio": boundary.Ratio,
+		"predecessor_symbol": action.PredecessorSymbol,
+		"boundary_ms":        boundary.BoundaryMS, "observed_ratio": boundary.Ratio,
 		"close_before": boundary.CloseBefore, "open_after": boundary.OpenAfter,
 		"announcement_raw": json.RawMessage(action.Raw),
 	})

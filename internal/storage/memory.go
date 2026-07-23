@@ -57,13 +57,13 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 	key := strings.ToLower(query.Exchange) + ":" + strings.ToUpper(query.Symbol) + ":" + query.Timeframe
 	mode := market.MustNormalizePriceMode(query.PriceMode)
 	rows := m.bars[key]
-	if mode != market.PriceModeRaw {
-		if adjustedRows := m.adjustedBars[adjustedKey(query.Exchange, query.SourceMarket, query.Symbol, query.Timeframe, mode)]; len(adjustedRows) > 0 {
-			rows = adjustedRows
-		}
-	}
 	if len(rows) == 0 {
 		return nil, nil
+	}
+	var adjustedRows map[int64]market.Bar
+	covered := false
+	if mode != market.PriceModeRaw {
+		adjustedRows = m.adjustedBars[adjustedKey(query.Exchange, query.SourceMarket, query.Symbol, query.Timeframe, mode)]
 	}
 	starts := make([]int64, 0, len(rows))
 	for start := range rows {
@@ -75,11 +75,22 @@ func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.Kline
 		limit = len(starts)
 	}
 	starts = starts[len(starts)-limit:]
+	if mode != market.PriceModeRaw && len(starts) > 0 {
+		covered = m.hasAdjustmentCoverageLocked(query.Exchange, query.SourceMarket, query.Symbol,
+			market.BarAdjustmentTimestamp(rows[starts[0]]), market.BarAdjustmentTimestamp(rows[starts[len(starts)-1]]))
+	}
 	bars := make([]market.Bar, 0, len(starts))
 	for _, start := range starts {
 		bar := market.DecorateBar(rows[start])
-		if mode != market.PriceModeRaw && (bar.PriceMode != mode || bar.AdjustmentStatus != market.AdjustmentStatusAdjusted) {
-			bar = m.applyFactorLocked(bar, query.SourceMarket, mode)
+		if mode != market.PriceModeRaw {
+			if materialized, ok := adjustedRows[start]; ok {
+				bar = market.DecorateBar(materialized)
+			} else {
+				bar = m.applyFactorLocked(bar, query.SourceMarket, mode)
+				if covered && bar.AdjustmentStatus == market.AdjustmentStatusMissing {
+					bar = market.MarkBarAdjustmentStatus(bar, mode, market.AdjustmentStatusNotRequired)
+				}
+			}
 		} else if mode == market.PriceModeRaw {
 			bar = market.MarkBarAdjustmentStatus(bar, mode, market.AdjustmentStatusRaw)
 		}
@@ -261,13 +272,37 @@ func (m *MemoryHistoricalStore) ListOpenCorporateActionEvents(_ context.Context)
 	defer m.mu.RUnlock()
 	out := make([]market.CorporateActionEvent, 0)
 	for _, event := range m.corporateActions {
-		if event.State == market.CorporateActionStateFactor || event.State == market.CorporateActionStateManualReview {
+		if event.State == market.CorporateActionStateFactor || event.State == market.CorporateActionStateManualReview || event.State == market.CorporateActionStateNotRequired {
 			continue
 		}
 		out = append(out, event)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FirstSeenMS < out[j].FirstSeenMS })
 	return out, nil
+}
+
+func (m *MemoryHistoricalStore) HasAdjustmentCoverage(_ context.Context, exchange string, sourceMarket string, symbol string, startMS int64, endMS int64) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hasAdjustmentCoverageLocked(exchange, sourceMarket, symbol, startMS, endMS), nil
+}
+
+func (m *MemoryHistoricalStore) hasAdjustmentCoverageLocked(exchange string, sourceMarket string, symbol string, startMS int64, endMS int64) bool {
+	for _, event := range m.corporateActions {
+		if event.EventType != market.CorporateActionEventHistoricalCoverage || event.State != market.CorporateActionStateNotRequired {
+			continue
+		}
+		if !strings.EqualFold(event.Exchange, exchange) || !strings.EqualFold(event.Symbol, symbol) {
+			continue
+		}
+		if sourceMarket != "" && event.SourceMarket != "" && !strings.EqualFold(event.SourceMarket, sourceMarket) {
+			continue
+		}
+		if event.FirstSeenMS <= startMS && event.LastEventMS >= endMS {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *MemoryHistoricalStore) applyFactorLocked(bar market.Bar, sourceMarket string, priceMode string) market.Bar {

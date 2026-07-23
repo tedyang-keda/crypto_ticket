@@ -153,4 +153,14 @@ func TestAnnouncementMatchesSymbol(t *testing.T) {
 	if AnnouncementMatchesSymbol("MUU-USDT-SWAP", "MUUX rebase announcement") {
 		t.Fatal("should not match MUU inside MUUX")
 	}
+	if !AnnouncementMatchesSymbol("OPENAI-USDT-SWAP", "OKX rebase on OPENAIUSDT perpetual") {
+		t.Fatal("should match compact OKX contract token")
+	}
+}
+
+func TestParseAnnouncedAdjustmentRatio(t *testing.T) {
+	ratio, ok := ParseAnnouncedRatio("Adjustment ratio to_ratio (actual / estimated) 12.52")
+	if !ok || ratio != 12.52 {
+		t.Fatalf("unexpected ratio: %f ok=%v", ratio, ok)
+	}
 }

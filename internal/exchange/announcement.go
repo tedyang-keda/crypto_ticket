@@ -17,6 +17,7 @@ import (
 var (
 	reAnnMultiply = regexp.MustCompile(`(?i)(?:×|multiplied by|position quantity\s*[×x])\s*([0-9]+(?:\.[0-9]+)?)`)
 	reAnnRatioOf  = regexp.MustCompile(`(?i)ratio of\s*([0-9]+(?:\.[0-9]+)?)`)
+	reAnnAdjust   = regexp.MustCompile(`(?i)adjustment\s+ratio(?:\s+[a-z_() /-]+)?\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)`)
 	reAnnScale    = regexp.MustCompile(`(?i)adjustment\s+scale\s+factor\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)`)
 	reAnnForRatio = regexp.MustCompile(`(?i)\b([0-9]+(?:\.[0-9]+)?)\s*[-\s]?for[-\s]?\s*([0-9]+(?:\.[0-9]+)?)\b`)
 	reAnnColon    = regexp.MustCompile(`\b([0-9]+(?:\.[0-9]+)?)\s*:\s*([0-9]+(?:\.[0-9]+)?)\b`)
@@ -35,6 +36,11 @@ func ParseAnnouncedRatio(text string) (float64, bool) {
 		}
 	}
 	if m := reAnnRatioOf.FindStringSubmatch(text); m != nil {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil && v > 0 {
+			return v, true
+		}
+	}
+	if m := reAnnAdjust.FindStringSubmatch(text); m != nil {
 		if v, err := strconv.ParseFloat(m[1], 64); err == nil && v > 0 {
 			return v, true
 		}
@@ -79,14 +85,27 @@ func looksLikeClock(a string, b string) bool {
 // "MUUUSDT"). Matching is word-ish and case-insensitive.
 func AnnouncementMatchesSymbol(symbol string, text string) bool {
 	full := strings.ToUpper(strings.TrimSpace(symbol))
-	if full != "" && containsAnnouncementToken(strings.ToUpper(text), full) {
+	upperText := strings.ToUpper(text)
+	if full != "" && containsAnnouncementToken(upperText, full) {
+		return true
+	}
+	compact := announcementCompactToken(full)
+	if compact != "" && compact != full && containsAnnouncementToken(upperText, compact) {
 		return true
 	}
 	base := announcementBaseToken(symbol)
 	if base == "" {
 		return false
 	}
-	return containsAnnouncementToken(strings.ToUpper(text), base)
+	return containsAnnouncementToken(upperText, base)
+}
+
+func announcementCompactToken(symbol string) string {
+	parts := strings.Split(strings.ToUpper(strings.TrimSpace(symbol)), "-")
+	if len(parts) >= 2 {
+		return parts[0] + parts[1]
+	}
+	return strings.Join(parts, "")
 }
 
 func containsAnnouncementToken(upper string, token string) bool {

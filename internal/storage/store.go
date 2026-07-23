@@ -20,4 +20,5 @@ type HistoricalStore interface {
 	UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error
 	UpsertCorporateActionEvent(ctx context.Context, event market.CorporateActionEvent) error
 	ListOpenCorporateActionEvents(ctx context.Context) ([]market.CorporateActionEvent, error)
+	HasAdjustmentCoverage(ctx context.Context, exchange string, sourceMarket string, symbol string, startMS int64, endMS int64) (bool, error)
 }
