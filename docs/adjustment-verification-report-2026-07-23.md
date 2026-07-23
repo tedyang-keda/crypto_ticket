@@ -1,83 +1,88 @@
-# Binance / OKX Historical Adjustment Verification Report
+# Binance / OKX 历史行情对齐验证报告
 
-Date: 2026-07-23 (Asia/Shanghai)
+验证时间：2026-07-23（Asia/Shanghai）
 
-Environment: `ticket` (`/opt/crypto_ticket`, commit `ea27ed7`)
+验证环境：`ticket`，生产机器 `hn3` 未访问、未修改。
 
-Production host `hn3` was not accessed or changed.
+## 验收口径
 
-## Scope
+本报告的通过标准是：
 
-The verification covers six official rebase / contract-size actions and one no-action control:
+> 对同一个 `exchange / symbol / timeframe / start_ms`，我们服务的 `price_mode=raw` OHLCV 与交易所当前官方历史 K 线接口一致。
 
-- OKX: `OPENAI-USDT-SWAP`, `ANTHROPIC-USDT-SWAP`, `SPACEX-USDT-SWAP -> SPCX-USDT-SWAP`.
-- Binance USD-M: `SPCXUSDT`, `CRWDUSDT`, `KORUUSDT`.
-- No-action control: OKX `ZHIPU-USDT-SWAP`.
+使用的官方接口：
 
-For every action sample, the check used:
+- Binance USD-M：`GET /fapi/v1/klines`
+- OKX：`GET /api/v5/market/history-candles`
 
-1. The official announcement ratio.
-2. The last active official 1m close before the action and first active official 1m open after it.
-3. The official higher-timeframe raw boundary candle.
-4. The local materialized backward-adjusted boundary candle.
-5. The adjusted previous close to boundary open gap.
-6. An idempotent backfill rerun.
+`backward_adjusted` 是系统额外提供的合成复权视图，不作为与官方 raw 历史接口对齐的验收依据。
 
-Zero-volume halt placeholders are excluded when rebuilding a boundary rollup, matching Binance's official higher-timeframe candle behavior.
+## 样本
 
-## OKX Results
+| 交易所 | 品种 | 官方动作比例 | 官方边界（UTC） | 代表周期 | raw 对齐结果 |
+| --- | --- | ---: | --- | --- | --- |
+| OKX | OPENAI-USDT-SWAP | 10 | 2026-06-30 07:00 | 1H | PASS |
+| OKX | ANTHROPIC-USDT-SWAP | 10 | 2026-06-30 08:06 | 1H | PASS |
+| OKX | SPACEX-USDT-SWAP -> SPCX-USDT-SWAP | 12.52 | 2026-06-02 07:10 | 2H | PASS |
+| Binance | SPCXUSDT | 1.1 | 2026-06-10 09:10 | 2H | PASS |
+| Binance | CRWDUSDT | 4 | 2026-07-02 13:35 | 1H | PASS |
+| Binance | KORUUSDT | 20 | 2026-07-15 09:35 | 15m | PASS |
 
-| Symbol | Official ratio | Boundary (UTC) | Observed 1m ratio | Checked TF | Official raw boundary OHLC | Local adjusted boundary OHLC | Adjusted gap | Result |
-| --- | ---: | --- | ---: | --- | --- | --- | ---: | --- |
-| OPENAI-USDT-SWAP | 10 | 2026-06-30 07:00 | 10.00263004 | 1H | 136.88 / 149.90 / 131.40 / 134.29 | 136.88 / 149.90 / 131.40 / 134.29 | -0.03% | PASS |
-| ANTHROPIC-USDT-SWAP | 10 | 2026-06-30 08:06 | 10.00023320 | 1H | 1703.10 / 1719.87 / 167.64 / 173.52 | 170.31 / 174.25 / 167.64 / 173.52 | 0.00% | PASS |
-| SPCX-USDT-SWAP | 12.52 | 2026-06-02 07:10 | 12.51753009 | 2H | 2400.10 / 2410.20 / 190.25 / 197.26 | 191.701278 / 203.51 / 189.696486 / 197.26 | +0.0042% | PASS |
+每个代表周期都检查了动作前一桶、跨边界桶和动作后一桶的 open、high、low、close、volume。
 
-Notes:
+## KORU 说明
 
-- OPENAI's boundary is aligned to the 1H bucket, so the official raw and adjusted 1H values are identical.
-- ANTHROPIC's 08:00 1H candle spans the 08:06 action. The raw candle is mixed-scale; the adjusted candle is rebuilt from adjusted 1m bars.
-- SPACEX was renamed to SPCX. The announcement predecessor is retained as evidence, while factors and history use the successor `SPCX-USDT-SWAP`.
+Binance 当前官方 15m 历史接口返回：
 
-## Binance Results
+| 位置 | start_ms | Official OHLC | Local raw OHLC |
+| --- | ---: | --- | --- |
+| 边界前一桶 | 1784106900000 | 481.11 / 481.11 / 481.11 / 481.11 | 481.11 / 481.11 / 481.11 / 481.11 |
+| 跨边界桶 | 1784107800000 | 22.68 / 25.20 / 22.68 / 23.71 | 22.68 / 25.20 / 22.68 / 23.71 |
+| 边界后一桶 | 1784108700000 | 23.71 / 23.77 / 23.34 / 23.39 | 23.71 / 23.77 / 23.34 / 23.39 |
 
-| Symbol | Official ratio | Boundary (UTC) | Observed 1m ratio | Checked TF | Official raw boundary OHLC | Local adjusted boundary OHLC | Adjusted gap | Result |
-| --- | ---: | --- | ---: | --- | --- | --- | ---: | --- |
-| SPCXUSDT | 1.1 | 2026-06-10 09:10 | 1.09282460 | 2H | 173.46 / 174.33 / 154.83 / 160.35 | 157.690909 / 162.00 / 154.83 / 160.35 | 0.00% | PASS |
-| CRWDUSDT | 4 | 2026-07-02 13:35 | 4.00673750 | 1H | 192.95 / 206.00 / 184.95 / 199.76 | 192.95 / 206.00 / 184.95 / 199.76 | -0.17% | PASS |
-| KORUUSDT | 20 | 2026-07-15 09:35 | 21.21296296 | 15m | 22.68 / 25.20 / 22.68 / 23.71 | 22.68 / 25.20 / 22.68 / 23.71 | -5.72% | PASS with note |
+因此 KORU 的正确结论是：我们的 raw 服务与 Binance 官方服务一致。官方公共历史接口没有把边界前所有 K 线统一除以 20；`24.0555` 只存在于我们的 `backward_adjusted` 视图中。
 
-Notes:
+## 验证中发现并修复的问题
 
-- Binance emits zero-volume old-scale 1m placeholders during some halt windows. Its official higher-timeframe candles omit those placeholders. Boundary rebuilding now follows that behavior.
-- KORU's official ratio is 20, while the active pre/post market prices imply 21.21296296. The factor intentionally uses the official ratio, leaving a real `-5.72%` repricing gap. Replacing the official factor with the observed gap would be incorrect.
+### 1. 只重建边界桶会漏掉官方回写
 
-## Control And Persistence Checks
+OPENAI 边界前一根 1H：
 
-- `ZHIPU-USDT-SWAP`: no rebase/split announcement was found in the scanned range. Recent adjusted requests return raw prices with `adjustment_status=not_required`.
-- All six action symbols return `adjustment_status=adjusted` with the exchange-specific official-announcement provider.
-- The raw evidence fields of every checked boundary candle match the exchange's official higher-timeframe REST response.
-- Re-running the backfill returns `SKIP existing` for all six actions and re-repairs/materializes the boundary rows without duplicating factors.
-- `go test ./...`, `go vet ./...`, and `git diff --check` passed locally. Relevant package tests also passed on `ticket`.
-- `crypto-ticket.service` remained active after deployment and served live adjusted queries.
+- OKX 官方 open：`1380.85`
+- 原本本地 open：`1380.46`
 
-## Coverage And Remaining Limits
+虽然本地已经覆盖了官方 1m，但 OKX 官方 1m 聚合结果与官方 1H 仍可能不同，说明交易所不同周期会独立维护或回写。
 
-The implementation covers:
+修复后，历史回填会分别拉取官方 `1m / 5m / 15m / 30m / 1H / 2H / 4H / 6H / 12H / 1D`，并按相同 `timeframe/start_ms` 覆盖 raw 数据。官方目标周期优先，只有官方该周期缺行时才回退到 1m 聚合。
 
-- Official historical announcement pagination for Binance and OKX.
-- Official-ratio factor backfill and official 1m boundary detection.
-- Rename + rebase where OKX serves predecessor history under the successor symbol.
-- Raw boundary repair and adjusted boundary materialization from 1m through 1D.
-- Partial materialized/dynamic result merging.
-- Explicit OKX no-action coverage.
+修复后 OPENAI 该 1H 的本地 raw open 已更新为 `1380.85`。
 
-Remaining limits:
+### 2. Binance 停牌零成交占位 K 线
 
-- Crossing boundary candles above 1D (`2D`, weekly, monthly) are not materialized yet. Dynamic close-boundary factor selection alone cannot fully repair their mixed-scale OHLC.
-- No-action coverage is only written for explicitly requested OKX symbols and scan ranges. Unknown or unscanned symbols correctly remain `missing_factor`.
-- Announcement parsers depend on public exchange formats and should be regression-tested when Binance CMS or OKX Help changes its schema.
+Binance 在部分停牌窗口返回 `volume=0` 的旧尺度 1m 占位行，但官方高周期可能忽略这些占位行。现在 raw 直接使用官方目标周期，不再依赖本地聚合猜测官方口径。
 
-## Conclusion
+### 3. OKX 限流
 
-The tested Binance and OKX action types are covered correctly for 1m through 1D serving paths. Official raw boundary evidence is preserved, adjusted boundary candles are continuous except for legitimate market repricing, rename handling works, and backfill is idempotent. The primary remaining functional gap is materialization of crossing candles above 1D.
+逐周期回补会增加请求数。回填器已加入请求间隔和最多四次退避重试，避免 `429 Too Many Requests` 导致半途失败。
+
+## 额外检查
+
+- ZHIPU-USDT-SWAP：扫描范围内没有复权公告，raw 行情与 OKX 官方一致；adjusted 请求返回 `not_required`。
+- 六个动作重复执行均返回 `SKIP existing`，同时会重新执行官方历史 raw 修复，不重复写因子。
+- 本地 `go test ./...`、`go vet ./...`、`git diff --check` 全部通过。
+- `ticket` 的 `crypto-ticket.service` 保持运行，`hn3` 未操作。
+
+## 当前覆盖范围
+
+- raw 官方对齐：`1m` 到 `1D`，回补动作所在 UTC 日。
+- adjusted：因子动态读取，跨边界桶从 adjusted 1m 物化到 `1D`。
+- rename + rebase：SPACEX 历史使用后继品种 `SPCX-USDT-SWAP` 对齐。
+
+当前未覆盖：
+
+- `2D`、周线、月线的官方逐周期 raw 回补。
+- 如果交易所在动作日之外继续回写更早历史，需要扩大回补窗口后再次扫描。
+
+## 结论
+
+按“我们的 raw 服务与交易所当前官方同周期历史接口一致”的标准，六个典型除权/合约规模调整样本均通过。验证过程中发现的跨周期独立回写问题已经修复，不能再使用“官方 1m 重聚合”代替“官方目标周期”作为对齐依据。
