@@ -517,10 +517,12 @@ func (s *Store) AdjustmentFactorAt(ctx context.Context, exchange string, sourceM
 		effective_from_ms, effective_to_ms, price_multiplier, volume_multiplier, event_type, raw_json
 		FROM adjustment_factor
 		WHERE exchange = ? AND symbol = ? AND adj_mode = ?
-		  AND (source_market = ? OR source_market = '')
+		  AND (source_market = ? OR source_market = '' OR ? = '')
 		  AND effective_from_ms <= ? AND (effective_to_ms = 0 OR effective_to_ms >= ?)
-		ORDER BY source_market DESC, effective_from_ms DESC
-		LIMIT 1`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode, sourceMarket, tsMS, tsMS)
+		ORDER BY CASE WHEN source_market = ? THEN 0 WHEN source_market = '' THEN 1 ELSE 2 END,
+			effective_from_ms DESC
+		LIMIT 1`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode,
+		sourceMarket, sourceMarket, tsMS, tsMS, sourceMarket)
 	if err != nil {
 		return nil, err
 	}
