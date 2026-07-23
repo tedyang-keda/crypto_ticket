@@ -73,6 +73,7 @@ func main() {
 
 	backfiller := adjustment.NewHistoricalBackfiller(store, source, client, adjustment.HistoricalBackfillConfig{
 		BoundaryTolerancePct: opts.boundaryTolerancePct,
+		RequestDelay:         opts.requestDelay,
 		DryRun:               opts.dryRun,
 	})
 	succeeded := 0

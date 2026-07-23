@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"crypto-ticket/internal/aggregator"
 	"crypto-ticket/internal/exchange"
@@ -48,6 +49,7 @@ type HistoricalKlineSource interface {
 
 type HistoricalBackfillConfig struct {
 	BoundaryTolerancePct float64
+	RequestDelay         time.Duration
 	DryRun               bool
 }
 
@@ -98,7 +100,7 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 	if action.Symbol == "" || action.Ratio <= 0 || action.WindowStartMS <= 0 || action.WindowEndMS <= action.WindowStartMS {
 		return result, fmt.Errorf("invalid historical action symbol=%q ratio=%f window=[%d,%d]", action.Symbol, action.Ratio, action.WindowStartMS, action.WindowEndMS)
 	}
-	bars, err := b.source.FetchKlines(ctx, b.client, exchange.KlineRequest{
+	bars, err := b.fetchKlinesWithRetry(ctx, exchange.KlineRequest{
 		Symbol: action.Symbol, Timeframe: deriverTimeframe,
 		StartMS: action.WindowStartMS, EndMS: action.WindowEndMS,
 	})
@@ -184,7 +186,7 @@ func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, a
 	frames := append([]string{deriverTimeframe}, boundaryMaterializationTimeframes()...)
 	window := historicalOfficialWindow{}
 	for _, tf := range frames {
-		bars, err := b.source.FetchKlines(ctx, b.client, exchange.KlineRequest{
+		bars, err := b.fetchKlinesWithRetry(ctx, exchange.KlineRequest{
 			Symbol: action.Symbol, Timeframe: tf, StartMS: startMS, EndMS: endMS,
 		})
 		if err != nil {
@@ -201,11 +203,47 @@ func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, a
 			window.oneMinute = bars
 		}
 		window.rawBars = append(window.rawBars, bars...)
+		if err := waitHistoricalBackfill(ctx, b.cfg.RequestDelay); err != nil {
+			return historicalOfficialWindow{}, err
+		}
 	}
 	if len(window.oneMinute) == 0 {
 		return historicalOfficialWindow{}, fmt.Errorf("official 1m materialization window is empty")
 	}
 	return window, nil
+}
+
+func (b *HistoricalBackfiller) fetchKlinesWithRetry(ctx context.Context, request exchange.KlineRequest) ([]market.Bar, error) {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		bars, err := b.source.FetchKlines(ctx, b.client, request)
+		if err == nil {
+			return bars, nil
+		}
+		lastErr = err
+		if attempt == 3 {
+			break
+		}
+		delay := time.Duration(1<<attempt) * 500 * time.Millisecond
+		if err := waitHistoricalBackfill(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func waitHistoricalBackfill(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action HistoricalAction, boundary Derivation, window historicalOfficialWindow, segments []market.AdjustmentFactor, result *HistoricalBackfillResult) error {
