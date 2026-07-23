@@ -68,6 +68,11 @@ type HistoricalBackfillResult struct {
 	AdjustedBarsMaterialized int
 }
 
+type historicalOfficialWindow struct {
+	oneMinute []market.Bar
+	rawBars   []market.Bar
+}
+
 type HistoricalBackfiller struct {
 	store  HistoricalBackfillStore
 	source HistoricalKlineSource
@@ -106,11 +111,11 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 		return result, fmt.Errorf("no kline boundary matches announced ratio %.8f within %.2f%%", action.Ratio, b.cfg.BoundaryTolerancePct*100)
 	}
 	result.Boundary = boundary
-	officialOneMinute, err := b.fetchMaterializationWindow(ctx, action, boundary.BoundaryMS)
+	officialWindow, err := b.fetchMaterializationWindow(ctx, action, boundary.BoundaryMS)
 	if err != nil {
 		return result, err
 	}
-	result.BarsFetched = len(officialOneMinute)
+	result.BarsFetched = len(officialWindow.oneMinute)
 
 	existing, err := b.store.ListAdjustmentFactors(ctx, action.Exchange, action.SourceMarket, action.Symbol, market.PriceModeBackwardAdjusted)
 	if err != nil {
@@ -121,7 +126,7 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 		result.AlreadyExists = true
 		result.Segments = existing
 		if !b.cfg.DryRun {
-			if err := b.persistBoundaryBars(ctx, action, boundary, officialOneMinute, existing, &result); err != nil {
+			if err := b.persistBoundaryBars(ctx, action, boundary, officialWindow, existing, &result); err != nil {
 				return result, err
 			}
 			if err := b.persistEvent(ctx, action, boundary, historicalEvidence(action, boundary)); err != nil {
@@ -148,7 +153,7 @@ func (b *HistoricalBackfiller) Backfill(ctx context.Context, action HistoricalAc
 		market.PriceModeBackwardAdjusted, result.Segments); err != nil {
 		return result, fmt.Errorf("replace adjustment factors: %w", err)
 	}
-	if err := b.persistBoundaryBars(ctx, action, boundary, officialOneMinute, result.Segments, &result); err != nil {
+	if err := b.persistBoundaryBars(ctx, action, boundary, officialWindow, result.Segments, &result); err != nil {
 		return result, err
 	}
 	if err := b.persistEvent(ctx, action, boundary, evidence); err != nil {
@@ -173,30 +178,38 @@ func (b *HistoricalBackfiller) persistEvent(ctx context.Context, action Historic
 	return nil
 }
 
-func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, action HistoricalAction, boundaryMS int64) ([]market.Bar, error) {
+func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, action HistoricalAction, boundaryMS int64) (historicalOfficialWindow, error) {
 	startMS := timeframe.FloorStartMS(boundaryMS, "1D")
 	endMS := timeframe.EndMS(startMS, "1D")
-	bars, err := b.source.FetchKlines(ctx, b.client, exchange.KlineRequest{
-		Symbol: action.Symbol, Timeframe: deriverTimeframe, StartMS: startMS, EndMS: endMS,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("fetch official 1m materialization window: %w", err)
+	frames := append([]string{deriverTimeframe}, boundaryMaterializationTimeframes()...)
+	window := historicalOfficialWindow{}
+	for _, tf := range frames {
+		bars, err := b.source.FetchKlines(ctx, b.client, exchange.KlineRequest{
+			Symbol: action.Symbol, Timeframe: tf, StartMS: startMS, EndMS: endMS,
+		})
+		if err != nil {
+			return historicalOfficialWindow{}, fmt.Errorf("fetch official %s materialization window: %w", tf, err)
+		}
+		for i := range bars {
+			bars[i].Exchange = action.Exchange
+			bars[i].SourceMarket = action.SourceMarket
+			bars[i].Symbol = action.Symbol
+			bars[i].Timeframe = tf
+		}
+		sort.Slice(bars, func(i, j int) bool { return bars[i].StartMS < bars[j].StartMS })
+		if tf == deriverTimeframe {
+			window.oneMinute = bars
+		}
+		window.rawBars = append(window.rawBars, bars...)
 	}
-	if len(bars) == 0 {
-		return nil, fmt.Errorf("official 1m materialization window is empty")
+	if len(window.oneMinute) == 0 {
+		return historicalOfficialWindow{}, fmt.Errorf("official 1m materialization window is empty")
 	}
-	for i := range bars {
-		bars[i].Exchange = action.Exchange
-		bars[i].SourceMarket = action.SourceMarket
-		bars[i].Symbol = action.Symbol
-		bars[i].Timeframe = deriverTimeframe
-	}
-	sort.Slice(bars, func(i, j int) bool { return bars[i].StartMS < bars[j].StartMS })
-	return bars, nil
+	return window, nil
 }
 
-func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action HistoricalAction, boundary Derivation, rawOneMinute []market.Bar, segments []market.AdjustmentFactor, result *HistoricalBackfillResult) error {
-	rawBars, adjustedBars := rebuildBoundaryBars(action, boundary.BoundaryMS, rawOneMinute, segments)
+func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action HistoricalAction, boundary Derivation, window historicalOfficialWindow, segments []market.AdjustmentFactor, result *HistoricalBackfillResult) error {
+	rawBars, adjustedBars := rebuildBoundaryBarsWithOfficial(action, boundary.BoundaryMS, window.oneMinute, window.rawBars, segments)
 	result.RawBarsRebuilt = len(rawBars)
 	result.AdjustedBarsMaterialized = len(adjustedBars)
 	if err := b.store.UpsertBars(ctx, rawBars); err != nil {
@@ -209,9 +222,14 @@ func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action H
 }
 
 func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, segments []market.AdjustmentFactor) ([]market.Bar, []market.Bar) {
+	return rebuildBoundaryBarsWithOfficial(action, boundaryMS, rawOneMinute, nil, segments)
+}
+
+func rebuildBoundaryBarsWithOfficial(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, officialRawBars []market.Bar, segments []market.AdjustmentFactor) ([]market.Bar, []market.Bar) {
 	nowMS := market.NowMS()
-	rawBars := append([]market.Bar(nil), rawOneMinute...)
-	rawBars = append(rawBars, rebuildOfficialRawRollups(action, boundaryMS, rawOneMinute, nowMS)...)
+	fallbackRaw := append([]market.Bar(nil), rawOneMinute...)
+	fallbackRaw = append(fallbackRaw, rebuildOfficialRawRollups(action, boundaryMS, rawOneMinute, nowMS)...)
+	rawBars := mergeOfficialRawBars(fallbackRaw, officialRawBars)
 	adjustedOneMinute := make([]market.Bar, 0, len(rawOneMinute))
 	for _, raw := range rawOneMinute {
 		factor := factorAt(segments, market.BarAdjustmentTimestamp(raw))
@@ -231,7 +249,10 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 			continue
 		}
 		adjustedRollup := aggregator.RollupBars(tf, adjustedBucket, true, "adjusted_1m_boundary_rebuild", nowMS)
-		rawRollup := aggregator.RollupBars(tf, rawBucket, true, "official_boundary_rebuild", nowMS)
+		rawRollup := findHistoricalBar(rawBars, tf, bucketStart)
+		if rawRollup == nil {
+			rawRollup = aggregator.RollupBars(tf, rawBucket, true, "official_boundary_rebuild", nowMS)
+		}
 		if adjustedRollup == nil || rawRollup == nil {
 			continue
 		}
@@ -254,6 +275,43 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 		adjustedBars = append(adjustedBars, market.DecorateBar(*adjustedRollup))
 	}
 	return rawBars, adjustedBars
+}
+
+func mergeOfficialRawBars(fallback []market.Bar, official []market.Bar) []market.Bar {
+	byKey := make(map[string]market.Bar, len(fallback)+len(official))
+	for _, bar := range fallback {
+		byKey[historicalBarKey(bar)] = bar
+	}
+	for _, bar := range official {
+		byKey[historicalBarKey(bar)] = bar
+	}
+	out := make([]market.Bar, 0, len(byKey))
+	for _, bar := range byKey {
+		out = append(out, bar)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := timeframe.Index(out[i].Timeframe)
+		right := timeframe.Index(out[j].Timeframe)
+		if left != right {
+			return left < right
+		}
+		return out[i].StartMS < out[j].StartMS
+	})
+	return out
+}
+
+func historicalBarKey(bar market.Bar) string {
+	return bar.Timeframe + "|" + fmt.Sprint(bar.StartMS)
+}
+
+func findHistoricalBar(bars []market.Bar, tf string, startMS int64) *market.Bar {
+	for i := range bars {
+		if bars[i].Timeframe == tf && bars[i].StartMS == startMS {
+			bar := bars[i]
+			return &bar
+		}
+	}
+	return nil
 }
 
 func rebuildOfficialRawRollups(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, nowMS int64) []market.Bar {

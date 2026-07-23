@@ -172,6 +172,33 @@ func TestRebuildBoundaryBarsIgnoresInactiveHaltPlaceholders(t *testing.T) {
 	}
 }
 
+func TestRebuildBoundaryBarsPrefersOfficialTargetTimeframe(t *testing.T) {
+	raw := []market.Bar{
+		{Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Timeframe: "1m", StartMS: 0, EndMS: 59_999, OpenPrice: 100, HighPrice: 101, LowPrice: 99, ClosePrice: 100, Volume: 1, IsFinal: true},
+		{Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Timeframe: "1m", StartMS: 60_000, EndMS: 119_999, OpenPrice: 100, HighPrice: 100, LowPrice: 100, ClosePrice: 100, Volume: 1, IsFinal: true},
+		{Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Timeframe: "1m", StartMS: 120_000, EndMS: 179_999, OpenPrice: 10, HighPrice: 11, LowPrice: 9, ClosePrice: 10, Volume: 10, IsFinal: true},
+	}
+	official5m := market.Bar{
+		Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP", Timeframe: "5m",
+		StartMS: 0, EndMS: 299_999, OpenPrice: 99.5, HighPrice: 102, LowPrice: 9, ClosePrice: 10, Volume: 12, IsFinal: true,
+	}
+	segments := CumulativeBackwardSegments(market.AdjustmentFactor{
+		Provider: OKXProviderName, ProviderVersion: ProviderVersion, Exchange: "okx", SourceMarket: "okx:SWAP",
+		Symbol: "OPENAI-USDT-SWAP", EventType: HistoricalEventOKXRebase,
+	}, []LedgerEvent{{EffectiveMS: 120_000, PriceMultiplier: 0.1, VolumeMultiplier: 10, EventType: HistoricalEventOKXRebase}})
+	rawBars, adjustedBars := rebuildBoundaryBarsWithOfficial(HistoricalAction{
+		Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "OPENAI-USDT-SWAP",
+	}, 120_000, raw, append(raw, official5m), segments)
+	raw5 := findTestBar(rawBars, "5m", 0)
+	adjusted5 := findTestBar(adjustedBars, "5m", 0)
+	if raw5 == nil || adjusted5 == nil {
+		t.Fatalf("missing official timeframe rows raw=%v adjusted=%v", raw5, adjusted5)
+	}
+	if raw5.OpenPrice != 99.5 || adjusted5.RawOpenPrice != 99.5 {
+		t.Fatalf("official target timeframe was not preferred raw=%+v adjusted=%+v", *raw5, *adjusted5)
+	}
+}
+
 func findTestBar(bars []market.Bar, tf string, startMS int64) *market.Bar {
 	for i := range bars {
 		if bars[i].Timeframe == tf && bars[i].StartMS == startMS {
