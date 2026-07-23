@@ -224,8 +224,8 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 	for _, tf := range boundaryMaterializationTimeframes() {
 		bucketStart := timeframe.FloorStartMS(boundaryMS, tf)
 		bucketEnd := timeframe.EndMS(bucketStart, tf)
-		rawBucket := barsWithin(rawOneMinute, bucketStart, bucketEnd)
-		adjustedBucket := barsWithin(adjustedOneMinute, bucketStart, bucketEnd)
+		rawBucket := activeBars(barsWithin(rawOneMinute, bucketStart, bucketEnd))
+		adjustedBucket := activeBars(barsWithin(adjustedOneMinute, bucketStart, bucketEnd))
 		if len(rawBucket) == 0 || len(adjustedBucket) != len(rawBucket) {
 			continue
 		}
@@ -257,6 +257,19 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 		adjustedBars = append(adjustedBars, market.DecorateBar(*adjustedRollup))
 	}
 	return rawBars, adjustedBars
+}
+
+func activeBars(bars []market.Bar) []market.Bar {
+	active := make([]market.Bar, 0, len(bars))
+	for _, bar := range bars {
+		if bar.Volume > 0 {
+			active = append(active, bar)
+		}
+	}
+	if len(active) == 0 {
+		return bars
+	}
+	return active
 }
 
 func boundaryMaterializationTimeframes() []string {

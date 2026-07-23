@@ -147,6 +147,28 @@ func TestRebuildBoundaryBarsRollsUpAdjustedOneMinute(t *testing.T) {
 	}
 }
 
+func TestRebuildBoundaryBarsIgnoresInactiveHaltPlaceholders(t *testing.T) {
+	raw := []market.Bar{
+		{Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "CRWDUSDT", Timeframe: "1m", StartMS: 0, EndMS: 59_999, OpenPrice: 800, HighPrice: 800, LowPrice: 800, ClosePrice: 800, Volume: 0, IsFinal: true},
+		{Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "CRWDUSDT", Timeframe: "1m", StartMS: 60_000, EndMS: 119_999, OpenPrice: 200, HighPrice: 205, LowPrice: 195, ClosePrice: 202, Volume: 10, IsFinal: true},
+	}
+	segments := CumulativeBackwardSegments(market.AdjustmentFactor{
+		Provider: BinanceProviderName, ProviderVersion: ProviderVersion, Exchange: "binance", SourceMarket: "binance:um_futures",
+		Symbol: "CRWDUSDT", EventType: HistoricalEventBinanceContractSize,
+	}, []LedgerEvent{{EffectiveMS: 60_000, PriceMultiplier: 0.25, VolumeMultiplier: 4, EventType: HistoricalEventBinanceContractSize}})
+	rawBars, adjustedBars := rebuildBoundaryBars(HistoricalAction{
+		Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "CRWDUSDT",
+	}, 60_000, raw, segments)
+	raw5 := findTestBar(rawBars, "5m", 0)
+	adjusted5 := findTestBar(adjustedBars, "5m", 0)
+	if raw5 == nil || adjusted5 == nil {
+		t.Fatalf("missing halt-boundary rollups raw=%v adjusted=%v", raw5, adjusted5)
+	}
+	if raw5.OpenPrice != 200 || raw5.HighPrice != 205 || adjusted5.OpenPrice != 200 || adjusted5.HighPrice != 205 {
+		t.Fatalf("inactive placeholder leaked into boundary rollup raw=%+v adjusted=%+v", *raw5, *adjusted5)
+	}
+}
+
 func findTestBar(bars []market.Bar, tf string, startMS int64) *market.Bar {
 	for i := range bars {
 		if bars[i].Timeframe == tf && bars[i].StartMS == startMS {
