@@ -51,6 +51,30 @@ func (m *MemoryHistoricalStore) UpsertBars(_ context.Context, bars []market.Bar)
 	return nil
 }
 
+func (m *MemoryHistoricalStore) ReplaceBarsInRange(_ context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64, bars []market.Bar) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := strings.ToLower(exchange) + ":" + strings.ToUpper(symbol) + ":" + tf
+	if m.bars[key] == nil {
+		m.bars[key] = make(map[int64]market.Bar)
+	}
+	for start := range m.bars[key] {
+		if start >= startMS && start <= endMS {
+			delete(m.bars[key], start)
+		}
+	}
+	for _, bar := range bars {
+		if !strings.EqualFold(bar.Exchange, exchange) || !strings.EqualFold(bar.Symbol, symbol) || bar.Timeframe != tf || bar.StartMS < startMS || bar.StartMS > endMS {
+			continue
+		}
+		if bar.SourceMarket == "" {
+			bar.SourceMarket = market.SourceMarket(bar.Exchange, "")
+		}
+		m.bars[key][bar.StartMS] = bar
+	}
+	return nil
+}
+
 func (m *MemoryHistoricalStore) RecentBars(_ context.Context, query market.KlineQuery) ([]market.Bar, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

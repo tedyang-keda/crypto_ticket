@@ -37,6 +37,7 @@ type HistoricalAction struct {
 
 type HistoricalBackfillStore interface {
 	UpsertBars(ctx context.Context, bars []market.Bar) error
+	ReplaceBarsInRange(ctx context.Context, exchange string, symbol string, timeframe string, startMS int64, endMS int64, bars []market.Bar) error
 	UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error
 	ListAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error)
 	ReplaceAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, factors []market.AdjustmentFactor) error
@@ -73,6 +74,12 @@ type HistoricalBackfillResult struct {
 type historicalOfficialWindow struct {
 	oneMinute []market.Bar
 	rawBars   []market.Bar
+	ranges    map[string]historicalRange
+}
+
+type historicalRange struct {
+	startMS int64
+	endMS   int64
 }
 
 type HistoricalBackfiller struct {
@@ -184,10 +191,11 @@ func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, a
 	startMS := timeframe.FloorStartMS(boundaryMS, "1D")
 	endMS := timeframe.EndMS(startMS, "1D")
 	frames := append([]string{deriverTimeframe}, boundaryMaterializationTimeframes()...)
-	window := historicalOfficialWindow{}
+	window := historicalOfficialWindow{ranges: make(map[string]historicalRange, len(frames))}
 	for _, tf := range frames {
+		rangeStartMS, rangeEndMS := officialRepairRange(boundaryMS, tf, startMS, endMS)
 		bars, err := b.fetchKlinesWithRetry(ctx, exchange.KlineRequest{
-			Symbol: action.Symbol, Timeframe: tf, StartMS: startMS, EndMS: endMS,
+			Symbol: action.Symbol, Timeframe: tf, StartMS: rangeStartMS, EndMS: rangeEndMS,
 		})
 		if err != nil {
 			return historicalOfficialWindow{}, fmt.Errorf("fetch official %s materialization window: %w", tf, err)
@@ -203,6 +211,7 @@ func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, a
 			window.oneMinute = bars
 		}
 		window.rawBars = append(window.rawBars, bars...)
+		window.ranges[tf] = historicalRange{startMS: rangeStartMS, endMS: rangeEndMS}
 		if err := waitHistoricalBackfill(ctx, b.cfg.RequestDelay); err != nil {
 			return historicalOfficialWindow{}, err
 		}
@@ -211,6 +220,23 @@ func (b *HistoricalBackfiller) fetchMaterializationWindow(ctx context.Context, a
 		return historicalOfficialWindow{}, fmt.Errorf("official 1m materialization window is empty")
 	}
 	return window, nil
+}
+
+func officialRepairRange(boundaryMS int64, tf string, dayStartMS int64, dayEndMS int64) (int64, int64) {
+	contextStart := timeframe.FloorStartMS(boundaryMS, tf)
+	contextEndStart := contextStart
+	for i := 0; i < 2; i++ {
+		contextStart = timeframe.FloorStartMS(contextStart-1, tf)
+		contextEndStart = timeframe.NextStartMS(contextEndStart, tf)
+	}
+	contextEnd := timeframe.EndMS(contextEndStart, tf)
+	if contextStart > dayStartMS {
+		contextStart = dayStartMS
+	}
+	if contextEnd < dayEndMS {
+		contextEnd = dayEndMS
+	}
+	return contextStart, contextEnd
 }
 
 func (b *HistoricalBackfiller) fetchKlinesWithRetry(ctx context.Context, request exchange.KlineRequest) ([]market.Bar, error) {
@@ -250,8 +276,10 @@ func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action H
 	rawBars, adjustedBars := rebuildBoundaryBarsWithOfficial(action, boundary.BoundaryMS, window.oneMinute, window.rawBars, segments)
 	result.RawBarsRebuilt = len(rawBars)
 	result.AdjustedBarsMaterialized = len(adjustedBars)
-	if err := b.store.UpsertBars(ctx, rawBars); err != nil {
-		return fmt.Errorf("upsert repaired boundary bars: %w", err)
+	for tf, repairRange := range window.ranges {
+		if err := b.store.ReplaceBarsInRange(ctx, action.Exchange, action.Symbol, tf, repairRange.startMS, repairRange.endMS, rawBars); err != nil {
+			return fmt.Errorf("replace official %s bars in range: %w", tf, err)
+		}
 	}
 	if err := b.store.UpsertAdjustedBars(ctx, adjustedBars); err != nil {
 		return fmt.Errorf("upsert materialized adjusted boundary bars: %w", err)
@@ -265,9 +293,11 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 
 func rebuildBoundaryBarsWithOfficial(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, officialRawBars []market.Bar, segments []market.AdjustmentFactor) ([]market.Bar, []market.Bar) {
 	nowMS := market.NowMS()
-	fallbackRaw := append([]market.Bar(nil), rawOneMinute...)
-	fallbackRaw = append(fallbackRaw, rebuildOfficialRawRollups(action, boundaryMS, rawOneMinute, nowMS)...)
-	rawBars := mergeOfficialRawBars(fallbackRaw, officialRawBars)
+	rawBars := append([]market.Bar(nil), officialRawBars...)
+	if len(rawBars) == 0 {
+		rawBars = append(rawBars, rawOneMinute...)
+		rawBars = append(rawBars, rebuildOfficialRawRollups(action, boundaryMS, rawOneMinute, nowMS)...)
+	}
 	adjustedOneMinute := make([]market.Bar, 0, len(rawOneMinute))
 	for _, raw := range rawOneMinute {
 		factor := factorAt(segments, market.BarAdjustmentTimestamp(raw))
@@ -313,33 +343,6 @@ func rebuildBoundaryBarsWithOfficial(action HistoricalAction, boundaryMS int64, 
 		adjustedBars = append(adjustedBars, market.DecorateBar(*adjustedRollup))
 	}
 	return rawBars, adjustedBars
-}
-
-func mergeOfficialRawBars(fallback []market.Bar, official []market.Bar) []market.Bar {
-	byKey := make(map[string]market.Bar, len(fallback)+len(official))
-	for _, bar := range fallback {
-		byKey[historicalBarKey(bar)] = bar
-	}
-	for _, bar := range official {
-		byKey[historicalBarKey(bar)] = bar
-	}
-	out := make([]market.Bar, 0, len(byKey))
-	for _, bar := range byKey {
-		out = append(out, bar)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		left := timeframe.Index(out[i].Timeframe)
-		right := timeframe.Index(out[j].Timeframe)
-		if left != right {
-			return left < right
-		}
-		return out[i].StartMS < out[j].StartMS
-	})
-	return out
-}
-
-func historicalBarKey(bar market.Bar) string {
-	return bar.Timeframe + "|" + fmt.Sprint(bar.StartMS)
 }
 
 func findHistoricalBar(bars []market.Bar, tf string, startMS int64) *market.Bar {

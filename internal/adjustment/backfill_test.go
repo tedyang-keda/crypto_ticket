@@ -9,6 +9,7 @@ import (
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/storage"
+	"crypto-ticket/internal/timeframe"
 )
 
 type historicalKlineStub struct {
@@ -196,6 +197,20 @@ func TestRebuildBoundaryBarsPrefersOfficialTargetTimeframe(t *testing.T) {
 	}
 	if raw5.OpenPrice != 99.5 || adjusted5.RawOpenPrice != 99.5 {
 		t.Fatalf("official target timeframe was not preferred raw=%+v adjusted=%+v", *raw5, *adjusted5)
+	}
+}
+
+func TestOfficialRepairRangeIncludesAdjacentBuckets(t *testing.T) {
+	boundary := int64(1782802800000) // 2026-06-30 07:00 UTC
+	dayStart := timeframe.FloorStartMS(boundary, "1D")
+	dayEnd := timeframe.EndMS(dayStart, "1D")
+	start4H, end4H := officialRepairRange(boundary, "4H", dayStart, dayEnd)
+	if start4H != int64(1782763200000) || end4H != dayEnd {
+		t.Fatalf("unexpected 4H repair range [%d,%d]", start4H, end4H)
+	}
+	start1D, end1D := officialRepairRange(boundary, "1D", dayStart, dayEnd)
+	if start1D != dayStart-2*24*60*60*1000 || end1D != dayEnd+2*24*60*60*1000 {
+		t.Fatalf("unexpected 1D repair range [%d,%d]", start1D, end1D)
 	}
 }
 

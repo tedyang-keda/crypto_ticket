@@ -236,6 +236,36 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 	}
 	defer tx.Rollback()
 
+	if err := upsertBarsTx(ctx, tx, bars); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ReplaceBarsInRange(ctx context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64, bars []market.Bar) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ?`,
+		strings.ToLower(exchange), strings.ToUpper(symbol), tf, startMS, endMS); err != nil {
+		return err
+	}
+	filtered := make([]market.Bar, 0, len(bars))
+	for _, bar := range bars {
+		if strings.EqualFold(bar.Exchange, exchange) && strings.EqualFold(bar.Symbol, symbol) && bar.Timeframe == tf && bar.StartMS >= startMS && bar.StartMS <= endMS {
+			filtered = append(filtered, bar)
+		}
+	}
+	if err := upsertBarsTx(ctx, tx, filtered); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func upsertBarsTx(ctx context.Context, tx *sql.Tx, bars []market.Bar) error {
 	historySQL := `INSERT INTO bar_history
 		(exchange, source_market, symbol, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
 		 timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
@@ -251,12 +281,11 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 		 prev_close=VALUES(prev_close), chg=VALUES(chg), amp=VALUES(amp), last_tick_ms=VALUES(last_tick_ms),
 		 is_final=VALUES(is_final)`
 	for _, bar := range bars {
-		args := barArgs(bar)
-		if _, err := tx.ExecContext(ctx, historySQL, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, historySQL, barArgs(bar)...); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) ClearBars(ctx context.Context) (int64, error) {
