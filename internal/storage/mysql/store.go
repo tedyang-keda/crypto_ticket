@@ -862,7 +862,7 @@ func (s *Store) recentAdjustedBars(ctx context.Context, query market.KlineQuery,
 		return nil, err
 	}
 	for i := range rawBars {
-		factor, err := s.AdjustmentFactorAt(ctx, rawBars[i].Exchange, firstNonEmpty(query.SourceMarket, rawBars[i].SourceMarket), rawBars[i].Symbol, priceMode, rawBars[i].StartMS)
+		factor, err := s.AdjustmentFactorAt(ctx, rawBars[i].Exchange, firstNonEmpty(query.SourceMarket, rawBars[i].SourceMarket), rawBars[i].Symbol, priceMode, market.BarAdjustmentTimestamp(rawBars[i]))
 		if err != nil {
 			return nil, err
 		}

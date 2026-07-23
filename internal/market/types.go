@@ -377,6 +377,16 @@ func ApplyFactorToBar(bar Bar, factor AdjustmentFactor) Bar {
 	return DecorateBar(bar)
 }
 
+// BarAdjustmentTimestamp selects the regime in effect at the bar close. This
+// keeps a higher-timeframe bar that spans an adjustment boundary on the
+// post-event scale instead of applying the pre-event factor to the whole bar.
+func BarAdjustmentTimestamp(bar Bar) int64 {
+	if bar.EndMS > 0 {
+		return bar.EndMS
+	}
+	return bar.StartMS
+}
+
 func MarkBarAdjustmentStatus(bar Bar, priceMode string, status string) Bar {
 	bar.PriceMode = priceMode
 	bar.AdjustmentStatus = status

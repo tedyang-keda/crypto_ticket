@@ -265,6 +265,45 @@ func TestKlinesAppliesAdjustmentFactorForAdjustedPriceMode(t *testing.T) {
 	}
 }
 
+func TestKlinesUsesClosingRegimeForBarSpanningAdjustmentBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	service := NewMarketService(store, realtime.NewHub(), []string{"1H"}, 300)
+	boundary := int64(1_710_003_000_000)
+	if err := store.UpsertAdjustmentFactors(ctx, []market.AdjustmentFactor{
+		{
+			Provider: "vendor", Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "KORUUSDT",
+			AdjMode: market.PriceModeBackwardAdjusted, EffectiveFromMS: 0, EffectiveToMS: boundary - 1,
+			PriceMultiplier: 0.05, VolumeMultiplier: 20,
+		},
+		{
+			Provider: "vendor", Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "KORUUSDT",
+			AdjMode: market.PriceModeBackwardAdjusted, EffectiveFromMS: boundary, EffectiveToMS: 0,
+			PriceMultiplier: 1, VolumeMultiplier: 1,
+		},
+	}); err != nil {
+		t.Fatalf("upsert factors: %v", err)
+	}
+	if err := store.UpsertBars(ctx, []market.Bar{{
+		Exchange: "binance", SourceMarket: "binance:um_futures", Symbol: "KORUUSDT", Timeframe: "1H",
+		StartMS: boundary - 30*60_000, EndMS: boundary + 30*60_000 - 1,
+		OpenPrice: 22.68, HighPrice: 23.5, LowPrice: 22.5, ClosePrice: 23.39, Volume: 100, IsFinal: true,
+	}}); err != nil {
+		t.Fatalf("upsert spanning bar: %v", err)
+	}
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange: "binance", Symbol: "KORUUSDT", Timeframe: "1H", Limit: 1,
+		PriceMode: market.PriceModeBackwardAdjusted,
+	})
+	if err != nil {
+		t.Fatalf("klines: %v", err)
+	}
+	if len(bars) != 1 || bars[0].PriceMultiplier != 1 || bars[0].OpenPrice != 22.68 {
+		t.Fatalf("spanning bar should use post-boundary factor: %+v", bars)
+	}
+}
+
 func TestKlinesBuildsHigherTimeframeFromFinalOneMinuteAndLiveOneMinute(t *testing.T) {
 	ctx := context.Background()
 	service := newTestMarketServiceWithFrames([]string{"1m", "1H"})

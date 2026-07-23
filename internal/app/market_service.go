@@ -620,7 +620,7 @@ func (s *MarketService) applyQueryPriceMode(ctx context.Context, bar market.Bar,
 	if mode == market.PriceModeRaw {
 		return market.MarkBarAdjustmentStatus(market.DecorateBar(bar), mode, market.AdjustmentStatusRaw), nil
 	}
-	factor, err := s.store.AdjustmentFactorAt(ctx, bar.Exchange, bar.SourceMarket, bar.Symbol, mode, bar.StartMS)
+	factor, err := s.store.AdjustmentFactorAt(ctx, bar.Exchange, bar.SourceMarket, bar.Symbol, mode, market.BarAdjustmentTimestamp(bar))
 	if err != nil {
 		return bar, err
 	}

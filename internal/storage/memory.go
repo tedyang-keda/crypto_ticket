@@ -271,7 +271,7 @@ func (m *MemoryHistoricalStore) ListOpenCorporateActionEvents(_ context.Context)
 }
 
 func (m *MemoryHistoricalStore) applyFactorLocked(bar market.Bar, sourceMarket string, priceMode string) market.Bar {
-	factor := m.adjustmentFactorAtLocked(bar.Exchange, firstNonEmpty(sourceMarket, bar.SourceMarket), bar.Symbol, priceMode, bar.StartMS)
+	factor := m.adjustmentFactorAtLocked(bar.Exchange, firstNonEmpty(sourceMarket, bar.SourceMarket), bar.Symbol, priceMode, market.BarAdjustmentTimestamp(bar))
 	if factor == nil {
 		return market.MarkBarAdjustmentStatus(bar, priceMode, market.AdjustmentStatusMissing)
 	}
