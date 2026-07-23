@@ -118,6 +118,36 @@ func TestOKXFetchKlinesUsesHistoryEndpointForExplicitStart(t *testing.T) {
 	}
 }
 
+func TestOKXFetchKlinesContinuesAfterShortHistoryPage(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return jsonResponse(`{"code":"0","data":[["240000","10","10","10","10","1","1","10","1"],["180000","10","10","10","10","1","1","10","1"]]}`), nil
+		case 2:
+			if got := r.URL.Query().Get("after"); got != "180000" {
+				t.Fatalf("unexpected second-page cursor %s", got)
+			}
+			return jsonResponse(`{"code":"0","data":[["120000","10","10","10","10","1","1","10","1"],["60000","10","10","10","10","1","1","10","1"]]}`), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "TEST-USDT-SWAP", Timeframe: "1m", StartMS: 60_000, EndMS: 300_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(bars) != 4 {
+		t.Fatalf("short history page stopped pagination requests=%d bars=%d", requests, len(bars))
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {

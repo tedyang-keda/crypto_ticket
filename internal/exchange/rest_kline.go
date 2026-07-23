@@ -271,9 +271,6 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 		}
 		useRecentEndpoint = false
 		after = oldest
-		if len(page) < pageLimit && endpointPath != "/api/v5/market/candles" {
-			break
-		}
 	}
 	sortBars(all)
 	return trimBars(all, request.Limit), nil
