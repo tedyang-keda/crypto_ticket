@@ -145,6 +145,9 @@ func TestRebuildBoundaryBarsRollsUpAdjustedOneMinute(t *testing.T) {
 	if adjusted15.RawHighPrice != raw15.HighPrice || adjusted15.AdjustmentStatus != market.AdjustmentStatusAdjusted {
 		t.Fatalf("materialized raw evidence missing: %+v", *adjusted15)
 	}
+	if raw5 := findTestBar(rawBars, "5m", 0); raw5 == nil {
+		t.Fatal("official 1m window should rebuild non-boundary raw buckets")
+	}
 }
 
 func TestRebuildBoundaryBarsIgnoresInactiveHaltPlaceholders(t *testing.T) {

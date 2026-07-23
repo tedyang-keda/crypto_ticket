@@ -211,6 +211,7 @@ func (b *HistoricalBackfiller) persistBoundaryBars(ctx context.Context, action H
 func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, segments []market.AdjustmentFactor) ([]market.Bar, []market.Bar) {
 	nowMS := market.NowMS()
 	rawBars := append([]market.Bar(nil), rawOneMinute...)
+	rawBars = append(rawBars, rebuildOfficialRawRollups(action, boundaryMS, rawOneMinute, nowMS)...)
 	adjustedOneMinute := make([]market.Bar, 0, len(rawOneMinute))
 	for _, raw := range rawOneMinute {
 		factor := factorAt(segments, market.BarAdjustmentTimestamp(raw))
@@ -229,14 +230,11 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 		if len(rawBucket) == 0 || len(adjustedBucket) != len(rawBucket) {
 			continue
 		}
-		rawRollup := aggregator.RollupBars(tf, rawBucket, true, "official_boundary_rebuild", nowMS)
 		adjustedRollup := aggregator.RollupBars(tf, adjustedBucket, true, "adjusted_1m_boundary_rebuild", nowMS)
-		if rawRollup == nil || adjustedRollup == nil {
+		rawRollup := aggregator.RollupBars(tf, rawBucket, true, "official_boundary_rebuild", nowMS)
+		if adjustedRollup == nil || rawRollup == nil {
 			continue
 		}
-		rawRollup.Exchange = action.Exchange
-		rawRollup.SourceMarket = action.SourceMarket
-		rawRollup.Symbol = action.Symbol
 		adjustedRollup.Exchange = action.Exchange
 		adjustedRollup.SourceMarket = action.SourceMarket
 		adjustedRollup.Symbol = action.Symbol
@@ -253,10 +251,40 @@ func rebuildBoundaryBars(action HistoricalAction, boundaryMS int64, rawOneMinute
 		adjustedRollup.RawClosePrice = rawRollup.ClosePrice
 		adjustedRollup.RawVolume = rawRollup.Volume
 		adjustedRollup.RawQuoteVolume = rawRollup.QuoteVolume
-		rawBars = append(rawBars, market.DecorateBar(*rawRollup))
 		adjustedBars = append(adjustedBars, market.DecorateBar(*adjustedRollup))
 	}
 	return rawBars, adjustedBars
+}
+
+func rebuildOfficialRawRollups(action HistoricalAction, boundaryMS int64, rawOneMinute []market.Bar, nowMS int64) []market.Bar {
+	rollups := make([]market.Bar, 0)
+	for _, tf := range boundaryMaterializationTimeframes() {
+		buckets := make(map[int64][]market.Bar)
+		for _, bar := range rawOneMinute {
+			bucketStart := timeframe.FloorStartMS(bar.StartMS, tf)
+			buckets[bucketStart] = append(buckets[bucketStart], bar)
+		}
+		starts := make([]int64, 0, len(buckets))
+		for startMS := range buckets {
+			starts = append(starts, startMS)
+		}
+		sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+		for _, startMS := range starts {
+			bucket := buckets[startMS]
+			if startMS <= boundaryMS && boundaryMS <= timeframe.EndMS(startMS, tf) {
+				bucket = activeBars(bucket)
+			}
+			rollup := aggregator.RollupBars(tf, bucket, true, "official_history_rebuild", nowMS)
+			if rollup == nil {
+				continue
+			}
+			rollup.Exchange = action.Exchange
+			rollup.SourceMarket = action.SourceMarket
+			rollup.Symbol = action.Symbol
+			rollups = append(rollups, market.DecorateBar(*rollup))
+		}
+	}
+	return rollups
 }
 
 func activeBars(bars []market.Bar) []market.Bar {
