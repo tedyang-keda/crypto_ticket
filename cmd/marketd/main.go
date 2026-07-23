@@ -6,15 +6,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"crypto-ticket/internal/adjustment"
 	"crypto-ticket/internal/api"
 	"crypto-ticket/internal/app"
 	"crypto-ticket/internal/collector"
 	"crypto-ticket/internal/config"
+	"crypto-ticket/internal/corpaction"
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/guardian"
+	"crypto-ticket/internal/instrument"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
@@ -56,8 +60,27 @@ func main() {
 	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit)
 	server := api.NewServer(marketService, hub, cfg.DashboardDir)
 
+	var corpRegistry *corpaction.Registry
+	var aliasRegistry *corpaction.AliasRegistry
+	if cfg.EnableInstrumentMonitor {
+		corpRegistry = corpaction.NewRegistry(corpaction.Config{
+			PendingTTL:    time.Duration(cfg.CorpActionPendingTTLSeconds) * time.Second,
+			ResolvedTTL:   time.Duration(cfg.CorpActionResolvedTTLSeconds) * time.Second,
+			NeutralizePct: cfg.CorpActionNeutralizePct,
+		})
+		marketService.SetCorporateActionGuard(corpRegistry)
+		aliasRegistry = corpaction.NewAliasRegistry()
+		for _, spec := range cfg.InstrumentAliases {
+			aliasRegistry.Link(spec.Exchange, "", spec.Successor, spec.Predecessor, 0)
+		}
+		marketService.SetAliasResolver(aliasRegistry)
+		if len(cfg.InstrumentAliases) > 0 {
+			log.Printf("seeded %d instrument rename aliases", len(cfg.InstrumentAliases))
+		}
+	}
+
 	errCh := make(chan error, 8)
-	startBackgroundWorkers(ctx, cfg, store, marketService, errCh)
+	startBackgroundWorkers(ctx, cfg, store, marketService, corpRegistry, aliasRegistry, errCh)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: server.Handler()}
 	go func() {
 		log.Printf("marketd listening on http://%s", cfg.HTTPAddr)
@@ -84,6 +107,8 @@ func startBackgroundWorkers(
 	cfg config.Config,
 	store storage.HistoricalStore,
 	marketService *app.MarketService,
+	corpRegistry *corpaction.Registry,
+	aliasRegistry *corpaction.AliasRegistry,
 	errCh chan<- error,
 ) {
 	if cfg.EnableCollector {
@@ -95,6 +120,70 @@ func startBackgroundWorkers(
 			}
 		}()
 		log.Printf("kline collector started runtimes=%d", len(runtimes))
+	}
+	if cfg.EnableInstrumentMonitor {
+		var sink instrument.EventSink = instrument.LogSink{}
+		if cfg.EnableFactorDerivation {
+			deriver := adjustment.New(store, store, adjustment.Config{
+				ConfirmDelay:             time.Duration(cfg.FactorConfirmDelaySeconds) * time.Second,
+				Interval:                 time.Duration(cfg.FactorDeriveIntervalSeconds) * time.Second,
+				Lookback:                 time.Duration(cfg.FactorLookbackSeconds) * time.Second,
+				MinMovePct:               cfg.FactorMinMovePct,
+				MaxAttempts:              cfg.FactorMaxAttempts,
+				MaxWait:                  time.Duration(cfg.FactorMaxWaitSeconds) * time.Second,
+				OfficialDivergencePct:    cfg.FactorOfficialDivergencePct,
+				AnnouncementTolerancePct: cfg.FactorAnnouncementTolerancePct,
+				RequireAnnouncement:      cfg.FactorRequireAnnouncement,
+			})
+			if corpRegistry != nil {
+				deriver.SetRegistry(corpRegistry)
+			}
+			if aliasRegistry != nil {
+				deriver.SetAliasResolver(aliasRegistry)
+			}
+			if cfg.FactorUseOfficialKlines {
+				if official := makeOfficialKlineSource(cfg); official != nil {
+					deriver.SetOfficialSource(official)
+					log.Printf("adjustment factor deriver using official REST klines (divergence>%.3f flagged)", cfg.FactorOfficialDivergencePct)
+				}
+			}
+			if cfg.FactorVerifyAnnouncement {
+				if verifier := makeAnnouncementVerifier(cfg); verifier != nil {
+					deriver.SetAnnouncementVerifier(verifier)
+					log.Printf("adjustment factor deriver cross-checking announcements (tolerance=%.3f strict=%v)",
+						cfg.FactorAnnouncementTolerancePct, cfg.FactorRequireAnnouncement)
+				}
+			}
+			sink = deriver
+			go func() {
+				if err := deriver.Run(ctx); err != nil && ctx.Err() == nil {
+					errCh <- err
+				}
+			}()
+			log.Printf("adjustment factor deriver started confirm_delay=%ds min_move=%.3f",
+				cfg.FactorConfirmDelaySeconds, cfg.FactorMinMovePct)
+		}
+		monitors := makeInstrumentMonitors(cfg, store, sink, aliasRegistry)
+		for _, monitor := range monitors {
+			monitor := monitor
+			go func() {
+				if err := monitor.Run(ctx); err != nil && ctx.Err() == nil {
+					errCh <- err
+				}
+			}()
+		}
+		pollingMonitors := makeBinancePollingMonitors(cfg, sink, aliasRegistry)
+		for _, monitor := range pollingMonitors {
+			monitor := monitor
+			go func() {
+				if err := monitor.RunPolling(ctx); err != nil && ctx.Err() == nil {
+					errCh <- err
+				}
+			}()
+		}
+		if len(monitors)+len(pollingMonitors) > 0 {
+			log.Printf("instrument monitor started ws=%d polling=%d", len(monitors), len(pollingMonitors))
+		}
 	}
 	if cfg.EnableKlineGuardian {
 		guardianStore, ok := store.(guardian.Store)
@@ -158,6 +247,157 @@ func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) [
 		})
 	}
 	return runtimes
+}
+
+// makeInstrumentMonitors builds real-time metadata monitors for OKX instruments
+// and Binance USD-M contractInfo. Binance COIN-M is excluded because the
+// equity/TRADIFI perpetual products live on USD-M.
+func makeInstrumentMonitors(cfg config.Config, store storage.HistoricalStore, sink instrument.EventSink, aliasRegistry *corpaction.AliasRegistry) []*instrument.Monitor {
+	pingInterval := time.Duration(cfg.InstrumentMonitorPingSeconds) * time.Second
+	monitors := make([]*instrument.Monitor, 0)
+	for _, exchangeConfig := range cfg.Exchanges {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		var source instrument.Source
+		switch exchangeConfig.Name {
+		case "okx":
+			source = exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, cfg.OKXInstrumentsWSURL)
+		case "binance":
+			if strings.Contains(strings.ToLower(exchangeConfig.MarketType), "coin") {
+				continue
+			}
+			source = exchange.NewBinanceContractInfoSource(exchangeConfig.MarketType, exchangeConfig.RestURL, cfg.BinanceContractInfoWSURL)
+		}
+		if source == nil {
+			continue
+		}
+		monitor := instrument.New(source, sink, store, instrument.Config{
+			ReconnectBaseDelay:        time.Duration(cfg.ReconnectBaseDelaySeconds) * time.Second,
+			ReconnectMaxDelay:         time.Duration(cfg.ReconnectMaxDelaySeconds) * time.Second,
+			PingInterval:              pingInterval,
+			EmitInitialCorporateState: exchangeConfig.Name == "binance",
+		})
+		if aliasRegistry != nil {
+			monitor.SetAliasLinker(aliasRegistry)
+		}
+		monitors = append(monitors, monitor)
+	}
+	return monitors
+}
+
+// makeBinancePollingMonitors builds a REST-polling instrument monitor per
+// enabled Binance USD-M market. This remains as exchangeInfo reconciliation if
+// the contractInfo stream misses a transition during a disconnect.
+func makeBinancePollingMonitors(cfg config.Config, sink instrument.EventSink, aliasRegistry *corpaction.AliasRegistry) []*instrument.Monitor {
+	interval := time.Duration(cfg.InstrumentMonitorPollSeconds) * time.Second
+	monitors := make([]*instrument.Monitor, 0)
+	for _, exchangeConfig := range cfg.Exchanges {
+		if !exchangeConfig.Enabled || exchangeConfig.Name != "binance" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(exchangeConfig.MarketType), "coin") {
+			continue // equity perps are USDⓈ-M only
+		}
+		fetcher := exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
+		monitor := instrument.NewPolling(fetcher, sink, nil, instrument.Config{
+			PollInterval: interval,
+		})
+		if aliasRegistry != nil {
+			monitor.SetAliasLinker(aliasRegistry)
+		}
+		monitors = append(monitors, monitor)
+	}
+	return monitors
+}
+
+// officialKlineSource adapts the exchange REST kline fetchers to the deriver's
+// OfficialKlineSource interface, keyed by source market (exchange:marketType).
+type officialKlineSource struct {
+	fetchers map[string]exchange.RESTKlineFetcher
+	client   *http.Client
+}
+
+func (s *officialKlineSource) FetchOfficialKlines(ctx context.Context, _ string, sourceMarket string, symbol string, timeframe string, startMS int64, endMS int64) ([]market.Bar, error) {
+	fetcher, ok := s.fetchers[sourceMarket]
+	if !ok {
+		return nil, nil
+	}
+	return fetcher.FetchKlines(ctx, s.client, exchange.KlineRequest{
+		Symbol:    symbol,
+		Timeframe: timeframe,
+		StartMS:   startMS,
+		EndMS:     endMS,
+	})
+}
+
+// makeOfficialKlineSource builds the authoritative REST kline source used to
+// derive factors from trusted exchange data and flag local store divergence.
+func makeOfficialKlineSource(cfg config.Config) *officialKlineSource {
+	fetchers := make(map[string]exchange.RESTKlineFetcher)
+	for _, exchangeConfig := range cfg.Exchanges {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		var fetcher exchange.RESTKlineFetcher
+		switch exchangeConfig.Name {
+		case "binance":
+			fetcher = exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
+		case "okx":
+			fetcher = exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
+		}
+		if fetcher == nil {
+			continue
+		}
+		fetchers[market.SourceMarket(fetcher.Name(), fetcher.MarketType())] = fetcher
+	}
+	if len(fetchers) == 0 {
+		return nil
+	}
+	return &officialKlineSource{fetchers: fetchers, client: &http.Client{Timeout: 20 * time.Second}}
+}
+
+// multiAnnouncementVerifier dispatches announcement cross-checks to the
+// per-exchange verifier. Exchanges without a verifier degrade to "not found"
+// (lenient), so they never block a factor.
+type multiAnnouncementVerifier struct {
+	okx     *exchange.OKXAnnouncementVerifier
+	binance *exchange.BinanceAnnouncementVerifier
+}
+
+func (m *multiAnnouncementVerifier) VerifyCorporateAction(ctx context.Context, exchangeName string, sourceMarket string, symbol string, boundaryMS int64) (bool, float64, bool) {
+	switch strings.ToLower(exchangeName) {
+	case "binance":
+		if m.binance != nil {
+			return m.binance.VerifyCorporateAction(ctx, exchangeName, sourceMarket, symbol, boundaryMS)
+		}
+	case "okx":
+		if m.okx != nil {
+			return m.okx.VerifyCorporateAction(ctx, exchangeName, sourceMarket, symbol, boundaryMS)
+		}
+	}
+	return false, 0, false
+}
+
+// makeAnnouncementVerifier builds the announcement cross-check dispatcher.
+func makeAnnouncementVerifier(cfg config.Config) *multiAnnouncementVerifier {
+	client := &http.Client{Timeout: 20 * time.Second}
+	verifier := &multiAnnouncementVerifier{}
+	for _, exchangeConfig := range cfg.Exchanges {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		if exchangeConfig.Name == "okx" && verifier.okx == nil {
+			verifier.okx = exchange.NewOKXAnnouncementVerifier(exchangeConfig.RestURL, client)
+		}
+		if exchangeConfig.Name == "binance" && !strings.Contains(strings.ToLower(exchangeConfig.MarketType), "coin") && verifier.binance == nil {
+			verifier.binance = exchange.NewBinanceAnnouncementVerifier(cfg.BinanceCMSURL, client)
+		}
+	}
+	if verifier.okx == nil && verifier.binance == nil {
+		return nil
+	}
+	return verifier
 }
 
 func makeKlineGuardianFetchers(configs []config.ExchangeConfig) []guardian.Fetcher {

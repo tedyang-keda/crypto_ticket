@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"crypto-ticket/internal/corpaction"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
@@ -50,6 +51,168 @@ func TestIngestKlineStoresFinalAndComputesDerivedFields(t *testing.T) {
 	}
 	if second.Open != second.OpenPrice || second.Quote != second.QuoteVolume || second.StartTS != second.StartMS {
 		t.Fatalf("expected decorated aliases: %+v", second)
+	}
+}
+
+func TestApplyCorporateActionGuardNeutralizesCrossingBar(t *testing.T) {
+	service := newTestMarketService()
+	// Anchor near "now" so the resolved-window TTL (checked against NowMS) is live.
+	boundary := market.NowMS()
+	registry := corpaction.NewRegistry(corpaction.Config{})
+	registry.Resolve("okx", "MUU-USDT-SWAP", boundary)
+	service.SetCorporateActionGuard(registry)
+
+	crossing := service.applyCorporateActionGuard(market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: boundary, EndMS: boundary + 59_999,
+		ClosePrice: 100, PrevClose: 2000, Chg: -95, PriceMode: market.PriceModeRaw,
+	})
+	if crossing.Chg != 0 || crossing.PrevClose != 0 {
+		t.Fatalf("crossing bar should be neutralized, got chg=%f prev=%f", crossing.Chg, crossing.PrevClose)
+	}
+	if crossing.AdjustmentStatus != market.AdjustmentStatusLiveRaw {
+		t.Fatalf("crossing bar should be flagged live_raw, got %q", crossing.AdjustmentStatus)
+	}
+
+	// A bar outside the boundary span keeps its real change.
+	normal := service.applyCorporateActionGuard(market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: boundary + 60_000, EndMS: boundary + 119_999,
+		ClosePrice: 130, PrevClose: 100, Chg: 30, PriceMode: market.PriceModeRaw,
+	})
+	if normal.Chg != 30 || normal.AdjustmentStatus == market.AdjustmentStatusLiveRaw {
+		t.Fatalf("post-boundary bar should be untouched, got chg=%f status=%q", normal.Chg, normal.AdjustmentStatus)
+	}
+}
+
+func TestEnrichBarNeutralizesFakeJumpAcrossRebase(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketService()
+	boundary := market.NowMS()
+	base := boundary - 60_000
+	registry := corpaction.NewRegistry(corpaction.Config{})
+	registry.Resolve("okx", "MUU-USDT-SWAP", boundary)
+	service.SetCorporateActionGuard(registry)
+
+	// Pre-split final bar establishes the previous close (2000).
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 2000, HighPrice: 2000, LowPrice: 2000, ClosePrice: 2000,
+		IsFinal: true,
+	}); err != nil {
+		t.Fatalf("ingest pre-split: %v", err)
+	}
+
+	enriched, err := service.enrichBar(ctx, market.DecorateBar(market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: boundary, EndMS: boundary + 59_999,
+		OpenPrice: 100, HighPrice: 100, LowPrice: 100, ClosePrice: 100,
+		PriceMode: market.PriceModeRaw,
+	}))
+	if err != nil {
+		t.Fatalf("enrichBar: %v", err)
+	}
+	if enriched.Chg != 0 {
+		t.Fatalf("fake -95%% jump should be neutralized, got chg=%f", enriched.Chg)
+	}
+	if enriched.AdjustmentStatus != market.AdjustmentStatusLiveRaw {
+		t.Fatalf("boundary bar should be live_raw, got %q", enriched.AdjustmentStatus)
+	}
+}
+
+func TestEnrichBarLeavesBarsUnchangedWithoutGuard(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketService()
+	base := int64(1_710_000_000_000)
+
+	if err := service.IngestKline(ctx, market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: base, EndMS: base + 59_999,
+		OpenPrice: 2000, HighPrice: 2000, LowPrice: 2000, ClosePrice: 2000,
+		IsFinal: true,
+	}); err != nil {
+		t.Fatalf("ingest pre-split: %v", err)
+	}
+	enriched, err := service.enrichBar(ctx, market.DecorateBar(market.Bar{
+		Exchange: "okx", Symbol: "MUU-USDT-SWAP", Timeframe: "1m",
+		StartMS: base + 60_000, EndMS: base + 119_999,
+		OpenPrice: 100, HighPrice: 100, LowPrice: 100, ClosePrice: 100,
+		PriceMode: market.PriceModeRaw,
+	}))
+	if err != nil {
+		t.Fatalf("enrichBar: %v", err)
+	}
+	if enriched.Chg == 0 {
+		t.Fatal("without a guard the raw jump must be preserved")
+	}
+}
+
+type fixedAliasResolver struct {
+	predecessor string
+	boundaryMS  int64
+}
+
+func (f fixedAliasResolver) Lookup(_ string, _ string) (string, string, int64, bool) {
+	return f.predecessor, "okx:SWAP", f.boundaryMS, true
+}
+
+func TestKlinesStitchesRenamedPredecessorHistory(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketService()
+	store := storage.NewMemoryHistoricalStore()
+	// Rebuild the service around a store we can seed directly.
+	service = NewMarketService(store, realtime.NewHub(), []string{"1m"}, 300)
+
+	minute := int64(60_000)
+	boundary := int64(1_710_000_120_000)
+
+	rawBar := func(symbol string, startMS int64, price float64) market.Bar {
+		return market.Bar{
+			Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: symbol, Timeframe: "1m",
+			StartMS: startMS, EndMS: startMS + 59_999,
+			OpenPrice: price, HighPrice: price, LowPrice: price, ClosePrice: price,
+			Volume: 5, IsFinal: true,
+		}
+	}
+	// Predecessor OLDX (price ~2504) before boundary; successor NEWX (~200) after.
+	if err := store.UpsertBars(ctx, []market.Bar{
+		rawBar("OLDX-USDT-SWAP", boundary-2*minute, 2504),
+		rawBar("OLDX-USDT-SWAP", boundary-minute, 2504),
+		rawBar("NEWX-USDT-SWAP", boundary, 200),
+		rawBar("NEWX-USDT-SWAP", boundary+minute, 205),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The successor's factor timeline: pre-boundary scaled by 200/2504, unit after.
+	if err := store.ReplaceAdjustmentFactors(ctx, "okx", "okx:SWAP", "NEWX-USDT-SWAP", market.PriceModeBackwardAdjusted, []market.AdjustmentFactor{
+		{Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "NEWX-USDT-SWAP", AdjMode: market.PriceModeBackwardAdjusted, EffectiveFromMS: 0, EffectiveToMS: boundary - 1, PriceMultiplier: 200.0 / 2504.0, VolumeMultiplier: 2504.0 / 200.0},
+		{Exchange: "okx", SourceMarket: "okx:SWAP", Symbol: "NEWX-USDT-SWAP", AdjMode: market.PriceModeBackwardAdjusted, EffectiveFromMS: boundary, EffectiveToMS: 0, PriceMultiplier: 1, VolumeMultiplier: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service.SetAliasResolver(fixedAliasResolver{predecessor: "OLDX-USDT-SWAP", boundaryMS: boundary})
+
+	bars, err := service.Klines(ctx, market.KlineQuery{
+		Exchange: "okx", Symbol: "NEWX-USDT-SWAP", Timeframe: "1m", Limit: 10,
+		PriceMode: market.PriceModeBackwardAdjusted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two predecessor bars stitched ahead of the two successor bars.
+	if len(bars) != 4 {
+		t.Fatalf("expected 4 stitched bars, got %d", len(bars))
+	}
+	// Predecessor bars are scaled onto the successor basis: 2504 * (200/2504) = 200.
+	if bars[0].StartMS != boundary-2*minute {
+		t.Fatalf("history should be prepended in order, first StartMS=%d", bars[0].StartMS)
+	}
+	if bars[0].ClosePrice < 199.9 || bars[0].ClosePrice > 200.1 {
+		t.Fatalf("predecessor close should adjust to ~200, got %f", bars[0].ClosePrice)
+	}
+	if bars[3].ClosePrice != 205 {
+		t.Fatalf("latest successor bar should be unadjusted 205, got %f", bars[3].ClosePrice)
 	}
 }
 

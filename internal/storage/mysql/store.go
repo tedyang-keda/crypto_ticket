@@ -93,6 +93,28 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 				KEY idx_instrument_event_symbol (exchange, source_market, symbol, event_ts_ms),
 				KEY idx_instrument_event_type (event_type, event_ts_ms)
 			)`,
+		`CREATE TABLE IF NOT EXISTS corporate_action_event (
+				action_id VARCHAR(160) NOT NULL,
+				exchange VARCHAR(16) NOT NULL,
+				source_market VARCHAR(48) NOT NULL DEFAULT '',
+				symbol VARCHAR(64) NOT NULL,
+				event_type VARCHAR(32) NOT NULL DEFAULT '',
+				state VARCHAR(32) NOT NULL,
+				first_seen_ms BIGINT NOT NULL,
+				last_event_ms BIGINT NOT NULL,
+				resume_ms BIGINT NOT NULL DEFAULT 0,
+				boundary_ms BIGINT NOT NULL DEFAULT 0,
+				announced_ratio DECIMAL(28, 12) NOT NULL DEFAULT 0,
+				attempts INT NOT NULL DEFAULT 0,
+				last_error VARCHAR(512) NOT NULL DEFAULT '',
+				raw_json JSON NULL,
+				updated_at_ms BIGINT NOT NULL,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (action_id),
+				KEY idx_corp_action_open (state, updated_at_ms),
+				KEY idx_corp_action_symbol (exchange, source_market, symbol, first_seen_ms)
+			)`,
 		`CREATE TABLE IF NOT EXISTS kline_guardian_state (
 				exchange VARCHAR(16) NOT NULL,
 				symbol VARCHAR(64) NOT NULL,
@@ -551,6 +573,146 @@ func (s *Store) UpsertAdjustmentFactors(ctx context.Context, factors []market.Ad
 		}
 	}
 	return nil
+}
+
+func (s *Store) UpsertCorporateActionEvent(ctx context.Context, event market.CorporateActionEvent) error {
+	raw := any(nil)
+	if len(event.Raw) > 0 {
+		raw = string(event.Raw)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO corporate_action_event
+		(action_id, exchange, source_market, symbol, event_type, state, first_seen_ms, last_event_ms,
+		 resume_ms, boundary_ms, announced_ratio, attempts, last_error, raw_json, updated_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		 event_type=VALUES(event_type), state=VALUES(state), last_event_ms=VALUES(last_event_ms),
+		 resume_ms=VALUES(resume_ms), boundary_ms=VALUES(boundary_ms), announced_ratio=VALUES(announced_ratio),
+		 attempts=VALUES(attempts), last_error=VALUES(last_error), raw_json=VALUES(raw_json),
+		 updated_at_ms=VALUES(updated_at_ms)`,
+		event.ActionID,
+		strings.ToLower(strings.TrimSpace(event.Exchange)),
+		event.SourceMarket,
+		strings.ToUpper(strings.TrimSpace(event.Symbol)),
+		event.EventType,
+		event.State,
+		event.FirstSeenMS,
+		event.LastEventMS,
+		event.ResumeMS,
+		event.BoundaryMS,
+		event.AnnouncedRatio,
+		event.Attempts,
+		event.LastError,
+		raw,
+		event.UpdatedAtMS,
+	)
+	return err
+}
+
+func (s *Store) ListOpenCorporateActionEvents(ctx context.Context) ([]market.CorporateActionEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT action_id, exchange, source_market, symbol, event_type, state,
+		first_seen_ms, last_event_ms, resume_ms, boundary_ms, announced_ratio, attempts, last_error,
+		raw_json, updated_at_ms
+		FROM corporate_action_event
+		WHERE state NOT IN (?, ?)
+		ORDER BY first_seen_ms ASC`, market.CorporateActionStateFactor, market.CorporateActionStateManualReview)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]market.CorporateActionEvent, 0)
+	for rows.Next() {
+		var event market.CorporateActionEvent
+		var raw sql.NullString
+		if err := rows.Scan(
+			&event.ActionID, &event.Exchange, &event.SourceMarket, &event.Symbol, &event.EventType, &event.State,
+			&event.FirstSeenMS, &event.LastEventMS, &event.ResumeMS, &event.BoundaryMS, &event.AnnouncedRatio,
+			&event.Attempts, &event.LastError, &raw, &event.UpdatedAtMS,
+		); err != nil {
+			return nil, err
+		}
+		if raw.Valid {
+			event.Raw = []byte(raw.String)
+		}
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error) {
+	priceMode, err := market.NormalizePriceMode(priceMode)
+	if err != nil {
+		return nil, err
+	}
+	if priceMode == market.PriceModeRaw {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT provider, provider_version, exchange, source_market, symbol, adj_mode,
+		effective_from_ms, effective_to_ms, price_multiplier, volume_multiplier, event_type, raw_json
+		FROM adjustment_factor
+		WHERE exchange = ? AND symbol = ? AND adj_mode = ?
+		  AND (source_market = ? OR source_market = '')
+		ORDER BY effective_from_ms ASC`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode, sourceMarket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]market.AdjustmentFactor, 0)
+	for rows.Next() {
+		factor, err := scanAdjustmentFactor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, factor)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ReplaceAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, factors []market.AdjustmentFactor) error {
+	mode, err := market.NormalizePriceMode(priceMode)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustment_factor
+		WHERE exchange = ? AND symbol = ? AND adj_mode = ? AND (source_market = ? OR source_market = '')`,
+		strings.ToLower(exchange), strings.ToUpper(symbol), mode, sourceMarket); err != nil {
+		return err
+	}
+	stmt := `INSERT INTO adjustment_factor
+		(provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms,
+		 price_multiplier, volume_multiplier, event_type, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, factor := range factors {
+		factorMode, err := market.NormalizePriceMode(factor.AdjMode)
+		if err != nil {
+			return err
+		}
+		raw := any(nil)
+		if len(factor.Raw) > 0 {
+			raw = string(factor.Raw)
+		}
+		if _, err := tx.ExecContext(ctx, stmt,
+			factor.Provider,
+			factor.ProviderVersion,
+			strings.ToLower(factor.Exchange),
+			factor.SourceMarket,
+			strings.ToUpper(factor.Symbol),
+			factorMode,
+			factor.EffectiveFromMS,
+			factor.EffectiveToMS,
+			nonZeroFloat(factor.PriceMultiplier, 1),
+			nonZeroFloat(factor.VolumeMultiplier, 1),
+			factor.EventType,
+			raw,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error {

@@ -26,10 +26,27 @@ type MarketService struct {
 	recentMax      int
 	liveBars       map[string]market.Bar
 	finalObservers []FinalBarObserver
+	corpGuard      CorporateActionGuard
+	aliasResolver  AliasResolver
+}
+
+// AliasResolver reports a symbol's renamed predecessor so its history can be
+// stitched onto the successor when serving adjusted series (layer D). It is
+// implemented by *corpaction.AliasRegistry.
+type AliasResolver interface {
+	Lookup(exchange string, successor string) (predecessor string, sourceMarket string, boundaryMS int64, ok bool)
 }
 
 type FinalBarObserver interface {
 	ObserveFinalBar(ctx context.Context, bar market.Bar) error
+}
+
+// CorporateActionGuard reports, for a bar, whether it straddles an active
+// corporate action so its spurious change can be suppressed (layer C). It is
+// implemented by *corpaction.Registry; kept as an interface here to avoid a
+// hard dependency.
+type CorporateActionGuard interface {
+	AssessBar(exchange string, symbol string, barStartMS int64, barEndMS int64, chgPct float64, nowMS int64) (liveRaw bool, neutralize bool)
 }
 
 func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
@@ -44,6 +61,22 @@ func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames [
 		recentMax: recentLimit,
 		liveBars:  make(map[string]market.Bar),
 	}
+}
+
+// SetCorporateActionGuard attaches the real-time corporate-action guard (layer
+// C). Optional; when unset bars pass through unmodified.
+func (s *MarketService) SetCorporateActionGuard(guard CorporateActionGuard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.corpGuard = guard
+}
+
+// SetAliasResolver attaches the rename-alias resolver (layer D). Optional; when
+// set, adjusted queries stitch a renamed instrument's predecessor history.
+func (s *MarketService) SetAliasResolver(resolver AliasResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.aliasResolver = resolver
 }
 
 func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
@@ -205,7 +238,29 @@ func (s *MarketService) enrichBar(ctx context.Context, bar market.Bar) (market.B
 	if err != nil {
 		return bar, err
 	}
-	return aggregator.ApplyDerived(bar, previousClose), nil
+	bar = aggregator.ApplyDerived(bar, previousClose)
+	return s.applyCorporateActionGuard(bar), nil
+}
+
+// applyCorporateActionGuard suppresses the spurious change on a bar that
+// straddles an active corporate action and flags it live_raw, so the rebase
+// discontinuity is not published or aggregated as real volatility.
+func (s *MarketService) applyCorporateActionGuard(bar market.Bar) market.Bar {
+	s.mu.RLock()
+	guard := s.corpGuard
+	s.mu.RUnlock()
+	if guard == nil {
+		return bar
+	}
+	liveRaw, neutralize := guard.AssessBar(bar.Exchange, bar.Symbol, bar.StartMS, bar.EndMS, bar.Chg, market.NowMS())
+	if neutralize {
+		bar.Chg = 0
+		bar.PrevClose = 0
+	}
+	if liveRaw && bar.PriceMode == market.PriceModeRaw {
+		bar.AdjustmentStatus = market.AdjustmentStatusLiveRaw
+	}
+	return market.DecorateBar(bar)
 }
 
 func (s *MarketService) previousClose(ctx context.Context, bar market.Bar) (float64, error) {
@@ -472,6 +527,12 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	for i := range bars {
 		bars[i] = market.DecorateBar(bars[i])
 	}
+	if market.IsAdjustedPriceMode(mode) {
+		bars, err = s.prependPredecessorHistory(ctx, query, bars)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if !query.IncludeLive {
 		return trimBars(bars, query.Limit), nil
 	}
@@ -499,6 +560,56 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		return nil, err
 	}
 	return trimBars(mergeLiveBar(bars, &queryPartial), query.Limit+1), nil
+}
+
+// prependPredecessorHistory stitches a renamed instrument's predecessor bars
+// onto the front of an adjusted series. The predecessor's raw bars are
+// relabeled to the successor symbol so the successor's cumulative factor
+// timeline (which includes the rename ratio for pre-boundary times) adjusts
+// them onto a continuous basis.
+func (s *MarketService) prependPredecessorHistory(ctx context.Context, query market.KlineQuery, bars []market.Bar) ([]market.Bar, error) {
+	s.mu.RLock()
+	resolver := s.aliasResolver
+	s.mu.RUnlock()
+	if resolver == nil {
+		return bars, nil
+	}
+	predecessor, predSource, boundaryMS, ok := resolver.Lookup(query.Exchange, query.Symbol)
+	if !ok {
+		return bars, nil
+	}
+
+	predQuery := query
+	predQuery.Symbol = strings.ToUpper(predecessor)
+	predQuery.SourceMarket = predSource
+	predQuery.PriceMode = market.PriceModeRaw
+	predQuery.IncludeLive = false
+	predQuery.Limit = query.Limit
+	predBars, err := s.store.RecentBars(ctx, predQuery)
+	if err != nil {
+		return nil, err
+	}
+	if len(predBars) == 0 {
+		return bars, nil
+	}
+
+	stitched := make([]market.Bar, 0, len(predBars)+len(bars))
+	for _, pb := range predBars {
+		if boundaryMS > 0 && pb.StartMS >= boundaryMS {
+			continue // keep only pre-rename history
+		}
+		// Relabel to the successor so its factor timeline applies.
+		pb.Symbol = query.Symbol
+		pb.SourceMarket = query.SourceMarket
+		adjusted, err := s.applyQueryPriceMode(ctx, pb, query.PriceMode)
+		if err != nil {
+			return nil, err
+		}
+		stitched = append(stitched, market.DecorateBar(adjusted))
+	}
+	stitched = append(stitched, bars...)
+	sort.Slice(stitched, func(i, j int) bool { return stitched[i].StartMS < stitched[j].StartMS })
+	return stitched, nil
 }
 
 func (s *MarketService) applyQueryPriceMode(ctx context.Context, bar market.Bar, priceMode string) (market.Bar, error) {

@@ -18,14 +18,16 @@ type MemoryHistoricalStore struct {
 	adjustedBars      map[string]map[int64]market.Bar
 	guardianStates    map[string]market.KlineGuardianState
 	guardianEvents    []market.KlineGuardianEvent
+	corporateActions  map[string]market.CorporateActionEvent
 }
 
 func NewMemoryHistoricalStore() *MemoryHistoricalStore {
 	return &MemoryHistoricalStore{
-		bars:           make(map[string]map[int64]market.Bar),
-		symbols:        make(map[string]market.SymbolInfo),
-		adjustedBars:   make(map[string]map[int64]market.Bar),
-		guardianStates: make(map[string]market.KlineGuardianState),
+		bars:             make(map[string]map[int64]market.Bar),
+		symbols:          make(map[string]market.SymbolInfo),
+		adjustedBars:     make(map[string]map[int64]market.Bar),
+		guardianStates:   make(map[string]market.KlineGuardianState),
+		corporateActions: make(map[string]market.CorporateActionEvent),
 	}
 }
 
@@ -149,6 +151,55 @@ func (m *MemoryHistoricalStore) AdjustmentFactorAt(_ context.Context, exchange s
 	return m.adjustmentFactorAtLocked(exchange, sourceMarket, symbol, priceMode, tsMS), nil
 }
 
+func (m *MemoryHistoricalStore) ListAdjustmentFactors(_ context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error) {
+	mode := market.MustNormalizePriceMode(priceMode)
+	exchange = strings.ToLower(exchange)
+	symbol = strings.ToUpper(symbol)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]market.AdjustmentFactor, 0)
+	for _, factor := range m.adjustmentFactors {
+		if strings.ToLower(factor.Exchange) != exchange || strings.ToUpper(factor.Symbol) != symbol {
+			continue
+		}
+		if sourceMarket != "" && factor.SourceMarket != "" && !strings.EqualFold(factor.SourceMarket, sourceMarket) {
+			continue
+		}
+		if market.MustNormalizePriceMode(factor.AdjMode) != mode {
+			continue
+		}
+		out = append(out, factor)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EffectiveFromMS < out[j].EffectiveFromMS })
+	return out, nil
+}
+
+func (m *MemoryHistoricalStore) ReplaceAdjustmentFactors(_ context.Context, exchange string, sourceMarket string, symbol string, priceMode string, factors []market.AdjustmentFactor) error {
+	mode := market.MustNormalizePriceMode(priceMode)
+	lowerExchange := strings.ToLower(exchange)
+	upperSymbol := strings.ToUpper(symbol)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := m.adjustmentFactors[:0:0]
+	for _, factor := range m.adjustmentFactors {
+		if strings.ToLower(factor.Exchange) == lowerExchange &&
+			strings.ToUpper(factor.Symbol) == upperSymbol &&
+			market.MustNormalizePriceMode(factor.AdjMode) == mode &&
+			(sourceMarket == "" || factor.SourceMarket == "" || strings.EqualFold(factor.SourceMarket, sourceMarket)) {
+			continue // drop existing factors for this key/mode
+		}
+		kept = append(kept, factor)
+	}
+	for _, factor := range factors {
+		factor.Exchange = strings.ToLower(factor.Exchange)
+		factor.Symbol = strings.ToUpper(factor.Symbol)
+		factor.AdjMode = market.MustNormalizePriceMode(factor.AdjMode)
+		kept = append(kept, factor)
+	}
+	m.adjustmentFactors = kept
+	return nil
+}
+
 func (m *MemoryHistoricalStore) UpsertAdjustmentFactors(_ context.Context, factors []market.AdjustmentFactor) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -194,6 +245,29 @@ func (m *MemoryHistoricalStore) UpsertAdjustedBars(_ context.Context, bars []mar
 		m.adjustedBars[key][bar.StartMS] = market.DecorateBar(bar)
 	}
 	return nil
+}
+
+func (m *MemoryHistoricalStore) UpsertCorporateActionEvent(_ context.Context, event market.CorporateActionEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	event.Exchange = strings.ToLower(strings.TrimSpace(event.Exchange))
+	event.Symbol = strings.ToUpper(strings.TrimSpace(event.Symbol))
+	m.corporateActions[event.ActionID] = event
+	return nil
+}
+
+func (m *MemoryHistoricalStore) ListOpenCorporateActionEvents(_ context.Context) ([]market.CorporateActionEvent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]market.CorporateActionEvent, 0)
+	for _, event := range m.corporateActions {
+		if event.State == market.CorporateActionStateFactor || event.State == market.CorporateActionStateManualReview {
+			continue
+		}
+		out = append(out, event)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FirstSeenMS < out[j].FirstSeenMS })
+	return out, nil
 }
 
 func (m *MemoryHistoricalStore) applyFactorLocked(bar market.Bar, sourceMarket string, priceMode string) market.Bar {

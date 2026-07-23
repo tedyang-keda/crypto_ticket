@@ -28,6 +28,8 @@ const (
 	PhasePreMarket  = "pre_market"
 	PhasePreopen    = "preopen"
 	PhaseRebase     = "rebase"
+	PhaseHalt       = "trading_halt"
+	PhaseCancelOnly = "trading_cancel_only"
 	PhaseSuspend    = "suspend"
 	PhaseExpired    = "expired"
 	PhaseUnknown    = "unknown"
@@ -41,6 +43,27 @@ const (
 	AdjustmentStatusMissing   = "missing_factor"
 	AdjustmentStatusLiveRaw   = "live_raw"
 	AdjustmentProviderRuntime = "runtime_factor"
+
+	// OKX exposes rebase-eligible contracts via ruleType; rebase itself is a
+	// lifecycle state. These are the machine-readable signals for a corporate
+	// action (split / pre-IPO share rebase) on equity and pre-market perps.
+	RuleRebaseContract = "rebase_contract"
+
+	// Instrument change event types emitted by the instruments-channel monitor.
+	InstrumentEventRebase      = "rebase_detected"
+	InstrumentEventRebaseArmed = "rebase_contract_armed"
+	InstrumentEventSuspended   = "equity_suspended"
+	InstrumentEventCancelOnly  = "equity_cancel_only"
+	InstrumentEventResumed     = "equity_resumed"
+	InstrumentEventDelisted    = "equity_delisted"
+	InstrumentEventRenamed     = "instrument_renamed"
+
+	CorporateActionStateDiscovered   = "DISCOVERED"
+	CorporateActionStateHalt         = "TRADING_HALT"
+	CorporateActionStateCancelOnly   = "TRADING_CANCEL_ONLY"
+	CorporateActionStateResumed      = "RESUMED"
+	CorporateActionStateFactor       = "FACTOR_WRITTEN"
+	CorporateActionStateManualReview = "MANUAL_REVIEW"
 )
 
 var ErrUnsupportedPriceMode = errors.New("unsupported price mode")
@@ -183,6 +206,27 @@ type InstrumentChangeEvent struct {
 	CurrentHash  string          `json:"current_hash,omitempty"`
 	PreviousJSON json.RawMessage `json:"previous_json,omitempty"`
 	CurrentJSON  json.RawMessage `json:"current_json,omitempty"`
+}
+
+// CorporateActionEvent is the durable lifecycle record for one adjustment.
+// Raw exchange messages remain attached as evidence because Binance's CMS API
+// is public but unversioned.
+type CorporateActionEvent struct {
+	ActionID       string          `json:"action_id"`
+	Exchange       string          `json:"exchange"`
+	SourceMarket   string          `json:"source_market,omitempty"`
+	Symbol         string          `json:"symbol"`
+	EventType      string          `json:"event_type"`
+	State          string          `json:"state"`
+	FirstSeenMS    int64           `json:"first_seen_ms"`
+	LastEventMS    int64           `json:"last_event_ms"`
+	ResumeMS       int64           `json:"resume_ms,omitempty"`
+	BoundaryMS     int64           `json:"boundary_ms,omitempty"`
+	AnnouncedRatio float64         `json:"announced_ratio,omitempty"`
+	Attempts       int             `json:"attempts"`
+	LastError      string          `json:"last_error,omitempty"`
+	Raw            json.RawMessage `json:"raw,omitempty"`
+	UpdatedAtMS    int64           `json:"updated_at_ms"`
 }
 
 type Event struct {

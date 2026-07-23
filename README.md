@@ -72,6 +72,27 @@ raw | backward_adjusted | forward_adjusted
 - WebSocket 实时推送仍是 raw。dashboard 切到 adjusted 模式后会停止消费 raw WS，改用 HTTP `price_mode` 查询，避免 raw live 覆盖复权视图。
 - 当前 `ticker/latest` 的 price 来自最新 `1m` kline close，不是真实 trade tick。adjusted 模式下如果找得到当前 bar 的 factor，会按 bar 规则派生；找不到时会返回 `adjustment_status=live_raw`。
 
+### Binance 历史复权因子补录
+
+历史补偿不会修改 `bar_history`。命令分页扫描 Binance 公告，读取官方调整比例，使用公告窗口内的官方 `1m` K 线定位边界，然后幂等写入 `corporate_action_event` 和累计 `adjustment_factor`：
+
+```bash
+# 先预览，不写数据库
+go run ./cmd/backfill_adjustments \
+  -symbols KORUUSDT \
+  -start 2026-07-01 \
+  -end 2026-07-31 \
+  -dry-run
+
+# 确认结果后写入
+go run ./cmd/backfill_adjustments \
+  -symbols KORUUSDT \
+  -start 2026-07-01 \
+  -end 2026-07-31
+```
+
+不传 `-symbols` 时会处理日期范围内扫描到的全部 Binance 合约调整。`-continue-on-error` 可跳过无法确认 K 线边界的公告。写入后通过 `price_mode=backward_adjusted` 动态复权，无需物化 `bar_history_adjusted`。
+
 ## 支持的周期
 
 运行时 timeframe 支持：

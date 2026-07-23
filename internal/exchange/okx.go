@@ -24,9 +24,33 @@ type okxInstrumentSpec struct {
 	baseCcy        string
 	quoteCcy       string
 	settleCcy      string
+	instFamily     string
 	ctVal          float64
+	ctMult         float64
 	ctValCcy       string
 	classification market.InstrumentClassification
+}
+
+// okxInstrumentItem mirrors the fields OKX returns from both the REST
+// GET /api/v5/public/instruments endpoint and the public "instruments"
+// WebSocket channel. The two share an identical data shape, so the same
+// decoding path serves symbol refresh and real-time corporate-action
+// detection.
+type okxInstrumentItem struct {
+	InstID       string `json:"instId"`
+	InstType     string `json:"instType"`
+	InstFamily   string `json:"instFamily"`
+	InstCategory string `json:"instCategory"`
+	RuleType     string `json:"ruleType"`
+	State        string `json:"state"`
+	BaseCcy      string `json:"baseCcy"`
+	QuoteCcy     string `json:"quoteCcy"`
+	SettleCcy    string `json:"settleCcy"`
+	CtVal        string `json:"ctVal"`
+	CtMult       string `json:"ctMult"`
+	CtValCcy     string `json:"ctValCcy"`
+	ListTime     string `json:"listTime"`
+	ExpTime      string `json:"expTime"`
 }
 
 func NewOKXAdapter(instType string, restURL string, wsURL string) *OKXAdapter {
@@ -75,18 +99,7 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 		return nil, fmt.Errorf("okx instruments status %s", resp.Status)
 	}
 	var payload struct {
-		Data []struct {
-			InstID       string `json:"instId"`
-			InstType     string `json:"instType"`
-			InstCategory string `json:"instCategory"`
-			RuleType     string `json:"ruleType"`
-			State        string `json:"state"`
-			BaseCcy      string `json:"baseCcy"`
-			QuoteCcy     string `json:"quoteCcy"`
-			SettleCcy    string `json:"settleCcy"`
-			CtVal        string `json:"ctVal"`
-			CtValCcy     string `json:"ctValCcy"`
-		} `json:"data"`
+		Data []okxInstrumentItem `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
@@ -95,52 +108,70 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 	symbols := make([]market.SymbolInfo, 0, len(payload.Data))
 	specs := make(map[string]okxInstrumentSpec, len(payload.Data))
 	for _, item := range payload.Data {
-		symbol := strings.ToUpper(strings.TrimSpace(item.InstID))
+		info, spec, symbol := a.buildInstrument(item, now)
 		if symbol == "" {
 			continue
 		}
-		baseCcy := strings.ToUpper(strings.TrimSpace(item.BaseCcy))
-		quoteCcy := strings.ToUpper(strings.TrimSpace(item.QuoteCcy))
-		if baseCcy == "" || quoteCcy == "" {
-			baseCcy, quoteCcy = inferOKXSymbolCurrencies(symbol)
-		}
-		raw := map[string]any{
-			"instId":       item.InstID,
-			"instType":     item.InstType,
-			"instCategory": item.InstCategory,
-			"ruleType":     item.RuleType,
-			"state":        item.State,
-			"baseCcy":      item.BaseCcy,
-			"quoteCcy":     item.QuoteCcy,
-			"settleCcy":    item.SettleCcy,
-			"ctVal":        item.CtVal,
-			"ctValCcy":     item.CtValCcy,
-		}
-		classification := market.ClassifyOKXSymbol(a.instType, raw)
-		specs[symbol] = okxInstrumentSpec{
-			baseCcy:        baseCcy,
-			quoteCcy:       quoteCcy,
-			settleCcy:      strings.ToUpper(strings.TrimSpace(item.SettleCcy)),
-			ctVal:          parseFloat(item.CtVal),
-			ctValCcy:       strings.ToUpper(strings.TrimSpace(item.CtValCcy)),
-			classification: classification,
-		}
-		status := strings.ToLower(item.State)
-		info := market.SymbolInfo{
-			Exchange:      a.Name(),
-			Symbol:        symbol,
-			MarketType:    a.instType,
-			Status:        status,
-			IsActive:      status == "live",
-			FirstSeenAtMS: now,
-			LastSeenAtMS:  now,
-			UpdatedAtMS:   now,
-			Raw:           rawJSON(raw),
-		}
-		symbols = append(symbols, market.ApplyClassificationFieldsToSymbol(info, classification))
+		specs[symbol] = spec
+		symbols = append(symbols, info)
 	}
 	a.replaceInstrumentSpecs(specs)
 	return symbols, nil
+}
+
+// buildInstrument maps a single OKX instrument record to a classified
+// SymbolInfo plus the spec used for kline normalization. Shared by the REST
+// symbol refresh and the WebSocket instruments channel so both stay in sync.
+func (a *OKXAdapter) buildInstrument(item okxInstrumentItem, now int64) (market.SymbolInfo, okxInstrumentSpec, string) {
+	symbol := strings.ToUpper(strings.TrimSpace(item.InstID))
+	if symbol == "" {
+		return market.SymbolInfo{}, okxInstrumentSpec{}, ""
+	}
+	baseCcy := strings.ToUpper(strings.TrimSpace(item.BaseCcy))
+	quoteCcy := strings.ToUpper(strings.TrimSpace(item.QuoteCcy))
+	if baseCcy == "" || quoteCcy == "" {
+		baseCcy, quoteCcy = inferOKXSymbolCurrencies(symbol)
+	}
+	raw := map[string]any{
+		"instId":       item.InstID,
+		"instType":     item.InstType,
+		"instFamily":   item.InstFamily,
+		"instCategory": item.InstCategory,
+		"ruleType":     item.RuleType,
+		"state":        item.State,
+		"baseCcy":      item.BaseCcy,
+		"quoteCcy":     item.QuoteCcy,
+		"settleCcy":    item.SettleCcy,
+		"ctVal":        item.CtVal,
+		"ctMult":       item.CtMult,
+		"ctValCcy":     item.CtValCcy,
+		"listTime":     item.ListTime,
+		"expTime":      item.ExpTime,
+	}
+	classification := market.ClassifyOKXSymbol(a.instType, raw)
+	spec := okxInstrumentSpec{
+		baseCcy:        baseCcy,
+		quoteCcy:       quoteCcy,
+		settleCcy:      strings.ToUpper(strings.TrimSpace(item.SettleCcy)),
+		instFamily:     strings.ToUpper(strings.TrimSpace(item.InstFamily)),
+		ctVal:          parseFloat(item.CtVal),
+		ctMult:         parseFloat(item.CtMult),
+		ctValCcy:       strings.ToUpper(strings.TrimSpace(item.CtValCcy)),
+		classification: classification,
+	}
+	status := strings.ToLower(item.State)
+	info := market.SymbolInfo{
+		Exchange:      a.Name(),
+		Symbol:        symbol,
+		MarketType:    a.instType,
+		Status:        status,
+		IsActive:      status == "live",
+		FirstSeenAtMS: now,
+		LastSeenAtMS:  now,
+		UpdatedAtMS:   now,
+		Raw:           rawJSON(raw),
+	}
+	return market.ApplyClassificationFieldsToSymbol(info, classification), spec, symbol
 }
 
 func (a *OKXAdapter) BuildSubscribePayload(symbols []string, requestID int64) ([]byte, error) {
@@ -165,6 +196,59 @@ func (a *OKXAdapter) buildSubscriptionPayload(op string, symbols []string, reque
 		"args": args,
 		"id":   requestID,
 	})
+}
+
+// BuildInstrumentsSubscribePayload builds the subscription frame for the OKX
+// public "instruments" channel. After subscribing, OKX pushes the full
+// instrument list once, then pushes only the records whose state changes
+// (listing, suspension, expiry, rebase) — the real-time signal used to detect
+// corporate actions on equity/pre-market perpetuals.
+func (a *OKXAdapter) BuildInstrumentsSubscribePayload() ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"op": "subscribe",
+		"args": []map[string]string{
+			{"channel": "instruments", "instType": a.instType},
+		},
+	})
+}
+
+// ParseInstrumentsMessage decodes a push from the "instruments" channel into
+// classified SymbolInfo records. Event acks (subscribe/error) and messages for
+// other channels decode to a nil slice. It also refreshes the adapter's local
+// instrument specs so kline normalization tracks live metadata changes.
+func (a *OKXAdapter) ParseInstrumentsMessage(payload []byte) ([]market.SymbolInfo, error) {
+	// OKX answers our keepalive "ping" with a plain-text "pong" and may send
+	// other non-JSON control frames; treat anything that is not a JSON object
+	// as a no-op rather than a decode error.
+	if trimmed := strings.TrimSpace(string(payload)); trimmed == "" || trimmed[0] != '{' {
+		return nil, nil
+	}
+	var data struct {
+		Event string `json:"event"`
+		Arg   struct {
+			Channel string `json:"channel"`
+		} `json:"arg"`
+		Data []okxInstrumentItem `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return nil, err
+	}
+	if data.Event != "" || strings.ToLower(strings.TrimSpace(data.Arg.Channel)) != "instruments" {
+		return nil, nil
+	}
+	now := market.NowMS()
+	symbols := make([]market.SymbolInfo, 0, len(data.Data))
+	updated := make(map[string]okxInstrumentSpec, len(data.Data))
+	for _, item := range data.Data {
+		info, spec, symbol := a.buildInstrument(item, now)
+		if symbol == "" {
+			continue
+		}
+		updated[symbol] = spec
+		symbols = append(symbols, info)
+	}
+	a.mergeInstrumentSpecs(updated)
+	return symbols, nil
 }
 
 func (a *OKXAdapter) ParseMessage(payload []byte) ([]market.Tick, error) {
@@ -313,6 +397,23 @@ func (a *OKXAdapter) replaceInstrumentSpecs(specs map[string]okxInstrumentSpec) 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.specs = specs
+}
+
+// mergeInstrumentSpecs applies incremental instrument updates from the
+// WebSocket instruments channel without discarding specs for symbols absent
+// from a partial push.
+func (a *OKXAdapter) mergeInstrumentSpecs(specs map[string]okxInstrumentSpec) {
+	if len(specs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.specs == nil {
+		a.specs = make(map[string]okxInstrumentSpec, len(specs))
+	}
+	for symbol, spec := range specs {
+		a.specs[symbol] = spec
+	}
 }
 
 func (a *OKXAdapter) instrumentSpec(symbol string) (okxInstrumentSpec, bool) {

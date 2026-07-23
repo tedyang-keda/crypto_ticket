@@ -32,7 +32,9 @@ func ClassifyBinanceSymbol(marketType string, payload map[string]any) Instrument
 	case "PREMARKET":
 		assetClass = AssetClassPreMarket
 	default:
-		if !strings.EqualFold(strings.TrimSpace(marketType), "um_futures") {
+		if contractType == "TRADIFI_PERPETUAL" {
+			assetClass = AssetClassEquity
+		} else if !strings.EqualFold(strings.TrimSpace(marketType), "um_futures") {
 			assetClass = AssetClassCrypto
 		}
 	}
@@ -45,6 +47,10 @@ func ClassifyBinanceSymbol(marketType string, payload map[string]any) Instrument
 	switch status {
 	case "TRADING":
 		lifecyclePhase = PhaseContinuous
+	case "TRADING_HALT":
+		lifecyclePhase = PhaseHalt
+	case "TRADING_CANCEL_ONLY":
+		lifecyclePhase = PhaseCancelOnly
 	case "PENDING_TRADING", "PRE_TRADING":
 		lifecyclePhase = PhasePreopen
 	case "SETTLING", "DELIVERING", "PRE_DELIVERING":
@@ -172,6 +178,57 @@ func ApplyClassificationFieldsToSymbol(symbol SymbolInfo, classification Instrum
 	symbol.RuleType = classification.RuleType
 	symbol.LifecyclePhase = classification.LifecyclePhase
 	return symbol
+}
+
+// IsEquityLikeAssetClass reports whether an asset class is subject to
+// corporate actions (splits, ex-dividend, pre-IPO share rebase) and therefore
+// eligible for the adjustment pipeline. Crypto is deliberately excluded.
+func IsEquityLikeAssetClass(assetClass string) bool {
+	switch strings.ToLower(strings.TrimSpace(assetClass)) {
+	case AssetClassEquity, AssetClassKREquity, AssetClassPreMarket, AssetClassIndex, AssetClassCommodity:
+		return true
+	default:
+		return false
+	}
+}
+
+// CorporateActionEventType classifies a transition between two snapshots of the
+// same instrument as a corporate-action candidate, returning the event type and
+// true when the change warrants adjustment-pipeline attention. It only fires for
+// equity-like instruments so ordinary crypto churn is ignored.
+func CorporateActionEventType(previous SymbolInfo, current SymbolInfo) (string, bool) {
+	if !IsEquityLikeAssetClass(current.AssetClass) && !IsEquityLikeAssetClass(previous.AssetClass) {
+		return "", false
+	}
+	// Entered the rebase state: the split/rebase is executing now.
+	if current.LifecyclePhase == PhaseRebase && previous.LifecyclePhase != PhaseRebase {
+		return InstrumentEventRebase, true
+	}
+	// Contract flagged as rebase-eligible ahead of the event.
+	if strings.EqualFold(current.RuleType, RuleRebaseContract) &&
+		!strings.EqualFold(previous.RuleType, RuleRebaseContract) {
+		return InstrumentEventRebaseArmed, true
+	}
+	// Trading halted from a live state — often the pre-adjustment suspension
+	// window; worth surfacing so downstream can freeze the affected bars.
+	if (current.LifecyclePhase == PhaseSuspend || current.LifecyclePhase == PhaseHalt) && previous.LifecyclePhase == PhaseContinuous {
+		return InstrumentEventSuspended, true
+	}
+	if current.LifecyclePhase == PhaseCancelOnly &&
+		(previous.LifecyclePhase == PhaseHalt || previous.LifecyclePhase == PhaseSuspend) {
+		return InstrumentEventCancelOnly, true
+	}
+	if current.LifecyclePhase == PhaseContinuous &&
+		(previous.LifecyclePhase == PhaseHalt || previous.LifecyclePhase == PhaseCancelOnly ||
+			previous.LifecyclePhase == PhaseSuspend || previous.LifecyclePhase == PhaseRebase) {
+		return InstrumentEventResumed, true
+	}
+	// Instrument expired from a live state: candidate delisting or rename leg.
+	if current.LifecyclePhase == PhaseExpired && previous.LifecyclePhase != PhaseExpired &&
+		previous.LifecyclePhase != PhaseUnknown {
+		return InstrumentEventDelisted, true
+	}
+	return "", false
 }
 
 func firstNonEmptyString(values ...string) string {

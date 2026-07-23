@@ -34,6 +34,7 @@ type KlineRequest struct {
 
 type RESTKlineFetcher interface {
 	Name() string
+	MarketType() string
 	FetchKlines(ctx context.Context, client *http.Client, request KlineRequest) ([]market.Bar, error)
 }
 
