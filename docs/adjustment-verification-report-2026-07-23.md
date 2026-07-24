@@ -100,18 +100,19 @@ ZHIPU 扩大到前后各 10 桶后，仍观察到 23 个字段差异：5m 11 个
 - ZHIPU-USDT-SWAP：扫描范围内没有公司行动公告；其高周期 raw 对照未全部通过，详见上文。
 - OKX BTC-USDT-SWAP、Binance BTCUSDT：作为普通品种对照，10 个周期均通过。
 - 六个动作重复执行都会重新拉取并覆盖官方历史 raw 数据，审计事件保持幂等。
+- 扩展周期验证：OKX OPENAI 的 `2D / 1W` 均为 `5/5 PASS`；OKX KORU 为 `2D 5/5 PASS`、`1W 3/3 PASS`；Binance KORU 的 `1W` 为 `3/3 PASS`。
 - 本地 `go test ./...`、`go vet ./...`、`git diff --check` 全部通过。
-- `ticket` 已部署代码提交 `9a91acd`，`crypto-ticket.service` 为 active；`hn3` 未操作。
+- `ticket` 已部署代码提交 `9c2d504`，`crypto-ticket.service` 为 active；`hn3` 未操作。
 
 ## 当前覆盖范围
 
-- raw 官方对齐：动作品种在动作所在 UTC 日及边界上下文窗口覆盖 `1m` 到 `1D`。
+- raw 官方对齐：OKX 动作品种覆盖 `1m` 到 `1D`、`2D` 和 `1W`；Binance 动作品种覆盖 `1m` 到 `1D` 和 `1W`。Binance 官方不提供 `2D`。
 - API 仅提供 raw；旧 adjusted 请求会明确返回 `400`。
 - rename + rebase：SPACEX 历史使用后继品种 `SPCX-USDT-SWAP` 对齐。
 
 当前未覆盖：
 
-- `2D`、周线、月线的官方逐周期 raw 回补。
+- 月线的公司行动官方逐周期 raw 回补，以及 Binance 官方未提供的 `2D`。
 - 如果交易所在动作日之外继续回写更早历史，需要扩大回补窗口后再次扫描。
 - 普通品种的高周期历史全量官方回补；ZHIPU 对照已证明本地 1m 聚合不能保证与 OKX 官方 5m 以上周期完全一致。
 
