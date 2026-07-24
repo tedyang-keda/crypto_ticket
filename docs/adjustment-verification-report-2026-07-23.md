@@ -101,7 +101,7 @@ ZHIPU 扩大到前后各 10 桶后，仍观察到 23 个字段差异：5m 11 个
 - OKX BTC-USDT-SWAP、Binance BTCUSDT：作为普通品种对照，10 个周期均通过。
 - 六个动作重复执行都会重新拉取并覆盖官方历史 raw 数据，审计事件保持幂等。
 - 本地 `go test ./...`、`go vet ./...`、`git diff --check` 全部通过。
-- `ticket` 已部署 `034eb56`，`crypto-ticket.service` 为 active；`hn3` 未操作。
+- `ticket` 已部署代码提交 `9a91acd`，`crypto-ticket.service` 为 active；`hn3` 未操作。
 
 ## 当前覆盖范围
 
