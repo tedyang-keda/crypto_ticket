@@ -108,7 +108,22 @@ ZHIPU 扩大到前后各 10 桶后，仍观察到 23 个字段差异：5m 11 个
 - 六个动作重复执行都会重新拉取并覆盖官方历史 raw 数据，审计事件保持幂等。
 - 扩展周期验证：OKX OPENAI、ANTHROPIC、SPCX 按 `adjust=forward` 验证 12 个周期均 PASS；OKX KORU 已完成 `1W 4/4 PASS`；Binance KORU 的 `1W` 为 `3/3 PASS`。
 - 本地 `go test ./...`、`go vet ./...`、`git diff --check` 全部通过。
-- `ticket` 已部署代码提交 `0d04337`，`crypto-ticket.service` 为 active；`hn3` 未操作。
+- `ticket` 已部署代码提交 `521fe51`，`crypto-ticket.service` 为 active；`hn3` 未操作。
+
+## 高周期实时 HTTP / WebSocket 验证（2026-07-24）
+
+提交 `521fe51` 将 `5m` 及以上的当前未完成 K 线改为直接读取官方目标周期接口。OKX SWAP 固定使用 `adjust=forward`；Binance 使用 `/fapi/v1/klines` 的官方唯一口径。公开 WS 只对实际订阅的高周期每 2 秒轮询，字段未变化时不重复推送；旧的本地 `1m` live rollup 不再混入高周期 WS。
+
+| 交易所 | 品种 | 周期 | HTTP 当前 K 线 | WS 当前 K 线 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| OKX | KORU-USDT-SWAP | 1W | `adjust=forward` 对齐 | `source=official_rest_live`，`18.6 / 23.4 / 17.43` 对齐 | PASS |
+| OKX | KORU-USDT-SWAP | 1D | `adjust=forward` 对齐 | `source=official_rest_live` | PASS |
+| OKX | OPENAI-USDT-SWAP | 1W | `adjust=forward` 对齐 | `120.81 / 121.2 / 103.66 / 117.38` 对齐 | PASS |
+| OKX | ZHIPU-USDT-SWAP | 1D | `adjust=forward` 对齐 | `145.77 / 163.63 / 143.27` 对齐 | PASS |
+| Binance | KORUUSDT | 1W / 1D | 官方 futures kline 对齐 | `source=official_rest_live` | PASS |
+| Binance | BTCUSDT | 1W | 官方 futures kline 对齐 | `64694.8 / 66924.1 / 63736.1` 对齐 | PASS |
+
+实时 close、volume 和 quote volume 会在 WS 消息与随后执行的官方 HTTP 查询之间继续变化，因此验收以时间戳和 open/high/low 等稳定字段完全一致、close/volume 仅单向实时推进为准。KORU `1W` 的关键错误字段已从本地合成的 `low=17.62` 修正为 OKX 官方前复权的 `low=17.43`。
 
 ## 当前覆盖范围
 
