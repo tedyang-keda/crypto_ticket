@@ -216,7 +216,11 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 	}
 	after := int64(0)
 	if request.EndMS > 0 {
-		after = request.EndMS + 1
+		// OKX may mark the first zero-volume candle below `after` as
+		// unconfirmed, even for old history. Look one complete bucket past the
+		// requested end so the last requested candle has a stable confirm flag.
+		endStartMS := timeframe.FloorStartMS(request.EndMS, request.Timeframe)
+		after = timeframe.NextStartMS(timeframe.NextStartMS(endStartMS, request.Timeframe), request.Timeframe)
 	}
 
 	useRecentEndpoint := request.StartMS == 0 && request.EndMS == 0

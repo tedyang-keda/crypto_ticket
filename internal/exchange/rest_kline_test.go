@@ -148,6 +148,26 @@ func TestOKXFetchKlinesContinuesAfterShortHistoryPage(t *testing.T) {
 	}
 }
 
+func TestOKXFetchKlinesLooksPastEndForStableConfirmation(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Query().Get("after"); got != "420000" {
+			t.Fatalf("expected one complete lookahead bucket, got after=%s", got)
+		}
+		return jsonResponse(`{"code":"0","data":[["360000","11","11","11","11","0","0","0","0"],["300000","10","10","10","10","0","0","0","1"],["240000","9","9","9","9","1","1","9","1"]]}`), nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "TEST-USDT-SWAP", Timeframe: "1m", StartMS: 240_000, EndMS: 300_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 2 || bars[0].StartMS != 240_000 || bars[1].StartMS != 300_000 {
+		t.Fatalf("unexpected stable historical window: %+v", bars)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
