@@ -27,14 +27,6 @@ type MarketService struct {
 	liveBars       map[string]market.Bar
 	finalObservers []FinalBarObserver
 	corpGuard      CorporateActionGuard
-	aliasResolver  AliasResolver
-}
-
-// AliasResolver reports a symbol's renamed predecessor so its history can be
-// stitched onto the successor when serving adjusted series (layer D). It is
-// implemented by *corpaction.AliasRegistry.
-type AliasResolver interface {
-	Lookup(exchange string, successor string) (predecessor string, sourceMarket string, boundaryMS int64, ok bool)
 }
 
 type FinalBarObserver interface {
@@ -69,14 +61,6 @@ func (s *MarketService) SetCorporateActionGuard(guard CorporateActionGuard) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.corpGuard = guard
-}
-
-// SetAliasResolver attaches the rename-alias resolver (layer D). Optional; when
-// set, adjusted queries stitch a renamed instrument's predecessor history.
-func (s *MarketService) SetAliasResolver(resolver AliasResolver) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.aliasResolver = resolver
 }
 
 func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
@@ -456,21 +440,16 @@ func (s *MarketService) publishBar(bar market.Bar) {
 func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol string, priceMode string) (*market.Tick, error) {
 	exchange = strings.ToLower(strings.TrimSpace(exchange))
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	mode, err := market.NormalizePriceMode(priceMode)
-	if err != nil {
+	if _, err := market.NormalizePriceMode(priceMode); err != nil {
 		return nil, err
 	}
 	s.mu.RLock()
 	live, ok := s.liveBars[barKey(exchange, symbol, aggregator.OneMinute)]
 	s.mu.RUnlock()
 	if ok {
-		bar, err := s.applyQueryPriceMode(ctx, live, mode)
-		if err != nil {
-			return nil, err
-		}
-		return tickFromBar(bar), nil
+		return tickFromBar(market.MarkBarAdjustmentStatus(live, market.PriceModeRaw, market.AdjustmentStatusRaw)), nil
 	}
-	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1, PriceMode: mode})
+	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1, PriceMode: market.PriceModeRaw})
 	if err != nil || len(bars) == 0 {
 		return nil, err
 	}
@@ -495,12 +474,6 @@ func tickFromBar(bar market.Bar) *market.Tick {
 		Source:           bar.Source,
 		RecvMS:           bar.UpdatedAtMS,
 	}
-	if bar.AdjustmentStatus == market.AdjustmentStatusAdjusted {
-		tick.RawPrice = bar.RawClosePrice
-		tick.AdjustedPrice = bar.ClosePrice
-		tick.RawSize = bar.RawVolume
-		tick.AdjustedSize = bar.Volume
-	}
 	return tick
 }
 
@@ -508,11 +481,10 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	query.Exchange = strings.ToLower(query.Exchange)
 	query.Symbol = strings.ToUpper(query.Symbol)
 	query.Timeframe = timeframe.MustNormalize(query.Timeframe)
-	mode, err := market.NormalizePriceMode(query.PriceMode)
-	if err != nil {
+	if _, err := market.NormalizePriceMode(query.PriceMode); err != nil {
 		return nil, err
 	}
-	query.PriceMode = mode
+	query.PriceMode = market.PriceModeRaw
 	if query.Limit <= 0 {
 		query.Limit = defaultRecentLimit
 	}
@@ -527,12 +499,6 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	for i := range bars {
 		bars[i] = market.DecorateBar(bars[i])
 	}
-	if market.IsAdjustedPriceMode(mode) {
-		bars, err = s.prependPredecessorHistory(ctx, query, bars)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if !query.IncludeLive {
 		return trimBars(bars, query.Limit), nil
 	}
@@ -541,10 +507,7 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		return trimBars(bars, query.Limit), nil
 	}
 	if query.Timeframe == aggregator.OneMinute {
-		queryLive, err := s.applyQueryPriceMode(ctx, *live, query.PriceMode)
-		if err != nil {
-			return nil, err
-		}
+		queryLive := market.MarkBarAdjustmentStatus(*live, market.PriceModeRaw, market.AdjustmentStatusRaw)
 		return trimBars(mergeLiveBar(bars, &queryLive), query.Limit+1), nil
 	}
 
@@ -555,80 +518,8 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	if partial == nil {
 		return trimBars(bars, query.Limit), nil
 	}
-	queryPartial, err := s.applyQueryPriceMode(ctx, *partial, query.PriceMode)
-	if err != nil {
-		return nil, err
-	}
+	queryPartial := market.MarkBarAdjustmentStatus(*partial, market.PriceModeRaw, market.AdjustmentStatusRaw)
 	return trimBars(mergeLiveBar(bars, &queryPartial), query.Limit+1), nil
-}
-
-// prependPredecessorHistory stitches a renamed instrument's predecessor bars
-// onto the front of an adjusted series. The predecessor's raw bars are
-// relabeled to the successor symbol so the successor's cumulative factor
-// timeline (which includes the rename ratio for pre-boundary times) adjusts
-// them onto a continuous basis.
-func (s *MarketService) prependPredecessorHistory(ctx context.Context, query market.KlineQuery, bars []market.Bar) ([]market.Bar, error) {
-	s.mu.RLock()
-	resolver := s.aliasResolver
-	s.mu.RUnlock()
-	if resolver == nil {
-		return bars, nil
-	}
-	predecessor, predSource, boundaryMS, ok := resolver.Lookup(query.Exchange, query.Symbol)
-	if !ok {
-		return bars, nil
-	}
-
-	predQuery := query
-	predQuery.Symbol = strings.ToUpper(predecessor)
-	predQuery.SourceMarket = predSource
-	predQuery.PriceMode = market.PriceModeRaw
-	predQuery.IncludeLive = false
-	predQuery.Limit = query.Limit
-	predBars, err := s.store.RecentBars(ctx, predQuery)
-	if err != nil {
-		return nil, err
-	}
-	if len(predBars) == 0 {
-		return bars, nil
-	}
-
-	stitched := make([]market.Bar, 0, len(predBars)+len(bars))
-	for _, pb := range predBars {
-		if boundaryMS > 0 && pb.StartMS >= boundaryMS {
-			continue // keep only pre-rename history
-		}
-		// Relabel to the successor so its factor timeline applies.
-		pb.Symbol = query.Symbol
-		pb.SourceMarket = query.SourceMarket
-		adjusted, err := s.applyQueryPriceMode(ctx, pb, query.PriceMode)
-		if err != nil {
-			return nil, err
-		}
-		stitched = append(stitched, market.DecorateBar(adjusted))
-	}
-	stitched = append(stitched, bars...)
-	sort.Slice(stitched, func(i, j int) bool { return stitched[i].StartMS < stitched[j].StartMS })
-	return stitched, nil
-}
-
-func (s *MarketService) applyQueryPriceMode(ctx context.Context, bar market.Bar, priceMode string) (market.Bar, error) {
-	mode, err := market.NormalizePriceMode(priceMode)
-	if err != nil {
-		return bar, err
-	}
-	if mode == market.PriceModeRaw {
-		return market.MarkBarAdjustmentStatus(market.DecorateBar(bar), mode, market.AdjustmentStatusRaw), nil
-	}
-	factor, err := s.store.AdjustmentFactorAt(ctx, bar.Exchange, bar.SourceMarket, bar.Symbol, mode, market.BarAdjustmentTimestamp(bar))
-	if err != nil {
-		return bar, err
-	}
-	if factor == nil {
-		bar = market.MarkBarAdjustmentStatus(market.DecorateBar(bar), mode, market.AdjustmentStatusLiveRaw)
-		return bar, nil
-	}
-	return market.ApplyFactorToBar(bar, *factor), nil
 }
 
 func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Bar {

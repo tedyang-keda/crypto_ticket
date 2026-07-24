@@ -6,16 +6,11 @@ export function useMarketSocket() {
   const exchange = useMarketStore((state) => state.exchange);
   const symbol = useMarketStore((state) => state.symbol);
   const timeframe = useMarketStore((state) => state.timeframe);
-  const priceMode = useMarketStore((state) => state.priceMode);
   const setLatestTick = useMarketStore((state) => state.setLatestTick);
   const updateBar = useMarketStore((state) => state.updateBar);
   const setConnection = useMarketStore((state) => state.setConnection);
 
   useEffect(() => {
-    if (priceMode !== "raw") {
-      setConnection("closed");
-      return;
-    }
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${protocol}://${window.location.host}/api/v1/ws`);
     let closed = false;
@@ -52,5 +47,5 @@ export function useMarketSocket() {
       closed = true;
       ws.close();
     };
-  }, [exchange, symbol, timeframe, priceMode, setConnection, setLatestTick, updateBar]);
+  }, [exchange, symbol, timeframe, setConnection, setLatestTick, updateBar]);
 }

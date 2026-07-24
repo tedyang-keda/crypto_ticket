@@ -43,7 +43,7 @@ HTTP /api/v1/klines?include_live=true
 - 高周期 final/live rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。
 - Kline guardian 不从 trade 重算 OHLCV；它只用交易所官方 REST kline 校验和修复官方 WS 可能漏掉的 final `1m`。
 
-## 品种分类与复权
+## 品种分类与公司行动修复
 
 symbol 元数据会写入 `symbol_registry`，并带上以下分类字段：
 
@@ -58,26 +58,13 @@ symbol 元数据会写入 `symbol_registry`，并带上以下分类字段：
 - Binance `exchangeInfo`：读取 `contractType`、`underlyingType`、`underlyingSubType`、`status/contractStatus`。`underlyingType=EQUITY` 会标为 `equity`，`underlyingType=PREMARKET` 会标为 `pre_market`。
 - OKX `public/instruments`：读取 `instType`、`instCategory`、`ruleType`、`state`。`instCategory=3` 会标为 `equity`，`ruleType=pre_market` 会标为 `pre_market`。
 
-bar 查询支持 `price_mode`：
+行情接口只提供交易所官方 `raw` 口径。`price_mode` 省略或传 `raw` 均可；旧的 `backward_adjusted`、`forward_adjusted` 参数会返回 `400 unsupported price mode`。系统不再计算复权因子，也不再提供动态或物化复权视图。
 
-```text
-raw | backward_adjusted | forward_adjusted
-```
+### 历史公司行动修复
 
-默认是 `raw`。`/api/v1/klines` 和 `/api/v1/ticker/latest` 都接受 `price_mode` 参数。复权第一版只对 bar 做派生，不重写原始 tick/trade：
+`cmd/backfill_adjustments` 支持 Binance 和 OKX。它分页扫描官方公告、读取公告比例，使用公告窗口内的官方 `1m` K 线定位精确动作边界，并把审计记录幂等写入 `corporate_action_event`。
 
-- `bar_history` 永远保存交易所 raw final bar。
-- `adjustment_factor` 保存复权因子，`bar_history_adjusted` 可保存物化后的复权 bar。
-- 请求 adjusted 模式时，服务按 `start_ms` 合并 `bar_history_adjusted` 和 raw 行；物化行覆盖对应边界桶，其余行继续按 `adjustment_factor` 动态派生。
-- `adjustment_status=not_required` 表示该品种和时间范围已经完成官方公告扫描且没有复权动作；未完成覆盖扫描且没有因子的品种仍返回 `missing_factor`。
-- WebSocket 实时推送仍是 raw。dashboard 切到 adjusted 模式后会停止消费 raw WS，改用 HTTP `price_mode` 查询，避免 raw live 覆盖复权视图。
-- 当前 `ticker/latest` 的 price 来自最新 `1m` kline close，不是真实 trade tick。adjusted 模式下如果找得到当前 bar 的 factor，会按 bar 规则派生；找不到时会返回 `adjustment_status=live_raw`。
-
-### 历史复权因子补录
-
-命令支持 Binance 和 OKX。它分页扫描官方公告、读取官方调整比例，使用公告窗口内的官方 `1m` K 线定位精确边界，然后幂等写入 `corporate_action_event` 和累计 `adjustment_factor`。
-
-回填会用官方 `1m` 修复边界所在 UTC 日的 raw `1m`，并重建跨边界的 raw 高周期桶；复权侧先逐根复权 `1m`，再物化边界所在的 `5m` 到 `1D` 桶，避免对混合尺度高周期 K 线整体乘单一因子。
+确认边界后，命令分别拉取交易所官方 `1m / 5m / 15m / 30m / 1H / 2H / 4H / 6H / 12H / 1D`，按 `exchange / symbol / timeframe / start_ms` 覆盖动作所在 UTC 日及边界上下文的 `bar_history`。每次执行都会重新拉取并覆盖，因此可以吸收交易所后续对历史 K 线的回写。
 
 ```bash
 # 先预览，不写数据库
@@ -104,7 +91,7 @@ go run ./cmd/backfill_adjustments \
 	-dry-run
 ```
 
-不传 `-symbols` 时会处理日期范围内扫描到的全部合约调整。`-continue-on-error` 可跳过无法确认 K 线边界的公告。OKX 显式传入的品种如果扫描范围内没有复权公告，会写入 no-action coverage；例如 ZHIPU 后续 adjusted 查询会返回 raw 数值和 `adjustment_status=not_required`。
+不传 `-symbols` 时会处理日期范围内扫描到的全部公司行动。`-continue-on-error` 可跳过无法确认 K 线边界的公告。扫描范围内没有公告的品种不会改写数据。
 
 ## 支持的周期
 

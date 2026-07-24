@@ -8,9 +8,7 @@ import (
 )
 
 // LogSink is the default EventSink: it records each corporate-action candidate
-// to the standard logger. It is the seam where the factor-derivation stage
-// (layer B) will later hook in to compute adjustment factors from the affected
-// bars.
+// to the standard logger so an official-history repair can be scheduled.
 type LogSink struct{}
 
 // HandleInstrumentEvent logs the candidate event and never errors.

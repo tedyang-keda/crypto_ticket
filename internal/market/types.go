@@ -34,16 +34,10 @@ const (
 	PhaseExpired    = "expired"
 	PhaseUnknown    = "unknown"
 
-	PriceModeRaw              = "raw"
-	PriceModeForwardAdjusted  = "forward_adjusted"
-	PriceModeBackwardAdjusted = "backward_adjusted"
+	PriceModeRaw = "raw"
 
-	AdjustmentStatusRaw         = "raw"
-	AdjustmentStatusAdjusted    = "adjusted"
-	AdjustmentStatusMissing     = "missing_factor"
-	AdjustmentStatusNotRequired = "not_required"
-	AdjustmentStatusLiveRaw     = "live_raw"
-	AdjustmentProviderRuntime   = "runtime_factor"
+	AdjustmentStatusRaw     = "raw"
+	AdjustmentStatusLiveRaw = "live_raw"
 
 	// OKX exposes rebase-eligible contracts via ruleType; rebase itself is a
 	// lifecycle state. These are the machine-readable signals for a corporate
@@ -63,11 +57,8 @@ const (
 	CorporateActionStateHalt         = "TRADING_HALT"
 	CorporateActionStateCancelOnly   = "TRADING_CANCEL_ONLY"
 	CorporateActionStateResumed      = "RESUMED"
-	CorporateActionStateFactor       = "FACTOR_WRITTEN"
+	CorporateActionStateRawRepaired  = "RAW_REPAIRED"
 	CorporateActionStateManualReview = "MANUAL_REVIEW"
-	CorporateActionStateNotRequired  = "NO_ACTION_REQUIRED"
-
-	CorporateActionEventHistoricalCoverage = "historical_adjustment_coverage"
 )
 
 var ErrUnsupportedPriceMode = errors.New("unsupported price mode")
@@ -82,10 +73,6 @@ type Tick struct {
 	LifecyclePhase   string          `json:"lifecycle_phase,omitempty"`
 	PriceMode        string          `json:"price_mode,omitempty"`
 	AdjustmentStatus string          `json:"adjustment_status,omitempty"`
-	RawPrice         float64         `json:"raw_price,omitempty"`
-	AdjustedPrice    float64         `json:"adjusted_price,omitempty"`
-	RawSize          float64         `json:"raw_size,omitempty"`
-	AdjustedSize     float64         `json:"adjusted_size,omitempty"`
 	TsMS             int64           `json:"ts_ms"`
 	Price            float64         `json:"price"`
 	Size             float64         `json:"size"`
@@ -135,19 +122,8 @@ type Bar struct {
 	Reason         string  `json:"reason"`
 	UpdatedAtMS    int64   `json:"updated_at_ms"`
 
-	PriceMode                 string  `json:"price_mode,omitempty"`
-	AdjustmentStatus          string  `json:"adjustment_status,omitempty"`
-	AdjustmentProvider        string  `json:"adjustment_provider,omitempty"`
-	AdjustmentProviderVersion string  `json:"adjustment_provider_version,omitempty"`
-	AdjustmentEventType       string  `json:"adjustment_event_type,omitempty"`
-	PriceMultiplier           float64 `json:"price_multiplier,omitempty"`
-	VolumeMultiplier          float64 `json:"volume_multiplier,omitempty"`
-	RawOpenPrice              float64 `json:"raw_open_price,omitempty"`
-	RawHighPrice              float64 `json:"raw_high_price,omitempty"`
-	RawLowPrice               float64 `json:"raw_low_price,omitempty"`
-	RawClosePrice             float64 `json:"raw_close_price,omitempty"`
-	RawVolume                 float64 `json:"raw_volume,omitempty"`
-	RawQuoteVolume            float64 `json:"raw_quote_volume,omitempty"`
+	PriceMode        string `json:"price_mode,omitempty"`
+	AdjustmentStatus string `json:"adjustment_status,omitempty"`
 }
 
 type SymbolInfo struct {
@@ -185,21 +161,6 @@ type KlineQuery struct {
 	PriceMode    string
 }
 
-type AdjustmentFactor struct {
-	Provider         string          `json:"provider"`
-	ProviderVersion  string          `json:"provider_version"`
-	Exchange         string          `json:"exchange"`
-	SourceMarket     string          `json:"source_market,omitempty"`
-	Symbol           string          `json:"symbol"`
-	AdjMode          string          `json:"adj_mode"`
-	EffectiveFromMS  int64           `json:"effective_from_ms"`
-	EffectiveToMS    int64           `json:"effective_to_ms"`
-	PriceMultiplier  float64         `json:"price_multiplier"`
-	VolumeMultiplier float64         `json:"volume_multiplier"`
-	EventType        string          `json:"event_type,omitempty"`
-	Raw              json.RawMessage `json:"raw,omitempty"`
-}
-
 type InstrumentChangeEvent struct {
 	Exchange     string          `json:"exchange"`
 	SourceMarket string          `json:"source_market,omitempty"`
@@ -212,7 +173,7 @@ type InstrumentChangeEvent struct {
 	CurrentJSON  json.RawMessage `json:"current_json,omitempty"`
 }
 
-// CorporateActionEvent is the durable lifecycle record for one adjustment.
+// CorporateActionEvent is the durable lifecycle record for one corporate action.
 // Raw exchange messages remain attached as evidence because Binance's CMS API
 // is public but unversioned.
 type CorporateActionEvent struct {
@@ -301,7 +262,7 @@ func NormalizePriceMode(value string) (string, error) {
 		mode = PriceModeRaw
 	}
 	switch mode {
-	case PriceModeRaw, PriceModeForwardAdjusted, PriceModeBackwardAdjusted:
+	case PriceModeRaw:
 		return mode, nil
 	default:
 		return "", fmt.Errorf("%w: %s", ErrUnsupportedPriceMode, value)
@@ -314,11 +275,6 @@ func MustNormalizePriceMode(value string) string {
 		panic(err)
 	}
 	return mode
-}
-
-func IsAdjustedPriceMode(value string) bool {
-	mode, err := NormalizePriceMode(value)
-	return err == nil && mode != PriceModeRaw
 }
 
 func InstrumentSignature(symbol SymbolInfo) string {
@@ -350,78 +306,10 @@ func InstrumentChangeEventType(previous SymbolInfo, current SymbolInfo) string {
 	}
 }
 
-func ApplyFactorToBar(bar Bar, factor AdjustmentFactor) Bar {
-	priceMultiplier := factor.PriceMultiplier
-	if priceMultiplier == 0 {
-		priceMultiplier = 1
-	}
-	volumeMultiplier := factor.VolumeMultiplier
-	if volumeMultiplier == 0 {
-		volumeMultiplier = 1
-	}
-	bar.RawOpenPrice = bar.OpenPrice
-	bar.RawHighPrice = bar.HighPrice
-	bar.RawLowPrice = bar.LowPrice
-	bar.RawClosePrice = bar.ClosePrice
-	bar.RawVolume = bar.Volume
-	bar.RawQuoteVolume = bar.QuoteVolume
-	bar.OpenPrice *= priceMultiplier
-	bar.HighPrice *= priceMultiplier
-	bar.LowPrice *= priceMultiplier
-	bar.ClosePrice *= priceMultiplier
-	bar.Volume *= volumeMultiplier
-	bar.QuoteVolume *= priceMultiplier * volumeMultiplier
-	bar.PriceMode = factor.AdjMode
-	bar.AdjustmentStatus = AdjustmentStatusAdjusted
-	bar.AdjustmentProvider = factor.Provider
-	bar.AdjustmentProviderVersion = factor.ProviderVersion
-	bar.AdjustmentEventType = factor.EventType
-	bar.PriceMultiplier = priceMultiplier
-	bar.VolumeMultiplier = volumeMultiplier
-	return DecorateBar(bar)
-}
-
-// BarAdjustmentTimestamp selects the regime in effect at the bar close. This
-// keeps a higher-timeframe bar that spans an adjustment boundary on the
-// post-event scale instead of applying the pre-event factor to the whole bar.
-func BarAdjustmentTimestamp(bar Bar) int64 {
-	if bar.EndMS > 0 {
-		return bar.EndMS
-	}
-	return bar.StartMS
-}
-
 func MarkBarAdjustmentStatus(bar Bar, priceMode string, status string) Bar {
 	bar.PriceMode = priceMode
 	bar.AdjustmentStatus = status
-	if status == AdjustmentStatusRaw {
-		bar.RawOpenPrice = 0
-		bar.RawHighPrice = 0
-		bar.RawLowPrice = 0
-		bar.RawClosePrice = 0
-		bar.RawVolume = 0
-		bar.RawQuoteVolume = 0
-	}
 	return DecorateBar(bar)
-}
-
-func ApplyFactorToTick(tick Tick, factor AdjustmentFactor) Tick {
-	priceMultiplier := factor.PriceMultiplier
-	if priceMultiplier == 0 {
-		priceMultiplier = 1
-	}
-	volumeMultiplier := factor.VolumeMultiplier
-	if volumeMultiplier == 0 {
-		volumeMultiplier = 1
-	}
-	tick.RawPrice = tick.Price
-	tick.RawSize = tick.Size
-	tick.Price *= priceMultiplier
-	tick.Size *= volumeMultiplier
-	tick.AdjustedPrice = tick.Price
-	tick.AdjustedSize = tick.Size
-	tick.PriceMode = factor.AdjMode
-	return tick
 }
 
 func relevantRawFields(raw json.RawMessage) map[string]any {

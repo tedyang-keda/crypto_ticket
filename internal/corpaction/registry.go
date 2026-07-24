@@ -1,7 +1,7 @@
 // Package corpaction holds the real-time corporate-action state shared between
-// the detection/derivation pipeline and the serving path. It is layer C of the
-// corporate-action handling: while a symbol is mid-rebase (before a factor is
-// confirmed) or on the exact bar that straddles a confirmed boundary, the
+// the detection pipeline and the serving path. While a symbol is mid-rebase
+// (before its boundary is confirmed) or on the exact bar that straddles a
+// confirmed boundary, the
 // serving path must mark the bar live_raw and suppress its spurious change so
 // the discontinuity is not treated as real volatility.
 package corpaction
@@ -17,7 +17,7 @@ import (
 // corporate-action-scale move during the pending phase.
 type Config struct {
 	// PendingTTL bounds the heuristic (magnitude-based) window between rebase
-	// detection and factor confirmation. Kept short so genuine large moves are
+	// detection and boundary confirmation. Kept short so genuine large moves are
 	// not suppressed for long.
 	PendingTTL time.Duration
 	// ResolvedTTL bounds how long a confirmed boundary keeps neutralizing the
@@ -44,7 +44,7 @@ func (c Config) withDefaults() Config {
 type window struct {
 	openedMS     int64
 	lastActiveMS int64
-	boundaryMS   int64 // 0 until a factor is confirmed
+	boundaryMS   int64 // 0 until the action boundary is confirmed
 }
 
 // Registry tracks active corporate-action windows per exchange:symbol. It is

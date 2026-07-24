@@ -2,9 +2,8 @@
 // instrument metadata. It detects instrument state transitions — in particular
 // corporate-action signals (rebase, split, pre-IPO share rebase, suspension,
 // delisting) on equity-like perpetuals — and emits them as candidate events for
-// the adjustment pipeline. This is layer A of the corporate-action handling:
-// detection only. Factor derivation and bar re-adjustment build on the events
-// surfaced here.
+// historical raw-repair workflow. This monitor only detects and records the
+// metadata transitions; official Kline repair is handled separately.
 //
 // WebSocket and REST-polling drivers feed the same snapshot-diff core. OKX uses
 // its instruments channel; Binance USDⓈ-M uses !contractInfo with exchangeInfo
@@ -48,7 +47,7 @@ type SymbolFetcher interface {
 }
 
 // EventSink receives corporate-action candidate events. Implementations may
-// log, persist, or forward them to the factor-derivation stage.
+// log, persist, or forward them to a repair scheduler.
 type EventSink interface {
 	HandleInstrumentEvent(ctx context.Context, event market.InstrumentChangeEvent) error
 }
@@ -411,7 +410,7 @@ func (m *Monitor) emitChange(ctx context.Context, previous market.SymbolInfo, cu
 	eventType, corporateAction := market.CorporateActionEventType(previous, current)
 	if !corporateAction {
 		// Non-corporate metadata drift: recorded via the snapshot/store update,
-		// but not escalated as an adjustment-pipeline candidate.
+		// but not escalated as a corporate-action repair candidate.
 		return
 	}
 	event := market.InstrumentChangeEvent{

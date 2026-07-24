@@ -24,18 +24,6 @@ type Config struct {
 	OKXInstrumentsWSURL               string
 	BinanceContractInfoWSURL          string
 	BinanceCMSURL                     string
-	EnableFactorDerivation            bool
-	FactorConfirmDelaySeconds         int
-	FactorDeriveIntervalSeconds       int
-	FactorLookbackSeconds             int
-	FactorMinMovePct                  float64
-	FactorMaxAttempts                 int
-	FactorMaxWaitSeconds              int
-	FactorUseOfficialKlines           bool
-	FactorOfficialDivergencePct       float64
-	FactorVerifyAnnouncement          bool
-	FactorAnnouncementTolerancePct    float64
-	FactorRequireAnnouncement         bool
 	CorpActionNeutralizePct           float64
 	CorpActionPendingTTLSeconds       int
 	CorpActionResolvedTTLSeconds      int
@@ -100,18 +88,6 @@ func Load() Config {
 		OKXInstrumentsWSURL:               env("OKX_PUBLIC_WS_URL", "wss://ws.okx.com:8443/ws/v5/public"),
 		BinanceContractInfoWSURL:          env("BINANCE_CONTRACT_INFO_WS_URL", "wss://fstream.binance.com/market/ws/!contractInfo"),
 		BinanceCMSURL:                     env("BINANCE_CMS_URL", "https://www.binance.com"),
-		EnableFactorDerivation:            envBool("ENABLE_FACTOR_DERIVATION", envBool("ENABLE_INSTRUMENT_MONITOR", enableCollector)),
-		FactorConfirmDelaySeconds:         envInt("FACTOR_CONFIRM_DELAY_SECONDS", 600),
-		FactorDeriveIntervalSeconds:       envInt("FACTOR_DERIVE_INTERVAL_SECONDS", 60),
-		FactorLookbackSeconds:             envInt("FACTOR_LOOKBACK_SECONDS", 21600),
-		FactorMinMovePct:                  envFloat("FACTOR_MIN_MOVE_PCT", 0.05),
-		FactorMaxAttempts:                 envInt("FACTOR_MAX_ATTEMPTS", 10),
-		FactorMaxWaitSeconds:              envInt("FACTOR_MAX_WAIT_SECONDS", 172800),
-		FactorUseOfficialKlines:           envBool("FACTOR_USE_OFFICIAL_KLINES", true),
-		FactorOfficialDivergencePct:       envFloat("FACTOR_OFFICIAL_DIVERGENCE_PCT", 0.02),
-		FactorVerifyAnnouncement:          envBool("FACTOR_VERIFY_ANNOUNCEMENT", true),
-		FactorAnnouncementTolerancePct:    envFloat("FACTOR_ANNOUNCEMENT_TOLERANCE_PCT", 0.05),
-		FactorRequireAnnouncement:         envBool("FACTOR_REQUIRE_ANNOUNCEMENT", false),
 		CorpActionNeutralizePct:           envFloat("CORP_ACTION_NEUTRALIZE_PCT", 0.15),
 		CorpActionPendingTTLSeconds:       envInt("CORP_ACTION_PENDING_TTL_SECONDS", 1800),
 		CorpActionResolvedTTLSeconds:      envInt("CORP_ACTION_RESOLVED_TTL_SECONDS", 93600),

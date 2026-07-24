@@ -4,9 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -58,26 +56,6 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			KEY idx_registry_asset_class (exchange, asset_class, rule_type, lifecycle_phase)
 			)`,
 		createBarHistoryTableStatement(time.Now().UTC()),
-		createAdjustedBarHistoryTableStatement(time.Now().UTC()),
-		`CREATE TABLE IF NOT EXISTS adjustment_factor (
-				provider VARCHAR(64) NOT NULL,
-				provider_version VARCHAR(64) NOT NULL,
-				exchange VARCHAR(16) NOT NULL,
-				source_market VARCHAR(48) NOT NULL DEFAULT '',
-				symbol VARCHAR(64) NOT NULL,
-				adj_mode VARCHAR(24) NOT NULL,
-				effective_from_ms BIGINT NOT NULL,
-				effective_to_ms BIGINT NOT NULL DEFAULT 0,
-				price_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
-				volume_multiplier DECIMAL(28, 12) NOT NULL DEFAULT 1,
-				event_type VARCHAR(32) NOT NULL DEFAULT '',
-				raw_json JSON NULL,
-				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-				PRIMARY KEY (provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
-				KEY idx_adjustment_lookup (exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms),
-				KEY idx_adjustment_event (event_type, updated_at)
-			)`,
 		`CREATE TABLE IF NOT EXISTS instrument_change_event (
 				id BIGINT NOT NULL AUTO_INCREMENT,
 				exchange VARCHAR(16) NOT NULL,
@@ -169,17 +147,6 @@ func createBarHistoryTableStatement(now time.Time) string {
 	partitionStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
 	return "CREATE TABLE IF NOT EXISTS bar_history (\n" +
 		barHistoryColumnsDDL() +
-		"\n)\n" +
-		BuildTimeframePartitionClause(TimeframePartitionOptions{
-			StartMonth: partitionStart,
-			Months:     12,
-		})
-}
-
-func createAdjustedBarHistoryTableStatement(now time.Time) string {
-	partitionStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	return "CREATE TABLE IF NOT EXISTS bar_history_adjusted (\n" +
-		adjustedBarHistoryColumnsDDL() +
 		"\n)\n" +
 		BuildTimeframePartitionClause(TimeframePartitionOptions{
 			StartMonth: partitionStart,
@@ -323,12 +290,8 @@ func (s *Store) CountBarsBefore(ctx context.Context, timeframe string, cutoffMS 
 }
 
 func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
-	priceMode, err := market.NormalizePriceMode(query.PriceMode)
-	if err != nil {
+	if _, err := market.NormalizePriceMode(query.PriceMode); err != nil {
 		return nil, err
-	}
-	if priceMode != market.PriceModeRaw {
-		return s.recentAdjustedBars(ctx, query, priceMode)
 	}
 	limit := query.Limit
 	if limit <= 0 {
@@ -353,7 +316,7 @@ func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]mark
 		if err != nil {
 			return nil, err
 		}
-		bars = append(bars, market.MarkBarAdjustmentStatus(bar, priceMode, market.AdjustmentStatusRaw))
+		bars = append(bars, market.MarkBarAdjustmentStatus(bar, market.PriceModeRaw, market.AdjustmentStatusRaw))
 	}
 	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
 		bars[i], bars[j] = bars[j], bars[i]
@@ -535,78 +498,6 @@ func (s *Store) InsertKlineGuardianEvents(ctx context.Context, events []market.K
 	return nil
 }
 
-func (s *Store) AdjustmentFactorAt(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, tsMS int64) (*market.AdjustmentFactor, error) {
-	priceMode, err := market.NormalizePriceMode(priceMode)
-	if err != nil {
-		return nil, err
-	}
-	if priceMode == market.PriceModeRaw {
-		return nil, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT provider, provider_version, exchange, source_market, symbol, adj_mode,
-		effective_from_ms, effective_to_ms, price_multiplier, volume_multiplier, event_type, raw_json
-		FROM adjustment_factor
-		WHERE exchange = ? AND symbol = ? AND adj_mode = ?
-		  AND (source_market = ? OR source_market = '' OR ? = '')
-		  AND effective_from_ms <= ? AND (effective_to_ms = 0 OR effective_to_ms >= ?)
-		ORDER BY CASE WHEN source_market = ? THEN 0 WHEN source_market = '' THEN 1 ELSE 2 END,
-			effective_from_ms DESC
-		LIMIT 1`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode,
-		sourceMarket, sourceMarket, tsMS, tsMS, sourceMarket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return nil, rows.Err()
-	}
-	factor, err := scanAdjustmentFactor(rows)
-	if err != nil {
-		return nil, err
-	}
-	return &factor, rows.Err()
-}
-
-func (s *Store) UpsertAdjustmentFactors(ctx context.Context, factors []market.AdjustmentFactor) error {
-	if len(factors) == 0 {
-		return nil
-	}
-	stmt := `INSERT INTO adjustment_factor
-		(provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms,
-		 price_multiplier, volume_multiplier, event_type, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-		 price_multiplier=VALUES(price_multiplier), volume_multiplier=VALUES(volume_multiplier),
-		 event_type=VALUES(event_type), raw_json=VALUES(raw_json)`
-	for _, factor := range factors {
-		mode, err := market.NormalizePriceMode(factor.AdjMode)
-		if err != nil {
-			return err
-		}
-		raw := any(nil)
-		if len(factor.Raw) > 0 {
-			raw = string(factor.Raw)
-		}
-		if _, err := s.db.ExecContext(ctx, stmt,
-			factor.Provider,
-			factor.ProviderVersion,
-			strings.ToLower(factor.Exchange),
-			factor.SourceMarket,
-			strings.ToUpper(factor.Symbol),
-			mode,
-			factor.EffectiveFromMS,
-			factor.EffectiveToMS,
-			nonZeroFloat(factor.PriceMultiplier, 1),
-			nonZeroFloat(factor.VolumeMultiplier, 1),
-			factor.EventType,
-			raw,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *Store) UpsertCorporateActionEvent(ctx context.Context, event market.CorporateActionEvent) error {
 	raw := any(nil)
 	if len(event.Raw) > 0 {
@@ -640,169 +531,6 @@ func (s *Store) UpsertCorporateActionEvent(ctx context.Context, event market.Cor
 	return err
 }
 
-func (s *Store) ListOpenCorporateActionEvents(ctx context.Context) ([]market.CorporateActionEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT action_id, exchange, source_market, symbol, event_type, state,
-		first_seen_ms, last_event_ms, resume_ms, boundary_ms, announced_ratio, attempts, last_error,
-		raw_json, updated_at_ms
-		FROM corporate_action_event
-		WHERE state NOT IN (?, ?, ?)
-		ORDER BY first_seen_ms ASC`, market.CorporateActionStateFactor, market.CorporateActionStateManualReview, market.CorporateActionStateNotRequired)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]market.CorporateActionEvent, 0)
-	for rows.Next() {
-		var event market.CorporateActionEvent
-		var raw sql.NullString
-		if err := rows.Scan(
-			&event.ActionID, &event.Exchange, &event.SourceMarket, &event.Symbol, &event.EventType, &event.State,
-			&event.FirstSeenMS, &event.LastEventMS, &event.ResumeMS, &event.BoundaryMS, &event.AnnouncedRatio,
-			&event.Attempts, &event.LastError, &raw, &event.UpdatedAtMS,
-		); err != nil {
-			return nil, err
-		}
-		if raw.Valid {
-			event.Raw = []byte(raw.String)
-		}
-		out = append(out, event)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) HasAdjustmentCoverage(ctx context.Context, exchange string, sourceMarket string, symbol string, startMS int64, endMS int64) (bool, error) {
-	filter := `exchange = ? AND symbol = ? AND event_type = ? AND state = ?
-		AND first_seen_ms <= ? AND last_event_ms >= ?`
-	args := []any{strings.ToLower(exchange), strings.ToUpper(symbol), market.CorporateActionEventHistoricalCoverage,
-		market.CorporateActionStateNotRequired, startMS, endMS}
-	if strings.TrimSpace(sourceMarket) != "" {
-		filter += " AND (source_market = ? OR source_market = '')"
-		args = append(args, sourceMarket)
-	}
-	var found int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM corporate_action_event WHERE `+filter+` LIMIT 1`, args...).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil && found == 1, err
-}
-
-func (s *Store) ListAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string) ([]market.AdjustmentFactor, error) {
-	priceMode, err := market.NormalizePriceMode(priceMode)
-	if err != nil {
-		return nil, err
-	}
-	if priceMode == market.PriceModeRaw {
-		return nil, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT provider, provider_version, exchange, source_market, symbol, adj_mode,
-		effective_from_ms, effective_to_ms, price_multiplier, volume_multiplier, event_type, raw_json
-		FROM adjustment_factor
-		WHERE exchange = ? AND symbol = ? AND adj_mode = ?
-		  AND (source_market = ? OR source_market = '')
-		ORDER BY effective_from_ms ASC`, strings.ToLower(exchange), strings.ToUpper(symbol), priceMode, sourceMarket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make([]market.AdjustmentFactor, 0)
-	for rows.Next() {
-		factor, err := scanAdjustmentFactor(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, factor)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) ReplaceAdjustmentFactors(ctx context.Context, exchange string, sourceMarket string, symbol string, priceMode string, factors []market.AdjustmentFactor) error {
-	mode, err := market.NormalizePriceMode(priceMode)
-	if err != nil {
-		return err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM adjustment_factor
-		WHERE exchange = ? AND symbol = ? AND adj_mode = ? AND (source_market = ? OR source_market = '')`,
-		strings.ToLower(exchange), strings.ToUpper(symbol), mode, sourceMarket); err != nil {
-		return err
-	}
-	stmt := `INSERT INTO adjustment_factor
-		(provider, provider_version, exchange, source_market, symbol, adj_mode, effective_from_ms, effective_to_ms,
-		 price_multiplier, volume_multiplier, event_type, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	for _, factor := range factors {
-		factorMode, err := market.NormalizePriceMode(factor.AdjMode)
-		if err != nil {
-			return err
-		}
-		raw := any(nil)
-		if len(factor.Raw) > 0 {
-			raw = string(factor.Raw)
-		}
-		if _, err := tx.ExecContext(ctx, stmt,
-			factor.Provider,
-			factor.ProviderVersion,
-			strings.ToLower(factor.Exchange),
-			factor.SourceMarket,
-			strings.ToUpper(factor.Symbol),
-			factorMode,
-			factor.EffectiveFromMS,
-			factor.EffectiveToMS,
-			nonZeroFloat(factor.PriceMultiplier, 1),
-			nonZeroFloat(factor.VolumeMultiplier, 1),
-			factor.EventType,
-			raw,
-		); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-func (s *Store) UpsertAdjustedBars(ctx context.Context, bars []market.Bar) error {
-	if len(bars) == 0 {
-		return nil
-	}
-	stmt := `INSERT INTO bar_history_adjusted
-		(exchange, source_market, symbol, adj_mode, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
-		 timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
-		 volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms,
-		 is_final, adjustment_status, adjustment_provider, adjustment_provider_version, adjustment_event_type,
-		 price_multiplier, volume_multiplier, raw_open_price, raw_high_price, raw_low_price, raw_close_price, raw_volume, raw_quote_volume)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-		 instrument_type=VALUES(instrument_type), asset_class=VALUES(asset_class), rule_type=VALUES(rule_type),
-		 lifecycle_phase=VALUES(lifecycle_phase), margin_type=VALUES(margin_type), end_ms=VALUES(end_ms),
-		 open_price=VALUES(open_price), high_price=VALUES(high_price), low_price=VALUES(low_price), close_price=VALUES(close_price),
-		 volume=VALUES(volume), volume_unit=VALUES(volume_unit), quote_volume=VALUES(quote_volume), quote_unit=VALUES(quote_unit),
-		 contract_volume=VALUES(contract_volume), trade_count=VALUES(trade_count), prev_close=VALUES(prev_close),
-		 chg=VALUES(chg), amp=VALUES(amp), last_tick_ms=VALUES(last_tick_ms), is_final=VALUES(is_final),
-		 adjustment_status=VALUES(adjustment_status), adjustment_provider=VALUES(adjustment_provider),
-		 adjustment_provider_version=VALUES(adjustment_provider_version), adjustment_event_type=VALUES(adjustment_event_type),
-		 price_multiplier=VALUES(price_multiplier), volume_multiplier=VALUES(volume_multiplier),
-		 raw_open_price=VALUES(raw_open_price), raw_high_price=VALUES(raw_high_price), raw_low_price=VALUES(raw_low_price),
-		 raw_close_price=VALUES(raw_close_price), raw_volume=VALUES(raw_volume), raw_quote_volume=VALUES(raw_quote_volume)`
-	for _, bar := range bars {
-		mode, err := market.NormalizePriceMode(bar.PriceMode)
-		if err != nil {
-			return err
-		}
-		if mode == market.PriceModeRaw {
-			continue
-		}
-		args := adjustedBarArgs(market.DecorateBar(bar), mode)
-		if _, err := s.db.ExecContext(ctx, stmt, args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func barArgs(bar market.Bar) []any {
 	return []any{
 		strings.ToLower(bar.Exchange),
@@ -834,111 +562,6 @@ func barArgs(bar market.Bar) []any {
 	}
 }
 
-func adjustedBarArgs(bar market.Bar, mode string) []any {
-	if bar.AdjustmentStatus == "" {
-		bar.AdjustmentStatus = market.AdjustmentStatusAdjusted
-	}
-	if bar.PriceMultiplier == 0 {
-		bar.PriceMultiplier = 1
-	}
-	if bar.VolumeMultiplier == 0 {
-		bar.VolumeMultiplier = 1
-	}
-	return []any{
-		strings.ToLower(bar.Exchange),
-		bar.SourceMarket,
-		strings.ToUpper(bar.Symbol),
-		mode,
-		bar.InstrumentType,
-		bar.AssetClass,
-		bar.RuleType,
-		bar.LifecyclePhase,
-		bar.MarginType,
-		bar.Timeframe,
-		bar.StartMS,
-		bar.EndMS,
-		bar.OpenPrice,
-		bar.HighPrice,
-		bar.LowPrice,
-		bar.ClosePrice,
-		bar.Volume,
-		bar.VolumeUnit,
-		bar.QuoteVolume,
-		bar.QuoteUnit,
-		bar.ContractVolume,
-		bar.TradeCount,
-		bar.PrevClose,
-		bar.Chg,
-		bar.Amp,
-		bar.LastTickMS,
-		bar.IsFinal,
-		bar.AdjustmentStatus,
-		bar.AdjustmentProvider,
-		bar.AdjustmentProviderVersion,
-		bar.AdjustmentEventType,
-		bar.PriceMultiplier,
-		bar.VolumeMultiplier,
-		bar.RawOpenPrice,
-		bar.RawHighPrice,
-		bar.RawLowPrice,
-		bar.RawClosePrice,
-		bar.RawVolume,
-		bar.RawQuoteVolume,
-	}
-}
-
-func (s *Store) recentAdjustedBars(ctx context.Context, query market.KlineQuery, priceMode string) ([]market.Bar, error) {
-	limit := query.Limit
-	if limit <= 0 {
-		limit = 300
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	rawQuery := query
-	rawQuery.PriceMode = market.PriceModeRaw
-	rawBars, err := s.recentRawBars(ctx, rawQuery, limit)
-	if err != nil {
-		return nil, err
-	}
-	if len(rawBars) == 0 {
-		return nil, nil
-	}
-	materialized, err := s.materializedAdjustedBarsInRange(ctx, query, priceMode, rawBars[0].StartMS, rawBars[len(rawBars)-1].StartMS)
-	if err != nil {
-		return nil, err
-	}
-	materializedByStart := make(map[int64]market.Bar, len(materialized))
-	for _, bar := range materialized {
-		materializedByStart[bar.StartMS] = bar
-	}
-	covered, err := s.HasAdjustmentCoverage(ctx, query.Exchange, query.SourceMarket, query.Symbol,
-		market.BarAdjustmentTimestamp(rawBars[0]), market.BarAdjustmentTimestamp(rawBars[len(rawBars)-1]))
-	if err != nil {
-		return nil, err
-	}
-	for i := range rawBars {
-		if bar, ok := materializedByStart[rawBars[i].StartMS]; ok {
-			rawBars[i] = bar
-			continue
-		}
-		factor, err := s.AdjustmentFactorAt(ctx, rawBars[i].Exchange, firstNonEmpty(query.SourceMarket, rawBars[i].SourceMarket), rawBars[i].Symbol, priceMode, market.BarAdjustmentTimestamp(rawBars[i]))
-		if err != nil {
-			return nil, err
-		}
-		if factor == nil {
-			status := market.AdjustmentStatusMissing
-			if covered {
-				status = market.AdjustmentStatusNotRequired
-			}
-			rawBars[i] = market.MarkBarAdjustmentStatus(rawBars[i], priceMode, status)
-			continue
-		}
-		rawBars[i] = market.ApplyFactorToBar(rawBars[i], *factor)
-	}
-	return recalculateDerived(rawBars), nil
-}
-
 func (s *Store) recentRawBars(ctx context.Context, query market.KlineQuery, limit int) ([]market.Bar, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+rawBarSelectColumns()+`
 		FROM bar_history
@@ -964,32 +587,6 @@ func (s *Store) recentRawBars(ctx context.Context, query market.KlineQuery, limi
 	return bars, rows.Err()
 }
 
-func (s *Store) materializedAdjustedBarsInRange(ctx context.Context, query market.KlineQuery, priceMode string, startMS int64, endMS int64) ([]market.Bar, error) {
-	filter := "exchange = ? AND symbol = ? AND adj_mode = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ?"
-	args := []any{strings.ToLower(query.Exchange), strings.ToUpper(query.Symbol), priceMode, query.Timeframe, startMS, endMS}
-	if strings.TrimSpace(query.SourceMarket) != "" {
-		filter += " AND source_market = ?"
-		args = append(args, query.SourceMarket)
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+adjustedBarSelectColumns()+`
-		FROM bar_history_adjusted
-		WHERE `+filter+`
-		ORDER BY start_ms ASC`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var bars []market.Bar
-	for rows.Next() {
-		bar, err := scanAdjustedBar(rows)
-		if err != nil {
-			return nil, err
-		}
-		bars = append(bars, market.DecorateBar(bar))
-	}
-	return bars, rows.Err()
-}
-
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -998,14 +595,6 @@ func rawBarSelectColumns() string {
 	return `exchange, source_market, symbol, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
 		timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
 		volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final`
-}
-
-func adjustedBarSelectColumns() string {
-	return `exchange, source_market, symbol, adj_mode, instrument_type, asset_class, rule_type, lifecycle_phase, margin_type,
-		timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
-		volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final,
-		adjustment_status, adjustment_provider, adjustment_provider_version, adjustment_event_type,
-		price_multiplier, volume_multiplier, raw_open_price, raw_high_price, raw_low_price, raw_close_price, raw_volume, raw_quote_volume`
 }
 
 func scanRawBar(row rowScanner) (market.Bar, error) {
@@ -1024,79 +613,6 @@ func scanRawBar(row rowScanner) (market.Bar, error) {
 	bar.IsFinal = isFinal
 	bar.Source = "mysql"
 	return market.DecorateBar(bar), nil
-}
-
-func scanAdjustedBar(row rowScanner) (market.Bar, error) {
-	var bar market.Bar
-	var isFinal bool
-	err := row.Scan(
-		&bar.Exchange, &bar.SourceMarket, &bar.Symbol, &bar.PriceMode, &bar.InstrumentType, &bar.AssetClass,
-		&bar.RuleType, &bar.LifecyclePhase, &bar.MarginType, &bar.Timeframe, &bar.StartMS, &bar.EndMS,
-		&bar.OpenPrice, &bar.HighPrice, &bar.LowPrice, &bar.ClosePrice, &bar.Volume, &bar.VolumeUnit,
-		&bar.QuoteVolume, &bar.QuoteUnit, &bar.ContractVolume, &bar.TradeCount, &bar.PrevClose,
-		&bar.Chg, &bar.Amp, &bar.LastTickMS, &isFinal, &bar.AdjustmentStatus,
-		&bar.AdjustmentProvider, &bar.AdjustmentProviderVersion, &bar.AdjustmentEventType,
-		&bar.PriceMultiplier, &bar.VolumeMultiplier, &bar.RawOpenPrice, &bar.RawHighPrice,
-		&bar.RawLowPrice, &bar.RawClosePrice, &bar.RawVolume, &bar.RawQuoteVolume,
-	)
-	if err != nil {
-		return bar, err
-	}
-	bar.IsFinal = isFinal
-	bar.Source = "mysql_adjusted"
-	return market.DecorateBar(bar), nil
-}
-
-func scanAdjustmentFactor(row rowScanner) (market.AdjustmentFactor, error) {
-	var factor market.AdjustmentFactor
-	var raw sql.NullString
-	err := row.Scan(
-		&factor.Provider, &factor.ProviderVersion, &factor.Exchange, &factor.SourceMarket, &factor.Symbol,
-		&factor.AdjMode, &factor.EffectiveFromMS, &factor.EffectiveToMS, &factor.PriceMultiplier,
-		&factor.VolumeMultiplier, &factor.EventType, &raw,
-	)
-	if err != nil {
-		return factor, err
-	}
-	if raw.Valid {
-		factor.Raw = []byte(raw.String)
-	}
-	return factor, nil
-}
-
-func recalculateDerived(bars []market.Bar) []market.Bar {
-	out := append([]market.Bar(nil), bars...)
-	var previousClose float64
-	for i := range out {
-		out[i].PrevClose = previousClose
-		if previousClose > 0 {
-			out[i].Chg = roundPercent((out[i].ClosePrice - previousClose) / previousClose * 100)
-		} else {
-			out[i].Chg = 0
-		}
-		if out[i].LowPrice > 0 {
-			out[i].Amp = roundPercent((out[i].HighPrice - out[i].LowPrice) / out[i].LowPrice * 100)
-		} else {
-			out[i].Amp = 0
-		}
-		previousClose = out[i].ClosePrice
-		out[i] = market.DecorateBar(out[i])
-	}
-	return out
-}
-
-func roundPercent(value float64) float64 {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0
-	}
-	return math.Round(value*1_000_000) / 1_000_000
-}
-
-func nonZeroFloat(value float64, fallback float64) float64 {
-	if value == 0 {
-		return fallback
-	}
-	return value
 }
 
 func nullableJSON(value string) any {

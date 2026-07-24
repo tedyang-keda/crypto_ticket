@@ -1,18 +1,16 @@
 import { create } from "zustand";
-import type { Bar, PriceMode, Tick } from "./types";
+import type { Bar, Tick } from "./types";
 
 type MarketState = {
   exchange: string;
   symbol: string;
   timeframe: string;
-  priceMode: PriceMode;
   latestTick: Tick | null;
   bars: Bar[];
   connection: "idle" | "connecting" | "open" | "closed";
   setExchange: (exchange: string) => void;
   setSymbol: (symbol: string) => void;
   setTimeframe: (timeframe: string) => void;
-  setPriceMode: (priceMode: PriceMode) => void;
   setLatestTick: (tick: Tick | null) => void;
   setBars: (bars: Bar[]) => void;
   updateBar: (bar: Bar) => void;
@@ -23,18 +21,15 @@ export const useMarketStore = create<MarketState>((set) => ({
   exchange: "binance",
   symbol: "BTCUSDT",
   timeframe: "1m",
-  priceMode: "raw",
   latestTick: null,
   bars: [],
   connection: "idle",
   setExchange: (exchange) => set({ exchange, symbol: exchange === "okx" ? "BTC-USDT-SWAP" : "BTCUSDT", latestTick: null, bars: [] }),
   setSymbol: (symbol) => set({ symbol, latestTick: null, bars: [] }),
   setTimeframe: (timeframe) => set({ timeframe, bars: [] }),
-  setPriceMode: (priceMode) => set({ priceMode, latestTick: null, bars: [] }),
   setLatestTick: (latestTick) =>
     set((state) => {
       if (!latestTick) return { latestTick };
-      if ((latestTick.price_mode || "raw") !== state.priceMode) return state;
       const exchange = latestTick.exchange.toLowerCase();
       const symbol = latestTick.symbol.toUpperCase();
       if (exchange !== state.exchange.toLowerCase() || symbol !== state.symbol.toUpperCase()) return state;
@@ -54,8 +49,7 @@ export const useMarketStore = create<MarketState>((set) => ({
       if (
         bar.exchange.toLowerCase() !== state.exchange.toLowerCase() ||
         bar.symbol.toUpperCase() !== state.symbol.toUpperCase() ||
-        bar.timeframe !== state.timeframe ||
-        (bar.price_mode || "raw") !== state.priceMode
+        bar.timeframe !== state.timeframe
       ) {
         return state;
       }

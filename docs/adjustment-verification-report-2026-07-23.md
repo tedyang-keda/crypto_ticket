@@ -15,7 +15,7 @@
 - Binance USD-M：`GET /fapi/v1/klines`
 - OKX：`GET /api/v5/market/history-candles`
 
-`backward_adjusted` 是系统额外提供的合成复权视图，不作为与官方 raw 历史接口对齐的验收依据。
+系统只提供官方 `raw` 口径，不再计算复权因子或提供 adjusted 视图。
 
 ## 样本
 
@@ -40,7 +40,7 @@ Binance 当前官方 15m 历史接口返回：
 | 跨边界桶 | 1784107800000 | 22.68 / 25.20 / 22.68 / 23.71 | 22.68 / 25.20 / 22.68 / 23.71 |
 | 边界后一桶 | 1784108700000 | 23.71 / 23.77 / 23.34 / 23.39 | 23.71 / 23.77 / 23.34 / 23.39 |
 
-因此 KORU 的正确结论是：我们的 raw 服务与 Binance 官方服务一致。官方公共历史接口没有把边界前所有 K 线统一除以 20；`24.0555` 只存在于我们的 `backward_adjusted` 视图中。
+因此 KORU 的正确结论是：我们的 raw 服务与 Binance 官方服务一致。官方公共历史接口没有把边界前所有 K 线统一除以 20，系统也不再自行构造这种复权价格。
 
 ## 验证中发现并修复的问题
 
@@ -97,16 +97,16 @@ ZHIPU 扩大到前后各 10 桶后，仍观察到 23 个字段差异：5m 11 个
 
 ## 运行检查
 
-- ZHIPU-USDT-SWAP：扫描范围内没有复权公告；adjusted 请求返回 `not_required`，但其高周期 raw 对照未全部通过，详见上文。
+- ZHIPU-USDT-SWAP：扫描范围内没有公司行动公告；其高周期 raw 对照未全部通过，详见上文。
 - OKX BTC-USDT-SWAP、Binance BTCUSDT：作为普通品种对照，10 个周期均通过。
-- 六个动作重复执行均返回 `SKIP existing`，同时会重新执行官方历史 raw 修复，不重复写因子。
+- 六个动作重复执行都会重新拉取并覆盖官方历史 raw 数据，审计事件保持幂等。
 - 本地 `go test ./...`、`go vet ./...`、`git diff --check` 全部通过。
 - `ticket` 已部署 `034eb56`，`crypto-ticket.service` 为 active；`hn3` 未操作。
 
 ## 当前覆盖范围
 
 - raw 官方对齐：动作品种在动作所在 UTC 日及边界上下文窗口覆盖 `1m` 到 `1D`。
-- adjusted：因子动态读取，跨边界桶从 adjusted 1m 物化到 `1D`。
+- API 仅提供 raw；旧 adjusted 请求会明确返回 `400`。
 - rename + rebase：SPACEX 历史使用后继品种 `SPCX-USDT-SWAP` 对齐。
 
 当前未覆盖：

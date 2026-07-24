@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -61,11 +60,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("scan %s announcements: %v", opts.exchange, err)
 	}
-	if !opts.dryRun {
-		if err := recordNoActionCoverage(ctx, store, opts, exchangeConfig, actions); err != nil {
-			log.Fatalf("record %s no-action coverage: %v", opts.exchange, err)
-		}
-	}
 	if len(actions) == 0 {
 		log.Printf("no %s corporate actions found range=[%d,%d] symbols=%v", opts.exchange, opts.startMS, opts.endMS, opts.symbols)
 		return
@@ -77,7 +71,6 @@ func main() {
 		DryRun:               opts.dryRun,
 	})
 	succeeded := 0
-	skipped := 0
 	failed := 0
 	for _, action := range actions {
 		result, err := backfiller.Backfill(ctx, action)
@@ -89,60 +82,17 @@ func main() {
 			}
 			log.Fatalf("backfill symbol=%s code=%s: %v", action.Symbol, action.AnnouncementCode, err)
 		}
-		if result.AlreadyExists {
-			skipped++
-			log.Printf("SKIP existing symbol=%s boundary=%d code=%s", action.Symbol, result.Boundary.BoundaryMS, action.AnnouncementCode)
-			continue
-		}
 		succeeded++
-		log.Printf("%s symbol=%s boundary=%d official_ratio=%.8f observed_ratio=%.8f factors=%d bars=%d code=%s",
+		log.Printf("%s symbol=%s boundary=%d official_ratio=%.8f observed_ratio=%.8f fetched=%d replaced=%d code=%s",
 			writeMode(opts.dryRun), action.Symbol, result.Boundary.BoundaryMS, action.Ratio,
-			result.Boundary.Ratio, len(result.Segments), result.BarsFetched, action.AnnouncementCode)
+			result.Boundary.Ratio, result.BarsFetched, result.RawBarsReplaced, action.AnnouncementCode)
 		if opts.requestDelay > 0 {
 			if err := wait(ctx, opts.requestDelay); err != nil {
 				log.Fatal(err)
 			}
 		}
 	}
-	log.Printf("done found=%d succeeded=%d existing=%d failed=%d dry_run=%v", len(actions), succeeded, skipped, failed, opts.dryRun)
-}
-
-func recordNoActionCoverage(ctx context.Context, store adjustment.HistoricalBackfillStore, opts options, exchangeConfig config.ExchangeConfig, actions []adjustment.HistoricalAction) error {
-	if opts.exchange != "okx" || len(opts.symbols) == 0 {
-		return nil
-	}
-	actionSymbols := make(map[string]bool, len(actions)*2)
-	for _, action := range actions {
-		actionSymbols[strings.ToUpper(action.Symbol)] = true
-		if action.PredecessorSymbol != "" {
-			actionSymbols[strings.ToUpper(action.PredecessorSymbol)] = true
-		}
-	}
-	sourceMarket := market.SourceMarket(opts.exchange, exchangeConfig.MarketType)
-	for _, requested := range opts.symbols {
-		symbol := strings.ToUpper(strings.TrimSpace(requested))
-		if opts.exchange == "okx" {
-			symbol = exchange.NormalizeOKXInstrumentID(symbol)
-		}
-		if symbol == "" || actionSymbols[symbol] {
-			continue
-		}
-		raw, _ := json.Marshal(map[string]any{
-			"method": "historical_announcement_scan", "exchange": opts.exchange,
-			"start_ms": opts.startMS, "end_ms": opts.endMS, "result": "no_corporate_action",
-		})
-		event := market.CorporateActionEvent{
-			ActionID: fmt.Sprintf("%s|%s|%s|coverage|%d|%d", opts.exchange, sourceMarket, symbol, opts.startMS, opts.endMS),
-			Exchange: opts.exchange, SourceMarket: sourceMarket, Symbol: symbol,
-			EventType: market.CorporateActionEventHistoricalCoverage, State: market.CorporateActionStateNotRequired,
-			FirstSeenMS: opts.startMS, LastEventMS: opts.endMS, Raw: raw, UpdatedAtMS: market.NowMS(),
-		}
-		if err := store.UpsertCorporateActionEvent(ctx, event); err != nil {
-			return err
-		}
-		log.Printf("COVERED no-action symbol=%s range=[%d,%d]", symbol, opts.startMS, opts.endMS)
-	}
-	return nil
+	log.Printf("done found=%d repaired=%d failed=%d dry_run=%v", len(actions), succeeded, failed, opts.dryRun)
 }
 
 func parseOptions() (options, error) {
@@ -158,7 +108,7 @@ func parseOptions() (options, error) {
 	flag.IntVar(&out.maxPages, "max-pages", 50, "maximum announcement pages to scan")
 	flag.IntVar(&requestDelayMS, "request-delay-ms", 200, "delay between announcement requests")
 	flag.Float64Var(&out.boundaryTolerancePct, "boundary-tolerance-pct", 0.25, "maximum observed/official ratio divergence as a fraction")
-	flag.BoolVar(&out.dryRun, "dry-run", false, "calculate and log without writing bars, factors, or events")
+	flag.BoolVar(&out.dryRun, "dry-run", false, "calculate and log without replacing bars or writing events")
 	flag.BoolVar(&out.continueOnError, "continue-on-error", false, "continue when one announcement cannot be backfilled")
 	flag.Parse()
 	out.exchange = strings.ToLower(strings.TrimSpace(out.exchange))

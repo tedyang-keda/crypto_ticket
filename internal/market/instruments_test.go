@@ -55,36 +55,3 @@ func TestClassifyOKXSymbolUsesCategoryAndRuleType(t *testing.T) {
 		t.Fatalf("unexpected pre-market classification: %+v", preMarket)
 	}
 }
-
-func TestApplyFactorToBarUpdatesPriceAndVolume(t *testing.T) {
-	bar := Bar{
-		Exchange:    "binance",
-		Symbol:      "TSLAUSDT",
-		Timeframe:   "1m",
-		StartMS:     1,
-		EndMS:       59_999,
-		OpenPrice:   100,
-		HighPrice:   110,
-		LowPrice:    90,
-		ClosePrice:  104,
-		Volume:      10,
-		QuoteVolume: 1000,
-	}
-	adjusted := ApplyFactorToBar(bar, AdjustmentFactor{
-		Provider:         "vendor",
-		ProviderVersion:  "v1",
-		AdjMode:          PriceModeBackwardAdjusted,
-		PriceMultiplier:  0.5,
-		VolumeMultiplier: 2,
-		EventType:        "split",
-	})
-	if adjusted.OpenPrice != 50 || adjusted.HighPrice != 55 || adjusted.ClosePrice != 52 {
-		t.Fatalf("unexpected adjusted prices: %+v", adjusted)
-	}
-	if adjusted.Volume != 20 || adjusted.QuoteVolume != 1000 {
-		t.Fatalf("unexpected adjusted volumes: %+v", adjusted)
-	}
-	if adjusted.RawOpenPrice != 100 || adjusted.RawVolume != 10 || adjusted.AdjustmentStatus != AdjustmentStatusAdjusted {
-		t.Fatalf("unexpected adjustment metadata: %+v", adjusted)
-	}
-}

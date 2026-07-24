@@ -182,7 +182,7 @@ func ApplyClassificationFieldsToSymbol(symbol SymbolInfo, classification Instrum
 
 // IsEquityLikeAssetClass reports whether an asset class is subject to
 // corporate actions (splits, ex-dividend, pre-IPO share rebase) and therefore
-// eligible for the adjustment pipeline. Crypto is deliberately excluded.
+// eligible for corporate-action handling. Crypto is deliberately excluded.
 func IsEquityLikeAssetClass(assetClass string) bool {
 	switch strings.ToLower(strings.TrimSpace(assetClass)) {
 	case AssetClassEquity, AssetClassKREquity, AssetClassPreMarket, AssetClassIndex, AssetClassCommodity:
@@ -194,7 +194,7 @@ func IsEquityLikeAssetClass(assetClass string) bool {
 
 // CorporateActionEventType classifies a transition between two snapshots of the
 // same instrument as a corporate-action candidate, returning the event type and
-// true when the change warrants adjustment-pipeline attention. It only fires for
+// true when the change warrants corporate-action repair attention. It only fires for
 // equity-like instruments so ordinary crypto churn is ignored.
 func CorporateActionEventType(previous SymbolInfo, current SymbolInfo) (string, bool) {
 	if !IsEquityLikeAssetClass(current.AssetClass) && !IsEquityLikeAssetClass(previous.AssetClass) {

@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"crypto-ticket/internal/adjustment"
 	"crypto-ticket/internal/api"
 	"crypto-ticket/internal/app"
 	"crypto-ticket/internal/collector"
@@ -73,7 +72,6 @@ func main() {
 		for _, spec := range cfg.InstrumentAliases {
 			aliasRegistry.Link(spec.Exchange, "", spec.Successor, spec.Predecessor, 0)
 		}
-		marketService.SetAliasResolver(aliasRegistry)
 		if len(cfg.InstrumentAliases) > 0 {
 			log.Printf("seeded %d instrument rename aliases", len(cfg.InstrumentAliases))
 		}
@@ -123,46 +121,6 @@ func startBackgroundWorkers(
 	}
 	if cfg.EnableInstrumentMonitor {
 		var sink instrument.EventSink = instrument.LogSink{}
-		if cfg.EnableFactorDerivation {
-			deriver := adjustment.New(store, store, adjustment.Config{
-				ConfirmDelay:             time.Duration(cfg.FactorConfirmDelaySeconds) * time.Second,
-				Interval:                 time.Duration(cfg.FactorDeriveIntervalSeconds) * time.Second,
-				Lookback:                 time.Duration(cfg.FactorLookbackSeconds) * time.Second,
-				MinMovePct:               cfg.FactorMinMovePct,
-				MaxAttempts:              cfg.FactorMaxAttempts,
-				MaxWait:                  time.Duration(cfg.FactorMaxWaitSeconds) * time.Second,
-				OfficialDivergencePct:    cfg.FactorOfficialDivergencePct,
-				AnnouncementTolerancePct: cfg.FactorAnnouncementTolerancePct,
-				RequireAnnouncement:      cfg.FactorRequireAnnouncement,
-			})
-			if corpRegistry != nil {
-				deriver.SetRegistry(corpRegistry)
-			}
-			if aliasRegistry != nil {
-				deriver.SetAliasResolver(aliasRegistry)
-			}
-			if cfg.FactorUseOfficialKlines {
-				if official := makeOfficialKlineSource(cfg); official != nil {
-					deriver.SetOfficialSource(official)
-					log.Printf("adjustment factor deriver using official REST klines (divergence>%.3f flagged)", cfg.FactorOfficialDivergencePct)
-				}
-			}
-			if cfg.FactorVerifyAnnouncement {
-				if verifier := makeAnnouncementVerifier(cfg); verifier != nil {
-					deriver.SetAnnouncementVerifier(verifier)
-					log.Printf("adjustment factor deriver cross-checking announcements (tolerance=%.3f strict=%v)",
-						cfg.FactorAnnouncementTolerancePct, cfg.FactorRequireAnnouncement)
-				}
-			}
-			sink = deriver
-			go func() {
-				if err := deriver.Run(ctx); err != nil && ctx.Err() == nil {
-					errCh <- err
-				}
-			}()
-			log.Printf("adjustment factor deriver started confirm_delay=%ds min_move=%.3f",
-				cfg.FactorConfirmDelaySeconds, cfg.FactorMinMovePct)
-		}
 		monitors := makeInstrumentMonitors(cfg, store, sink, aliasRegistry)
 		for _, monitor := range monitors {
 			monitor := monitor
@@ -309,95 +267,6 @@ func makeBinancePollingMonitors(cfg config.Config, sink instrument.EventSink, al
 		monitors = append(monitors, monitor)
 	}
 	return monitors
-}
-
-// officialKlineSource adapts the exchange REST kline fetchers to the deriver's
-// OfficialKlineSource interface, keyed by source market (exchange:marketType).
-type officialKlineSource struct {
-	fetchers map[string]exchange.RESTKlineFetcher
-	client   *http.Client
-}
-
-func (s *officialKlineSource) FetchOfficialKlines(ctx context.Context, _ string, sourceMarket string, symbol string, timeframe string, startMS int64, endMS int64) ([]market.Bar, error) {
-	fetcher, ok := s.fetchers[sourceMarket]
-	if !ok {
-		return nil, nil
-	}
-	return fetcher.FetchKlines(ctx, s.client, exchange.KlineRequest{
-		Symbol:    symbol,
-		Timeframe: timeframe,
-		StartMS:   startMS,
-		EndMS:     endMS,
-	})
-}
-
-// makeOfficialKlineSource builds the authoritative REST kline source used to
-// derive factors from trusted exchange data and flag local store divergence.
-func makeOfficialKlineSource(cfg config.Config) *officialKlineSource {
-	fetchers := make(map[string]exchange.RESTKlineFetcher)
-	for _, exchangeConfig := range cfg.Exchanges {
-		if !exchangeConfig.Enabled {
-			continue
-		}
-		var fetcher exchange.RESTKlineFetcher
-		switch exchangeConfig.Name {
-		case "binance":
-			fetcher = exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
-		case "okx":
-			fetcher = exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL)
-		}
-		if fetcher == nil {
-			continue
-		}
-		fetchers[market.SourceMarket(fetcher.Name(), fetcher.MarketType())] = fetcher
-	}
-	if len(fetchers) == 0 {
-		return nil
-	}
-	return &officialKlineSource{fetchers: fetchers, client: &http.Client{Timeout: 20 * time.Second}}
-}
-
-// multiAnnouncementVerifier dispatches announcement cross-checks to the
-// per-exchange verifier. Exchanges without a verifier degrade to "not found"
-// (lenient), so they never block a factor.
-type multiAnnouncementVerifier struct {
-	okx     *exchange.OKXAnnouncementVerifier
-	binance *exchange.BinanceAnnouncementVerifier
-}
-
-func (m *multiAnnouncementVerifier) VerifyCorporateAction(ctx context.Context, exchangeName string, sourceMarket string, symbol string, boundaryMS int64) (bool, float64, bool) {
-	switch strings.ToLower(exchangeName) {
-	case "binance":
-		if m.binance != nil {
-			return m.binance.VerifyCorporateAction(ctx, exchangeName, sourceMarket, symbol, boundaryMS)
-		}
-	case "okx":
-		if m.okx != nil {
-			return m.okx.VerifyCorporateAction(ctx, exchangeName, sourceMarket, symbol, boundaryMS)
-		}
-	}
-	return false, 0, false
-}
-
-// makeAnnouncementVerifier builds the announcement cross-check dispatcher.
-func makeAnnouncementVerifier(cfg config.Config) *multiAnnouncementVerifier {
-	client := &http.Client{Timeout: 20 * time.Second}
-	verifier := &multiAnnouncementVerifier{}
-	for _, exchangeConfig := range cfg.Exchanges {
-		if !exchangeConfig.Enabled {
-			continue
-		}
-		if exchangeConfig.Name == "okx" && verifier.okx == nil {
-			verifier.okx = exchange.NewOKXAnnouncementVerifier(exchangeConfig.RestURL, client)
-		}
-		if exchangeConfig.Name == "binance" && !strings.Contains(strings.ToLower(exchangeConfig.MarketType), "coin") && verifier.binance == nil {
-			verifier.binance = exchange.NewBinanceAnnouncementVerifier(cfg.BinanceCMSURL, client)
-		}
-	}
-	if verifier.okx == nil && verifier.binance == nil {
-		return nil
-	}
-	return verifier
 }
 
 func makeKlineGuardianFetchers(configs []config.ExchangeConfig) []guardian.Fetcher {
