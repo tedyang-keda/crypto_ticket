@@ -27,10 +27,15 @@ type MarketService struct {
 	liveBars       map[string]market.Bar
 	finalObservers []FinalBarObserver
 	corpGuard      CorporateActionGuard
+	officialKlines OfficialKlineSource
 }
 
 type FinalBarObserver interface {
 	ObserveFinalBar(ctx context.Context, bar market.Bar) error
+}
+
+type OfficialKlineSource interface {
+	LatestKline(ctx context.Context, exchange string, symbol string, timeframe string) (*market.Bar, error)
 }
 
 // CorporateActionGuard reports, for a bar, whether it straddles an active
@@ -61,6 +66,30 @@ func (s *MarketService) SetCorporateActionGuard(guard CorporateActionGuard) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.corpGuard = guard
+}
+
+func (s *MarketService) SetOfficialKlineSource(source OfficialKlineSource) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.officialKlines = source
+}
+
+func (s *MarketService) PublishOfficialLiveKline(ctx context.Context, bar market.Bar) error {
+	bar = normalizeBar(bar)
+	if bar.IsFinal || !validBar(bar) {
+		return nil
+	}
+	bar.Source = "official_rest_live"
+	bar.Reason = "official_current_kline"
+	enriched, err := s.enrichBar(ctx, bar)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.liveBars[barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe)] = enriched
+	s.mu.Unlock()
+	s.publishBar(enriched)
+	return nil
 }
 
 func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
@@ -356,6 +385,12 @@ func sourceBarsComplete(bars []market.Bar, sourceTF string, targetStart int64, t
 }
 
 func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market.Bar) error {
+	s.mu.RLock()
+	officialKlines := s.officialKlines
+	s.mu.RUnlock()
+	if officialKlines != nil {
+		return nil
+	}
 	nowMS := market.NowMS()
 	for _, tf := range timeframe.Order {
 		if tf == aggregator.OneMinute {
@@ -501,6 +536,22 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 	}
 	if !query.IncludeLive {
 		return trimBars(bars, query.Limit), nil
+	}
+	if query.Timeframe != aggregator.OneMinute {
+		s.mu.RLock()
+		officialKlines := s.officialKlines
+		s.mu.RUnlock()
+		if officialKlines != nil {
+			live, fetchErr := officialKlines.LatestKline(ctx, query.Exchange, query.Symbol, query.Timeframe)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			if live != nil && !live.IsFinal {
+				normalized := normalizeBar(*live)
+				return trimBars(mergeLiveBar(bars, &normalized), query.Limit+1), nil
+			}
+			return trimBars(bars, query.Limit), nil
+		}
 	}
 	live := s.liveOneMinute(query.Exchange, query.Symbol)
 	if live == nil {

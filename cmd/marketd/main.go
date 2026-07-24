@@ -57,6 +57,8 @@ func main() {
 
 	hub := realtime.NewHub()
 	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit)
+	officialLiveSource := collector.NewOfficialLiveSource(makeOfficialLiveFetchers(cfg.Exchanges))
+	marketService.SetOfficialKlineSource(officialLiveSource)
 	server := api.NewServer(marketService, hub, cfg.DashboardDir)
 
 	var corpRegistry *corpaction.Registry
@@ -78,7 +80,7 @@ func main() {
 	}
 
 	errCh := make(chan error, 8)
-	startBackgroundWorkers(ctx, cfg, store, marketService, corpRegistry, aliasRegistry, errCh)
+	startBackgroundWorkers(ctx, cfg, store, hub, marketService, officialLiveSource, corpRegistry, aliasRegistry, errCh)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: server.Handler()}
 	go func() {
 		log.Printf("marketd listening on http://%s", cfg.HTTPAddr)
@@ -104,11 +106,20 @@ func startBackgroundWorkers(
 	ctx context.Context,
 	cfg config.Config,
 	store storage.HistoricalStore,
+	hub *realtime.Hub,
 	marketService *app.MarketService,
+	officialLiveSource *collector.OfficialLiveSource,
 	corpRegistry *corpaction.Registry,
 	aliasRegistry *corpaction.AliasRegistry,
 	errCh chan<- error,
 ) {
+	officialLiveRunner := collector.NewOfficialLiveRunner(hub, officialLiveSource, marketService, 2*time.Second)
+	go func() {
+		if err := officialLiveRunner.Run(ctx); err != nil && ctx.Err() == nil {
+			errCh <- err
+		}
+	}()
+	log.Printf("official live kline relay started interval=2s")
 	if cfg.EnableCollector {
 		runtimes := makeCollectorRuntimes(cfg.Exchanges, cfg)
 		runner := collector.NewRunner(runtimes, store, marketService)
@@ -176,6 +187,28 @@ func startBackgroundWorkers(
 			cfg.KlineGuardianDelaySeconds,
 		)
 	}
+}
+
+func makeOfficialLiveFetchers(configs []config.ExchangeConfig) []exchange.RESTKlineFetcher {
+	fetchers := make([]exchange.RESTKlineFetcher, 0, len(configs))
+	for _, exchangeConfig := range configs {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		switch exchangeConfig.Name {
+		case "binance":
+			if strings.Contains(strings.ToLower(exchangeConfig.MarketType), "coin") {
+				continue
+			}
+			fetchers = append(fetchers, exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		case "okx":
+			if !strings.EqualFold(exchangeConfig.MarketType, "SWAP") {
+				continue
+			}
+			fetchers = append(fetchers, exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		}
+	}
+	return fetchers
 }
 
 func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) []collector.Runtime {

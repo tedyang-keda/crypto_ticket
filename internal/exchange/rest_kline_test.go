@@ -83,6 +83,42 @@ func TestOKXFetchKlinesUsesBaseAndQuoteVolumeFields(t *testing.T) {
 	}
 }
 
+func TestOKXFetchKlinesIncludesForwardAdjustedIncompleteBar(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Query().Get("adjust"); got != "forward" {
+			t.Fatalf("expected adjust=forward, got %q", got)
+		}
+		return jsonResponse(`{"code":"0","data":[["1779340000000","20","21","19","20.5","10","10","205","0"]]}`), nil
+	})}
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "KORU-USDT-SWAP", Timeframe: "1W", Limit: 1,
+		ForwardAdjusted: true, IncludeIncomplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 || bars[0].IsFinal || bars[0].OpenPrice != 20 {
+		t.Fatalf("unexpected incomplete bar: %+v", bars)
+	}
+}
+
+func TestBinanceFetchKlinesIncludesIncompleteBar(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResponse(`[[1779340000000,"20","21","19","20.5","10",1999999999999,"205",7]]`), nil
+	})}
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "KORUUSDT", Timeframe: "1W", Limit: 1, IncludeIncomplete: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 || bars[0].IsFinal || bars[0].ClosePrice != 20.5 {
+		t.Fatalf("unexpected incomplete bar: %+v", bars)
+	}
+}
+
 func TestOKXFetchKlinesUsesUTCSessionIntervals(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if got := r.URL.Query().Get("bar"); got != "1Dutc" {

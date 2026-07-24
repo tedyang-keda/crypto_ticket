@@ -2,6 +2,8 @@ package realtime
 
 import (
 	"encoding/json"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -19,6 +21,12 @@ type Subscriber struct {
 	mu       sync.RWMutex
 	channels map[string]struct{}
 	events   chan market.Event
+}
+
+type KlineSubscription struct {
+	Exchange  string
+	Symbol    string
+	Timeframe string
 }
 
 func NewHub() *Hub {
@@ -62,6 +70,37 @@ func (h *Hub) HasSubscribers(channel string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Hub) KlineSubscriptions() []KlineSubscription {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	deduplicated := make(map[string]KlineSubscription)
+	for sub := range h.subscribers {
+		sub.mu.RLock()
+		for channel := range sub.channels {
+			parts := strings.SplitN(channel, ":", 4)
+			if len(parts) != 4 || parts[0] != "kline" {
+				continue
+			}
+			deduplicated[channel] = KlineSubscription{Exchange: parts[1], Symbol: parts[2], Timeframe: parts[3]}
+		}
+		sub.mu.RUnlock()
+	}
+	out := make([]KlineSubscription, 0, len(deduplicated))
+	for _, subscription := range deduplicated {
+		out = append(out, subscription)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Exchange != out[j].Exchange {
+			return out[i].Exchange < out[j].Exchange
+		}
+		if out[i].Symbol != out[j].Symbol {
+			return out[i].Symbol < out[j].Symbol
+		}
+		return out[i].Timeframe < out[j].Timeframe
+	})
+	return out
 }
 
 func (s *Subscriber) Add(channel string) {

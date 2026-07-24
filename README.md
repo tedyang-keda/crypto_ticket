@@ -1,6 +1,6 @@
 # crypto-ticket
 
-`crypto-ticket` 当前主链路是 Go 版实时行情服务 `cmd/marketd` 加 React dashboard。它直接订阅 Binance / OKX 官方 `1m` kline WebSocket，把未完成的 `1m` K 线保存在进程内存，把已完成的官方 `1m` K 线写入 store，并用已完成的 `1m` K 线合成更高周期。
+`crypto-ticket` 当前主链路是 Go 版实时行情服务 `cmd/marketd` 加 React dashboard。它直接订阅 Binance / OKX 官方 `1m` kline WebSocket，把未完成的 `1m` K 线保存在进程内存，把已完成的官方 `1m` K 线写入 store。高周期当前 K 线直接读取交易所官方目标周期接口，避免本地 `1m` 合成结果与交易所独立维护的高周期 K 线不一致。
 
 旧的 Python 模块、归档脚本和 Redis kline cache 清理工具仍在仓库中，但 `marketd` 的实时主链路不再使用 Redis Streams，也不再用 tick 自行聚合 `1m`。
 
@@ -14,7 +14,6 @@ Binance / OKX official 1m kline WebSocket
            保存到进程内 liveBars
            每次收到官方推送都转发 1m kline WS event
            同时推送 ticker WS event，price = 当前 1m close
-           如果有高周期 WS 订阅者，实时合成并推送对应高周期 live kline
       -> final 1m:
            同步写入 store，MySQL 模式下写 bar_history
            推送 final 1m kline + ticker WS event
@@ -26,10 +25,15 @@ Binance / OKX official 1m kline WebSocket
            定时用近窗口 REST official 1m kline 校验/修复 MySQL
            修复后复用 MarketService 入库、推送和级联 rollup
 
+Active high-timeframe WS subscriptions
+  -> 每 2 秒读取交易所官方目标周期当前 K 线
+  -> OKX SWAP 请求固定使用 adjust=forward；Binance 使用官方 futures kline
+  -> 仅在字段变化时推送 high-timeframe live kline
+
 HTTP /api/v1/klines?include_live=true
   -> 读取 store 中已持久化的目标周期 bars
   -> 如有当前 live 1m，则把 live bar 合并进去
-  -> 对高周期请求，会按级联源周期合成当前未完成高周期
+  -> 对高周期请求，直接读取交易所官方目标周期当前 K 线
 ```
 
 关键结论：
@@ -39,8 +43,8 @@ HTTP /api/v1/klines?include_live=true
 - Redis 只在 `cmd/backfill_klines` 中用于清理旧的 `kline:*` / `livebar:*` cache key。
 - MySQL 中存的是 final bar。实时未完成 `1m` 只在当前 Go 进程内。
 - HTTP 可以读不同 timeframe 的行情；默认会包含当前未完成行情。
-- WS 会推 `1m` live，也会对当前有订阅者的高周期实时合成并推送 live bar。
-- 高周期 final/live rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。
+- WS 会推交易所官方 `1m` live；对当前有订阅者的高周期，每 2 秒查询并推送官方目标周期 live bar。
+- 高周期 final rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。公司行动窗口由官方目标周期回填覆盖。
 - Kline guardian 不从 trade 重算 OHLCV；它只用交易所官方 REST kline 校验和修复官方 WS 可能漏掉的 final `1m`。
 
 ## 品种分类与公司行动修复
@@ -160,7 +164,7 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | symbol 之间 REST 请求节流 |
 | `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` | `600` | 只审计最近被 collector 刷新过的 active symbol，避免旧脏 symbol 进入 REST 校验 |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
-| `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
+| `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；高周期 live WS 只轮询当前有订阅者的官方目标周期 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
 | `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | OKX 订阅刷新间隔；Binance static streams 只在重连时重新拉 symbols |
@@ -232,7 +236,7 @@ OKX 订阅：
 - 保存到进程内 `liveBars`，key 为 `exchange:symbol:timeframe`。
 - 每次收到官方 kline update 都推送 `1m` `kline` event。
 - 对 `1m` bar 还会推送 `ticker` event，ticker 的 price 来自当前 bar 的 close。
-- 如果该 symbol 有 `5m` / `1H` / `1D` 等高周期 kline WS 订阅者，会查询当前周期内已完成 `1m`，加上这根 live `1m`，实时合成高周期 live bar 并推送。
+- 不再用这根 `1m` 本地合成高周期 live bar。高周期 WS 由独立轮询器读取官方目标周期当前 K 线；OKX SWAP 固定传 `adjust=forward`。
 - 不写 MySQL。
 
 final `1m`：
@@ -396,7 +400,7 @@ WS 时效性：
 - final `1m` 会先写 store，写成功后再推送。
 - `ticker` 基于 `1m` kline 的 close，不是逐笔 trade tick。
 - 高周期 final bar 在周期结束且对应源周期 final bar 入库后级联生成并推送，例如 `1D <- 1H`、`1M/3M <- 1D`。
-- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时实时级联合成并通过 WS 推送。live 合成覆盖全部支持周期，不受 `MARKET_TIMEFRAMES` 限制；为避免全市场无意义 DB 查询，没有订阅者的高周期不会主动合成。
+- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时每 2 秒读取一次官方目标周期接口并通过 WS 推送；相同快照不会重复推送。该路径不受 `MARKET_TIMEFRAMES` 限制，没有订阅者的高周期不会发起 REST 请求。
 - 服务端每 15 秒发送一次 `{"op":"ping"}`；客户端发送 `{"op":"ping"}` 时服务端返回 `{"op":"pong"}`。
 - 每个 subscriber 的事件队列大小是 256；客户端消费太慢时，新事件会被丢弃，不做阻塞和重放。因此前端应该先 HTTP 拉快照，再接 WS 增量。
 - 当前 WS 只有 subscribe，没有 unsubscribe。前端切换 symbol/timeframe 时会关闭旧连接并重新连接。
@@ -441,15 +445,15 @@ curl 'http://127.0.0.1:8088/api/v1/klines?exchange=binance&symbol=BTCUSDT&timefr
 `include_live=true` 时的返回逻辑：
 
 - `timeframe=1m`：读取 store 中最近 final `1m`，再合并当前进程内 live `1m`。如果 live bar 是新一根，返回数量可能是 `limit + 1`。
-- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再按级联源周期临时合成一根未完成高周期 bar 并合并返回。
-- 如果当前进程刚启动且还没收到 live `1m`，则只能返回 store 中已有 final bars。
+- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再请求交易所官方目标周期当前 K 线并合并返回。OKX SWAP 使用 `adjust=forward`；Binance 使用官方 futures kline（官方没有复权参数）。
+- 官方高周期请求失败时接口返回错误，不会静默退回本地 `1m` 合成口径。
 - `include_live=false` 时，只返回 store 中已持久化 bars。
 
 现在访问能拿到什么：
 
 - `/api/v1/ticker/latest`：能拿到当前进程最后收到的 live `1m` close；没有 live 时拿最近 final `1m`。
 - `/api/v1/klines&timeframe=1m&include_live=true`：能拿到历史 final `1m` + 当前未完成 `1m`。
-- `/api/v1/klines&timeframe=5m/1H/...&include_live=true`：能拿到历史 final 高周期 + 当前未完成高周期，当前未完成高周期是在请求时按级联源周期合成的。
+- `/api/v1/klines&timeframe=5m/1H/...&include_live=true`：能拿到历史 final 高周期 + 交易所官方目标周期的当前未完成 K 线。
 - `/api/v1/klines&include_live=false`：只能拿到已经入库的 final bars，最新数据至少落后到最近一次周期收盘。
 
 Symbols：
@@ -622,7 +626,7 @@ livebar:{exchange}:{symbol}:{timeframe}
 
 - 没有 Redis / Kafka 这样的实时缓冲队列；collector、入库、rollup、推送都在 `marketd` 进程内完成。
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
-- 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
+- 高周期 live WS 官方轮询只对当前有订阅者的 channel 执行，避免全市场 REST 请求；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
 - Kline guardian 会修复近窗口 final `1m` 缺口；超过窗口的历史需要用 backfill 或单独维护命令修复。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。

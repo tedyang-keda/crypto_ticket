@@ -25,12 +25,13 @@ const (
 )
 
 type KlineRequest struct {
-	Symbol          string
-	Timeframe       string
-	StartMS         int64
-	EndMS           int64
-	Limit           int
-	ForwardAdjusted bool
+	Symbol            string
+	Timeframe         string
+	StartMS           int64
+	EndMS             int64
+	Limit             int
+	ForwardAdjusted   bool
+	IncludeIncomplete bool
 }
 
 type RESTKlineFetcher interface {
@@ -66,6 +67,9 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 	cursorEnd := request.EndMS
 	if cursorEnd <= 0 {
 		cursorEnd = timeframe.FloorStartMS(market.NowMS(), request.Timeframe) - 1
+		if request.IncludeIncomplete {
+			cursorEnd = market.NowMS()
+		}
 	}
 
 	for {
@@ -89,7 +93,7 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 		}
 		endpoint.RawQuery = query.Encode()
 
-		page, err := a.fetchBinanceKlinePage(ctx, client, endpoint.String(), request.Symbol, request.Timeframe)
+		page, err := a.fetchBinanceKlinePage(ctx, client, endpoint.String(), request.Symbol, request.Timeframe, request.IncludeIncomplete)
 		if err != nil {
 			return nil, err
 		}
@@ -124,7 +128,7 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 	return trimBars(all, request.Limit), nil
 }
 
-func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, client *http.Client, endpoint string, symbol string, tf string) ([]market.Bar, error) {
+func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, client *http.Client, endpoint string, symbol string, tf string, includeIncomplete bool) ([]market.Bar, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -154,7 +158,7 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 		}
 		startMS := intValue(row[0])
 		closeMS := intValue(row[6])
-		if startMS <= 0 || closeMS <= 0 || closeMS >= now {
+		if startMS <= 0 || closeMS <= 0 || (!includeIncomplete && closeMS >= now) {
 			continue
 		}
 		volume := floatValue(row[5])
@@ -185,7 +189,7 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 			ContractVolume: contractVolume,
 			TradeCount:     intValue(row[8]),
 			LastTickMS:     closeMS,
-			IsFinal:        true,
+			IsFinal:        closeMS < now,
 			Source:         "rest",
 			Reason:         "exchange_kline_backfill",
 			UpdatedAtMS:    now,
@@ -235,7 +239,7 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 		if remaining > 0 && remaining < pageLimit {
 			pageLimit = remaining
 		}
-		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit, request.ForwardAdjusted)
+		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit, request.ForwardAdjusted, request.IncludeIncomplete)
 		if err != nil {
 			return nil, err
 		}
@@ -281,7 +285,7 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 	return trimBars(all, request.Limit), nil
 }
 
-func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int, forwardAdjusted bool) ([]market.Bar, error) {
+func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int, forwardAdjusted bool, includeIncomplete bool) ([]market.Bar, error) {
 	endpoint, err := url.Parse(a.restURL + endpointPath)
 	if err != nil {
 		return nil, err
@@ -335,12 +339,12 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 	}
 	marginType := okxMarginType(symbol, spec)
 	for _, row := range payload.Data {
-		if len(row) < 9 || row[8] != "1" {
+		if len(row) < 9 || (!includeIncomplete && row[8] != "1") {
 			continue
 		}
 		startMS := parseInt(row[0])
 		endMS := timeframe.EndMS(startMS, tf)
-		if startMS <= 0 || endMS >= now {
+		if startMS <= 0 || (!includeIncomplete && endMS >= now) {
 			continue
 		}
 		contractVolume := parseFloat(row[5])
@@ -372,7 +376,7 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 			ContractVolume: contractVolume,
 			TradeCount:     0,
 			LastTickMS:     endMS,
-			IsFinal:        true,
+			IsFinal:        row[8] == "1",
 			Source:         "rest",
 			Reason:         "exchange_kline_backfill",
 			UpdatedAtMS:    now,
