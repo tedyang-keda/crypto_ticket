@@ -112,7 +112,7 @@ ZHIPU 扩大到前后各 10 桶后，仍观察到 23 个字段差异：5m 11 个
 
 ## 高周期实时 HTTP / WebSocket 验证（2026-07-24）
 
-提交 `521fe51` 将 `5m` 及以上的当前未完成 K 线改为直接读取官方目标周期接口。OKX SWAP 固定使用 `adjust=forward`；Binance 使用 `/fapi/v1/klines` 的官方唯一口径。公开 WS 只对实际订阅的高周期每 2 秒轮询，字段未变化时不重复推送；旧的本地 `1m` live rollup 不再混入高周期 WS。
+提交 `521fe51` 将 `5m` 及以上的当前未完成 K 线改为直接读取官方目标周期接口，后续提交进一步覆盖周期切换边界。OKX SWAP 固定使用 `adjust=forward`；Binance 使用 `/fapi/v1/klines` 的官方唯一口径。公开 WS 只对实际订阅的高周期每 2 秒轮询，字段未变化时不重复推送；旧的本地 `1m` live rollup 和本地 high-timeframe final rollup 均不再混入高周期 WS。周期切换时依次推送官方上一周期 final 和官方新周期 live，HTTP 也会用官方最近两根覆盖上一根 final 和当前 live。
 
 | 交易所 | 品种 | 周期 | HTTP 当前 K 线 | WS 当前 K 线 | 结果 |
 | --- | --- | --- | --- | --- | --- |

@@ -35,7 +35,7 @@ func NewOfficialLiveSource(fetchers []exchange.RESTKlineFetcher) *OfficialLiveSo
 	}
 }
 
-func (s *OfficialLiveSource) LatestKline(ctx context.Context, exchangeName string, symbol string, tf string) (*market.Bar, error) {
+func (s *OfficialLiveSource) RecentKlines(ctx context.Context, exchangeName string, symbol string, tf string) ([]market.Bar, error) {
 	fetcher := s.fetchers[strings.ToLower(strings.TrimSpace(exchangeName))]
 	if fetcher == nil {
 		return nil, fmt.Errorf("official live kline fetcher not found for %s", exchangeName)
@@ -50,34 +50,34 @@ func (s *OfficialLiveSource) LatestKline(ctx context.Context, exchangeName strin
 	if err != nil {
 		return nil, err
 	}
-	if len(bars) == 0 {
-		return nil, nil
-	}
-	latest := bars[len(bars)-1]
-	return &latest, nil
+	return bars, nil
 }
 
 type OfficialLivePublisher interface {
-	PublishOfficialLiveKline(ctx context.Context, bar market.Bar) error
+	PublishOfficialKline(ctx context.Context, bar market.Bar) error
 }
 
-type OfficialLatestKlineSource interface {
-	LatestKline(ctx context.Context, exchange string, symbol string, timeframe string) (*market.Bar, error)
+type OfficialRecentKlineSource interface {
+	RecentKlines(ctx context.Context, exchange string, symbol string, timeframe string) ([]market.Bar, error)
 }
 
 type OfficialLiveRunner struct {
 	hub       *realtime.Hub
-	source    OfficialLatestKlineSource
+	source    OfficialRecentKlineSource
 	publisher OfficialLivePublisher
 	interval  time.Duration
 	last      map[string]string
+	current   map[string]int64
 }
 
-func NewOfficialLiveRunner(hub *realtime.Hub, source OfficialLatestKlineSource, publisher OfficialLivePublisher, interval time.Duration) *OfficialLiveRunner {
+func NewOfficialLiveRunner(hub *realtime.Hub, source OfficialRecentKlineSource, publisher OfficialLivePublisher, interval time.Duration) *OfficialLiveRunner {
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	return &OfficialLiveRunner{hub: hub, source: source, publisher: publisher, interval: interval, last: make(map[string]string)}
+	return &OfficialLiveRunner{
+		hub: hub, source: source, publisher: publisher, interval: interval,
+		last: make(map[string]string), current: make(map[string]int64),
+	}
 }
 
 func (r *OfficialLiveRunner) Run(ctx context.Context) error {
@@ -100,21 +100,37 @@ func (r *OfficialLiveRunner) poll(ctx context.Context) error {
 		if subscription.Timeframe == "1m" {
 			continue
 		}
-		bar, err := r.source.LatestKline(ctx, subscription.Exchange, subscription.Symbol, subscription.Timeframe)
+		bars, err := r.source.RecentKlines(ctx, subscription.Exchange, subscription.Symbol, subscription.Timeframe)
 		if err != nil {
 			log.Printf("official live kline fetch failed exchange=%s symbol=%s timeframe=%s: %v",
 				subscription.Exchange, subscription.Symbol, subscription.Timeframe, err)
 			continue
 		}
-		if bar == nil || bar.IsFinal {
+		if len(bars) == 0 {
 			continue
 		}
 		key := realtime.KlineChannel(subscription.Exchange, subscription.Symbol, subscription.Timeframe)
-		fingerprint := liveBarFingerprint(*bar)
+		latest := bars[len(bars)-1]
+		if previousStart, initialized := r.current[key]; initialized && latest.StartMS > previousStart {
+			for i := len(bars) - 2; i >= 0; i-- {
+				if bars[i].StartMS != previousStart || !bars[i].IsFinal {
+					continue
+				}
+				if err := r.publisher.PublishOfficialKline(ctx, bars[i]); err != nil {
+					return err
+				}
+				break
+			}
+		}
+		r.current[key] = latest.StartMS
+		if latest.IsFinal {
+			continue
+		}
+		fingerprint := liveBarFingerprint(latest)
 		if r.last[key] == fingerprint {
 			continue
 		}
-		if err := r.publisher.PublishOfficialLiveKline(ctx, *bar); err != nil {
+		if err := r.publisher.PublishOfficialKline(ctx, latest); err != nil {
 			return err
 		}
 		r.last[key] = fingerprint

@@ -35,7 +35,7 @@ type FinalBarObserver interface {
 }
 
 type OfficialKlineSource interface {
-	LatestKline(ctx context.Context, exchange string, symbol string, timeframe string) (*market.Bar, error)
+	RecentKlines(ctx context.Context, exchange string, symbol string, timeframe string) ([]market.Bar, error)
 }
 
 // CorporateActionGuard reports, for a bar, whether it straddles an active
@@ -74,20 +74,35 @@ func (s *MarketService) SetOfficialKlineSource(source OfficialKlineSource) {
 	s.officialKlines = source
 }
 
-func (s *MarketService) PublishOfficialLiveKline(ctx context.Context, bar market.Bar) error {
+func (s *MarketService) PublishOfficialKline(ctx context.Context, bar market.Bar) error {
 	bar = normalizeBar(bar)
-	if bar.IsFinal || !validBar(bar) {
+	if !validBar(bar) {
 		return nil
 	}
-	bar.Source = "official_rest_live"
-	bar.Reason = "official_current_kline"
+	if bar.IsFinal {
+		bar.Source = "official_rest_final"
+		bar.Reason = "official_final_kline"
+	} else {
+		bar.Source = "official_rest_live"
+		bar.Reason = "official_current_kline"
+	}
 	enriched, err := s.enrichBar(ctx, bar)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.liveBars[barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe)] = enriched
+	key := barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe)
+	if enriched.IsFinal {
+		delete(s.liveBars, key)
+	} else {
+		s.liveBars[key] = enriched
+	}
 	s.mu.Unlock()
+	if enriched.IsFinal {
+		if err := s.store.UpsertBars(ctx, []market.Bar{enriched}); err != nil {
+			return err
+		}
+	}
 	s.publishBar(enriched)
 	return nil
 }
@@ -363,7 +378,9 @@ func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar, 
 			if err := s.store.UpsertBars(ctx, []market.Bar{enriched}); err != nil {
 				return err
 			}
-			s.publishBar(enriched)
+			if !s.usesOfficialKlines() {
+				s.publishBar(enriched)
+			}
 			queue = append(queue, enriched)
 		}
 	}
@@ -385,10 +402,7 @@ func sourceBarsComplete(bars []market.Bar, sourceTF string, targetStart int64, t
 }
 
 func (s *MarketService) publishLiveRollups(ctx context.Context, oneMinute market.Bar) error {
-	s.mu.RLock()
-	officialKlines := s.officialKlines
-	s.mu.RUnlock()
-	if officialKlines != nil {
+	if s.usesOfficialKlines() {
 		return nil
 	}
 	nowMS := market.NowMS()
@@ -542,15 +556,15 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		officialKlines := s.officialKlines
 		s.mu.RUnlock()
 		if officialKlines != nil {
-			live, fetchErr := officialKlines.LatestKline(ctx, query.Exchange, query.Symbol, query.Timeframe)
+			officialBars, fetchErr := officialKlines.RecentKlines(ctx, query.Exchange, query.Symbol, query.Timeframe)
 			if fetchErr != nil {
 				return nil, fetchErr
 			}
-			if live != nil && !live.IsFinal {
-				normalized := normalizeBar(*live)
-				return trimBars(mergeLiveBar(bars, &normalized), query.Limit+1), nil
+			for i := range officialBars {
+				normalized := normalizeBar(officialBars[i])
+				bars = mergeLiveBar(bars, &normalized)
 			}
-			return trimBars(bars, query.Limit), nil
+			return trimBars(bars, query.Limit+1), nil
 		}
 	}
 	live := s.liveOneMinute(query.Exchange, query.Symbol)
@@ -582,6 +596,12 @@ func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Ba
 	}
 	live = market.DecorateBar(live)
 	return &live
+}
+
+func (s *MarketService) usesOfficialKlines() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.officialKlines != nil
 }
 
 func (s *MarketService) ListSymbols(ctx context.Context, exchange string, activeOnly *bool) ([]market.SymbolInfo, error) {

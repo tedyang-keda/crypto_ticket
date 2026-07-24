@@ -322,17 +322,17 @@ type fixedOfficialKlineSource struct {
 	bar market.Bar
 }
 
-func (f fixedOfficialKlineSource) LatestKline(_ context.Context, exchange string, symbol string, tf string) (*market.Bar, error) {
+func (f fixedOfficialKlineSource) RecentKlines(_ context.Context, exchange string, symbol string, tf string) ([]market.Bar, error) {
 	bar := f.bar
 	bar.Exchange = exchange
 	bar.Symbol = symbol
 	bar.Timeframe = tf
-	return &bar, nil
+	return []market.Bar{bar}, nil
 }
 
 type failingOfficialKlineSource struct{}
 
-func (failingOfficialKlineSource) LatestKline(context.Context, string, string, string) (*market.Bar, error) {
+func (failingOfficialKlineSource) RecentKlines(context.Context, string, string, string) ([]market.Bar, error) {
 	return nil, errors.New("official kline unavailable")
 }
 
@@ -377,7 +377,7 @@ func TestOfficialKlineSourceReplacesLocalLiveRollupForHTTPAndWebSocket(t *testin
 	official.Exchange = "okx"
 	official.Symbol = "KORU-USDT-SWAP"
 	official.Timeframe = "1H"
-	if err := service.PublishOfficialLiveKline(ctx, official); err != nil {
+	if err := service.PublishOfficialKline(ctx, official); err != nil {
 		t.Fatal(err)
 	}
 	event := nextTestEvent(t, sub)
@@ -404,6 +404,34 @@ func TestOfficialKlineFailureDoesNotFallBackToLocalRollup(t *testing.T) {
 	})
 	if err == nil || err.Error() != "official kline unavailable" {
 		t.Fatalf("expected official source error, got %v", err)
+	}
+}
+
+func TestOfficialKlineSourceSuppressesLocalFinalRollupWebSocketEvent(t *testing.T) {
+	ctx := context.Background()
+	hub := realtime.NewHub()
+	service := NewMarketService(storage.NewMemoryHistoricalStore(), hub, []string{"1m", "1H"}, 300)
+	service.SetOfficialKlineSource(fixedOfficialKlineSource{bar: market.Bar{}})
+	sub := hub.Subscribe()
+	defer sub.Close()
+	sub.Add(realtime.KlineChannel("okx", "KORU-USDT-SWAP", "1H"))
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1H")
+
+	for i := 0; i < 60; i++ {
+		start := base + int64(i)*60_000
+		if err := service.IngestKline(ctx, market.Bar{
+			Exchange: "okx", Symbol: "KORU-USDT-SWAP", Timeframe: "1m",
+			StartMS: start, EndMS: start + 59_999,
+			OpenPrice: 100, HighPrice: 101, LowPrice: 99, ClosePrice: 100,
+			Volume: 1, QuoteVolume: 100, IsFinal: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case event := <-sub.Events():
+		t.Fatalf("local final rollup leaked to websocket: %+v", event)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

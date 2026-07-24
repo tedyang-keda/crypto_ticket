@@ -26,9 +26,9 @@ Binance / OKX official 1m kline WebSocket
            修复后复用 MarketService 入库、推送和级联 rollup
 
 Active high-timeframe WS subscriptions
-  -> 每 2 秒读取交易所官方目标周期当前 K 线
+  -> 每 2 秒读取交易所官方目标周期最近两根 K 线
   -> OKX SWAP 请求固定使用 adjust=forward；Binance 使用官方 futures kline
-  -> 仅在字段变化时推送 high-timeframe live kline
+  -> 字段变化时推送 live；周期切换时推送官方 final 后再推送新 live
 
 HTTP /api/v1/klines?include_live=true
   -> 读取 store 中已持久化的目标周期 bars
@@ -43,7 +43,7 @@ HTTP /api/v1/klines?include_live=true
 - Redis 只在 `cmd/backfill_klines` 中用于清理旧的 `kline:*` / `livebar:*` cache key。
 - MySQL 中存的是 final bar。实时未完成 `1m` 只在当前 Go 进程内。
 - HTTP 可以读不同 timeframe 的行情；默认会包含当前未完成行情。
-- WS 会推交易所官方 `1m` live；对当前有订阅者的高周期，每 2 秒查询并推送官方目标周期 live bar。
+- WS 会推交易所官方 `1m` live；对当前有订阅者的高周期，每 2 秒查询官方目标周期，推送官方 final/live bar。
 - 高周期 final rollup 使用级联源周期，不再所有高周期都直接扫描 `1m`：`30m <- 15m`，`1H <- 30m`，`1D <- 1H`，`1M/3M <- 1D`。公司行动窗口由官方目标周期回填覆盖。
 - Kline guardian 不从 trade 重算 OHLCV；它只用交易所官方 REST kline 校验和修复官方 WS 可能漏掉的 final `1m`。
 
@@ -400,7 +400,7 @@ WS 时效性：
 - final `1m` 会先写 store，写成功后再推送。
 - `ticker` 基于 `1m` kline 的 close，不是逐笔 trade tick。
 - 高周期 final bar 在周期结束且对应源周期 final bar 入库后级联生成并推送，例如 `1D <- 1H`、`1M/3M <- 1D`。
-- 高周期 live bar 会在有人订阅对应 `exchange/symbol/timeframe` 时每 2 秒读取一次官方目标周期接口并通过 WS 推送；相同快照不会重复推送。该路径不受 `MARKET_TIMEFRAMES` 限制，没有订阅者的高周期不会发起 REST 请求。
+- 高周期 bar 会在有人订阅对应 `exchange/symbol/timeframe` 时每 2 秒读取一次官方目标周期最近两根 K 线并通过 WS 推送；相同 live 快照不会重复推送，周期切换时使用官方 final 替代本地 rollup final。该路径不受 `MARKET_TIMEFRAMES` 限制，没有订阅者的高周期不会发起 REST 请求。
 - 服务端每 15 秒发送一次 `{"op":"ping"}`；客户端发送 `{"op":"ping"}` 时服务端返回 `{"op":"pong"}`。
 - 每个 subscriber 的事件队列大小是 256；客户端消费太慢时，新事件会被丢弃，不做阻塞和重放。因此前端应该先 HTTP 拉快照，再接 WS 增量。
 - 当前 WS 只有 subscribe，没有 unsubscribe。前端切换 symbol/timeframe 时会关闭旧连接并重新连接。
@@ -445,7 +445,7 @@ curl 'http://127.0.0.1:8088/api/v1/klines?exchange=binance&symbol=BTCUSDT&timefr
 `include_live=true` 时的返回逻辑：
 
 - `timeframe=1m`：读取 store 中最近 final `1m`，再合并当前进程内 live `1m`。如果 live bar 是新一根，返回数量可能是 `limit + 1`。
-- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再请求交易所官方目标周期当前 K 线并合并返回。OKX SWAP 使用 `adjust=forward`；Binance 使用官方 futures kline（官方没有复权参数）。
+- `timeframe>1m`：读取 store 中该 timeframe 的 final bars，再请求交易所官方目标周期最近两根 K 线并合并返回，从而同时覆盖上一根 final 和当前 live。OKX SWAP 使用 `adjust=forward`；Binance 使用官方 futures kline（官方没有复权参数）。
 - 官方高周期请求失败时接口返回错误，不会静默退回本地 `1m` 合成口径。
 - `include_live=false` 时，只返回 store 中已持久化 bars。
 
