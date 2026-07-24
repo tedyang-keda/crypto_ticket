@@ -58,17 +58,46 @@ func TestHistoricalBackfillerReplacesOfficialBarsForEveryTimeframe(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Boundary.BoundaryMS != 160_000 || result.RawBarsReplaced != 10 {
+	if result.Boundary.BoundaryMS != 160_000 || result.RawBarsReplaced != 11 {
 		t.Fatalf("unexpected repair result: %+v", result)
 	}
-	if len(source.requests) != 11 {
-		t.Fatalf("expected boundary request plus ten official timeframes, got %d", len(source.requests))
+	if len(source.requests) != 12 {
+		t.Fatalf("expected boundary request plus eleven official timeframes, got %d", len(source.requests))
 	}
-	for _, tf := range []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"} {
+	for _, tf := range []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"} {
 		bars, err := store.BarsInRange(ctx, "binance", "KORUUSDT", tf, math.MinInt64, math.MaxInt64)
 		if err != nil || len(bars) != 1 {
 			t.Fatalf("official %s bars were not replaced: bars=%+v err=%v", tf, bars, err)
 		}
+	}
+}
+
+func TestOfficialRepairTimeframesByExchange(t *testing.T) {
+	tests := []struct {
+		exchange string
+		want     []string
+	}{
+		{
+			exchange: "binance",
+			want:     []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"},
+		},
+		{
+			exchange: "okx",
+			want:     []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "2D", "1W"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.exchange, func(t *testing.T) {
+			got := officialRepairTimeframes(tc.exchange)
+			if len(got) != len(tc.want) {
+				t.Fatalf("unexpected frames: got=%v want=%v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("unexpected frames: got=%v want=%v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 

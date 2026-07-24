@@ -157,7 +157,7 @@ func (b *HistoricalBackfiller) persistEvent(ctx context.Context, action Historic
 func (b *HistoricalBackfiller) fetchOfficialRepairWindow(ctx context.Context, action HistoricalAction, boundaryMS int64) (historicalOfficialWindow, error) {
 	startMS := timeframe.FloorStartMS(boundaryMS, "1D")
 	endMS := timeframe.EndMS(startMS, "1D")
-	frames := officialRepairTimeframes()
+	frames := officialRepairTimeframes(action.Exchange)
 	window := historicalOfficialWindow{ranges: make(map[string]historicalRange, len(frames))}
 	for _, tf := range frames {
 		rangeStartMS, rangeEndMS := officialRepairRange(boundaryMS, tf, startMS, endMS)
@@ -241,7 +241,7 @@ func waitHistoricalBackfill(ctx context.Context, delay time.Duration) error {
 
 func (b *HistoricalBackfiller) persistOfficialBars(ctx context.Context, action HistoricalAction, window historicalOfficialWindow, result *HistoricalBackfillResult) error {
 	result.RawBarsReplaced = len(window.rawBars)
-	for _, tf := range officialRepairTimeframes() {
+	for _, tf := range officialRepairTimeframes(action.Exchange) {
 		repairRange := window.ranges[tf]
 		if err := b.store.ReplaceBarsInRange(ctx, action.Exchange, action.Symbol, tf, repairRange.startMS, repairRange.endMS, window.rawBars); err != nil {
 			return fmt.Errorf("replace official %s bars in range: %w", tf, err)
@@ -250,17 +250,13 @@ func (b *HistoricalBackfiller) persistOfficialBars(ctx context.Context, action H
 	return nil
 }
 
-func officialRepairTimeframes() []string {
-	frames := []string{boundaryTimeframe}
-	for _, tf := range timeframe.Order {
-		if tf == boundaryTimeframe {
-			continue
-		}
-		frames = append(frames, tf)
-		if tf == "1D" {
-			break
-		}
+func officialRepairTimeframes(exchangeName string) []string {
+	frames := []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"}
+	if strings.EqualFold(exchangeName, "okx") {
+		frames = append(frames, "2D")
 	}
+	// Binance has no official 2D interval, but both exchanges expose 1W.
+	frames = append(frames, "1W")
 	return frames
 }
 
