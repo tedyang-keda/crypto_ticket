@@ -108,6 +108,7 @@ func compareTimeframe(ctx context.Context, store rangeStore, fetcher exchange.RE
 	}
 	official, err := fetchWithRetry(ctx, fetcher, client, exchange.KlineRequest{
 		Symbol: opts.symbol, Timeframe: tf, StartMS: startMS, EndMS: endMS,
+		ForwardAdjusted: true,
 	})
 	if err != nil {
 		return result, fmt.Errorf("load official bars: %w", err)

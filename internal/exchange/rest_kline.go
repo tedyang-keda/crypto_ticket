@@ -25,11 +25,12 @@ const (
 )
 
 type KlineRequest struct {
-	Symbol    string
-	Timeframe string
-	StartMS   int64
-	EndMS     int64
-	Limit     int
+	Symbol          string
+	Timeframe       string
+	StartMS         int64
+	EndMS           int64
+	Limit           int
+	ForwardAdjusted bool
 }
 
 type RESTKlineFetcher interface {
@@ -234,7 +235,7 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 		if remaining > 0 && remaining < pageLimit {
 			pageLimit = remaining
 		}
-		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit)
+		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit, request.ForwardAdjusted)
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +281,7 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 	return trimBars(all, request.Limit), nil
 }
 
-func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int) ([]market.Bar, error) {
+func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int, forwardAdjusted bool) ([]market.Bar, error) {
 	endpoint, err := url.Parse(a.restURL + endpointPath)
 	if err != nil {
 		return nil, err
@@ -289,6 +290,9 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 	query.Set("instId", symbol)
 	query.Set("bar", bar)
 	query.Set("limit", strconv.Itoa(limit))
+	if forwardAdjusted {
+		query.Set("adjust", "forward")
+	}
 	if after > 0 {
 		query.Set("after", strconv.FormatInt(after, 10))
 	}

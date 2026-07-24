@@ -64,7 +64,7 @@ symbol 元数据会写入 `symbol_registry`，并带上以下分类字段：
 
 `cmd/backfill_adjustments` 支持 Binance 和 OKX。它分页扫描官方公告、读取公告比例，使用公告窗口内的官方 `1m` K 线定位精确动作边界，并把审计记录幂等写入 `corporate_action_event`。
 
-确认边界后，命令分别拉取交易所官方目标周期 K 线，按 `exchange / symbol / timeframe / start_ms` 覆盖动作所在 UTC 日及边界上下文的 `bar_history`。OKX 修复 `1m / 5m / 15m / 30m / 1H / 2H / 4H / 6H / 12H / 1D / 2D / 1W`；Binance 修复相同周期中的 `1m` 到 `1D` 以及 `1W`，因为 Binance 官方不提供 `2D`。每次执行都会重新拉取并覆盖，因此可以吸收交易所后续对历史 K 线的回写。
+确认边界后，命令分别拉取交易所官方目标周期 K 线，按 `exchange / symbol / timeframe / start_ms` 覆盖动作所在 UTC 日及边界上下文的 `bar_history`。OKX 的写库请求使用官方 `adjust=forward` 口径；边界定位请求仍使用未复权 `1m`，否则价格跳变会消失。OKX 修复 `1m / 5m / 15m / 30m / 1H / 2H / 4H / 6H / 12H / 1D / 2D / 1W`；Binance 修复相同周期中的 `1m` 到 `1D` 以及 `1W`，因为 Binance 官方不提供 `2D`。每次执行都会重新拉取并覆盖，因此可以吸收交易所后续对历史 K 线的回写。
 
 ```bash
 # 先预览，不写数据库

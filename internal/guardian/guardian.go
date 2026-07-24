@@ -396,6 +396,7 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 	limit := int((endMS-startMS)/timeframe.MinuteMS) + 1
 	official, err := fetcher.FetchKlines(ctx, g.client, exchange.KlineRequest{
 		Symbol: symbol, Timeframe: aggregator.OneMinute, StartMS: startMS, EndMS: endMS, Limit: limit,
+		ForwardAdjusted: true,
 	})
 	if err != nil {
 		event := market.KlineGuardianEvent{

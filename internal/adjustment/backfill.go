@@ -163,6 +163,7 @@ func (b *HistoricalBackfiller) fetchOfficialRepairWindow(ctx context.Context, ac
 		rangeStartMS, rangeEndMS := officialRepairRange(boundaryMS, tf, startMS, endMS)
 		bars, err := b.fetchKlinesWithRetry(ctx, exchange.KlineRequest{
 			Symbol: action.Symbol, Timeframe: tf, StartMS: rangeStartMS, EndMS: rangeEndMS,
+			ForwardAdjusted: true,
 		})
 		if err != nil {
 			return historicalOfficialWindow{}, fmt.Errorf("fetch official %s repair window: %w", tf, err)

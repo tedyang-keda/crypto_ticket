@@ -64,6 +64,14 @@ func TestHistoricalBackfillerReplacesOfficialBarsForEveryTimeframe(t *testing.T)
 	if len(source.requests) != 12 {
 		t.Fatalf("expected boundary request plus eleven official timeframes, got %d", len(source.requests))
 	}
+	if source.requests[0].ForwardAdjusted {
+		t.Fatal("boundary detection must use unadjusted klines")
+	}
+	for _, request := range source.requests[1:] {
+		if !request.ForwardAdjusted {
+			t.Fatalf("repair request must use forward-adjusted klines: %+v", request)
+		}
+	}
 	for _, tf := range []string{"1m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D", "1W"} {
 		bars, err := store.BarsInRange(ctx, "binance", "KORUUSDT", tf, math.MinInt64, math.MaxInt64)
 		if err != nil || len(bars) != 1 {

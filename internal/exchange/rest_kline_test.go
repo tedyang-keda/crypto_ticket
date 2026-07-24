@@ -53,14 +53,18 @@ func TestOKXFetchKlinesUsesBaseAndQuoteVolumeFields(t *testing.T) {
 		if r.URL.Query().Get("instId") != "BTC-USDT-SWAP" || r.URL.Query().Get("bar") != "1H" {
 			t.Fatalf("unexpected query %s", r.URL.RawQuery)
 		}
+		if got := r.URL.Query().Get("adjust"); got != "forward" {
+			t.Fatalf("expected adjust=forward, got %q", got)
+		}
 		return jsonResponse(`{"code":"0","data":[["3600000","100.0","110.0","90.0","105.0","123.45","1.234","129.570","1"]]}`), nil
 	})}
 
 	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
 	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
-		Symbol:    "BTC-USDT-SWAP",
-		Timeframe: "1H",
-		Limit:     1,
+		Symbol:          "BTC-USDT-SWAP",
+		Timeframe:       "1H",
+		Limit:           1,
+		ForwardAdjusted: true,
 	})
 	if err != nil {
 		t.Fatal(err)

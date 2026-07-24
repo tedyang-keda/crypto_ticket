@@ -338,11 +338,12 @@ func backfillExchange(
 	for _, symbol := range symbols {
 		for _, tf := range options.timeframes {
 			bars, err := fetcher.FetchKlines(ctx, client, exchange.KlineRequest{
-				Symbol:    symbol,
-				Timeframe: tf,
-				StartMS:   options.startMS,
-				EndMS:     options.endMS,
-				Limit:     options.limit,
+				Symbol:          symbol,
+				Timeframe:       tf,
+				StartMS:         options.startMS,
+				EndMS:           options.endMS,
+				Limit:           options.limit,
+				ForwardAdjusted: true,
 			})
 			if err != nil {
 				if errors.Is(err, exchange.ErrUnsupportedKlineInterval) {
