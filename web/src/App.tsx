@@ -36,7 +36,23 @@ import type { Bar, SymbolInfo, Tick } from "./types";
 import "./styles.css";
 
 const queryClient = new QueryClient();
-const timeframes = ["1m", "5m", "15m", "30m", "1H", "4H", "12H", "1D"];
+const timeframes = [
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "1H",
+  "4H",
+  "12H",
+  "1D",
+  "2D",
+  "3D",
+  "5D",
+  "1W",
+  "2W",
+  "1M",
+  "3M",
+];
 const exchanges = ["binance", "okx"];
 const modes = ["Candles", "Depth", "Replay"];
 const tools = [
