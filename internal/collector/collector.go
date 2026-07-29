@@ -28,6 +28,17 @@ type KlinePublisher interface {
 	IngestKline(ctx context.Context, bar market.Bar) error
 }
 
+type Observer interface {
+	RegisterCollectorRuntime(exchange string, marketType string)
+	CollectorConnection(exchange string, marketType string, delta int)
+	CollectorMessage(exchange string, marketType string)
+	CollectorBarReceived(exchange string, marketType string, bar market.Bar)
+	CollectorIngested(exchange string, marketType string, bar market.Bar)
+	CollectorReconnect(exchange string, marketType string)
+	CollectorParseError(exchange string, marketType string)
+	CollectorIngestError(exchange string, marketType string)
+}
+
 type Runtime struct {
 	Adapter exchange.Adapter
 	Config  Config
@@ -38,10 +49,11 @@ type Runner struct {
 	store     storage.HistoricalStore
 	publisher KlinePublisher
 	client    *http.Client
+	observer  Observer
 }
 
-func NewRunner(runtimes []Runtime, store storage.HistoricalStore, publisher KlinePublisher) *Runner {
-	return &Runner{
+func NewRunner(runtimes []Runtime, store storage.HistoricalStore, publisher KlinePublisher, observers ...Observer) *Runner {
+	runner := &Runner{
 		runtimes:  runtimes,
 		store:     store,
 		publisher: publisher,
@@ -49,6 +61,15 @@ func NewRunner(runtimes []Runtime, store storage.HistoricalStore, publisher Klin
 			Timeout: 20 * time.Second,
 		},
 	}
+	if len(observers) > 0 {
+		runner.observer = observers[0]
+	}
+	if runner.observer != nil {
+		for _, runtime := range runtimes {
+			runner.observer.RegisterCollectorRuntime(runtime.Adapter.Name(), runtime.Adapter.MarketType())
+		}
+	}
+	return runner
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -88,6 +109,9 @@ func (r *Runner) runExchange(ctx context.Context, runtime Runtime) error {
 		}
 		if ctx.Err() == nil {
 			log.Printf("%s %s collector reconnect after error: %v", runtime.Adapter.Name(), runtime.Adapter.MarketType(), err)
+			if r.observer != nil {
+				r.observer.CollectorReconnect(runtime.Adapter.Name(), runtime.Adapter.MarketType())
+			}
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -123,6 +147,10 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	if err != nil {
 		return err
 	}
+	if r.observer != nil {
+		r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), 1)
+		defer r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), -1)
+	}
 	log.Printf("%s %s kline collector connected symbols=%d", adapter.Name(), adapter.MarketType(), len(symbols))
 
 	refreshAt := time.Now().Add(cfg.SymbolRefreshInterval)
@@ -142,14 +170,29 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 		if err != nil {
 			return err
 		}
+		if r.observer != nil {
+			r.observer.CollectorMessage(adapter.Name(), adapter.MarketType())
+		}
 		bars, err := adapter.ParseKlineMessage(payload)
 		if err != nil {
 			log.Printf("%s %s parse kline failed: %v", adapter.Name(), adapter.MarketType(), err)
+			if r.observer != nil {
+				r.observer.CollectorParseError(adapter.Name(), adapter.MarketType())
+			}
 			continue
 		}
 		for _, bar := range bars {
+			if r.observer != nil {
+				r.observer.CollectorBarReceived(adapter.Name(), adapter.MarketType(), bar)
+			}
 			if err := r.publisher.IngestKline(ctx, bar); err != nil {
+				if r.observer != nil {
+					r.observer.CollectorIngestError(adapter.Name(), adapter.MarketType())
+				}
 				return err
+			}
+			if r.observer != nil {
+				r.observer.CollectorIngested(adapter.Name(), adapter.MarketType(), bar)
 			}
 		}
 	}
@@ -178,6 +221,10 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 		return err
 	}
 	defer conn.Close()
+	if r.observer != nil {
+		r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), 1)
+		defer r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), -1)
+	}
 	log.Printf("%s %s static kline stream connected chunk=%d symbols=%d", adapter.Name(), adapter.MarketType(), index, symbolCount)
 	for {
 		if ctx.Err() != nil {
@@ -188,14 +235,29 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 		if err != nil {
 			return err
 		}
+		if r.observer != nil {
+			r.observer.CollectorMessage(adapter.Name(), adapter.MarketType())
+		}
 		bars, err := adapter.ParseKlineMessage(payload)
 		if err != nil {
 			log.Printf("%s %s parse kline failed: %v", adapter.Name(), adapter.MarketType(), err)
+			if r.observer != nil {
+				r.observer.CollectorParseError(adapter.Name(), adapter.MarketType())
+			}
 			continue
 		}
 		for _, bar := range bars {
+			if r.observer != nil {
+				r.observer.CollectorBarReceived(adapter.Name(), adapter.MarketType(), bar)
+			}
 			if err := r.publisher.IngestKline(ctx, bar); err != nil {
+				if r.observer != nil {
+					r.observer.CollectorIngestError(adapter.Name(), adapter.MarketType())
+				}
 				return err
+			}
+			if r.observer != nil {
+				r.observer.CollectorIngested(adapter.Name(), adapter.MarketType(), bar)
 			}
 		}
 	}

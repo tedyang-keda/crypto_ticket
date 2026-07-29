@@ -1,0 +1,19 @@
+[Unit]
+Description=Crypto Ticket health watchdog
+After=network-online.target crypto-ticket.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto_ticket
+EnvironmentFile=/opt/crypto_ticket/.env
+ExecStart=/opt/crypto_ticket/bin/health_watchdog
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/crypto-ticket-watchdog
+
+[Install]
+WantedBy=multi-user.target

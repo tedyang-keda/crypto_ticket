@@ -64,6 +64,12 @@ type SymbolInfo struct {
 	UpdatedAtMS   int64  `json:"updated_at_ms"`
 }
 
+type MarketSeries struct {
+	Exchange   string `json:"exchange"`
+	Symbol     string `json:"symbol"`
+	MarketType string `json:"market_type,omitempty"`
+}
+
 type KlineQuery struct {
 	Exchange    string
 	Symbol      string
@@ -108,6 +114,27 @@ type KlineGuardianEvent struct {
 	OldValueJSON string `json:"old_value_json,omitempty"`
 	NewValueJSON string `json:"new_value_json,omitempty"`
 	CreatedAtMS  int64  `json:"created_at_ms"`
+}
+
+type CorporateActionJob struct {
+	ID                 int64   `json:"id,omitempty"`
+	Exchange           string  `json:"exchange"`
+	Symbol             string  `json:"symbol"`
+	MarketType         string  `json:"market_type,omitempty"`
+	EffectiveMS        int64   `json:"effective_ms"`
+	ObservedRatio      float64 `json:"observed_ratio"`
+	Factor             float64 `json:"factor"`
+	Detector           string  `json:"detector"`
+	Status             string  `json:"status"`
+	Attempts           int     `json:"attempts"`
+	NextRetryMS        int64   `json:"next_retry_ms"`
+	LastError          string  `json:"last_error,omitempty"`
+	RowsWritten        int     `json:"rows_written"`
+	VerificationStatus string  `json:"verification_status,omitempty"`
+	VerificationJSON   string  `json:"verification_json,omitempty"`
+	CreatedAtMS        int64   `json:"created_at_ms"`
+	UpdatedAtMS        int64   `json:"updated_at_ms"`
+	CompletedAtMS      int64   `json:"completed_at_ms,omitempty"`
 }
 
 func NowMS() int64 {

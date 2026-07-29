@@ -217,6 +217,32 @@ CREATE TABLE IF NOT EXISTS kline_guardian_event (
   KEY idx_guardian_event_type (event_type, created_at)
 );
 
+CREATE TABLE IF NOT EXISTS corporate_action_job (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  market_type VARCHAR(32) NOT NULL DEFAULT '',
+  effective_ms BIGINT NOT NULL,
+  observed_ratio DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  factor DECIMAL(28, 12) NOT NULL DEFAULT 0,
+  detector VARCHAR(32) NOT NULL DEFAULT '',
+  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  attempts INT NOT NULL DEFAULT 0,
+  next_retry_ms BIGINT NOT NULL DEFAULT 0,
+  last_error TEXT NULL,
+  rows_written BIGINT NOT NULL DEFAULT 0,
+  verification_status VARCHAR(32) NOT NULL DEFAULT '',
+  verification_json JSON NULL,
+  created_at_ms BIGINT NOT NULL DEFAULT 0,
+  updated_at_ms BIGINT NOT NULL DEFAULT 0,
+  completed_at_ms BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_corporate_action_event (exchange, symbol, effective_ms),
+  KEY idx_corporate_action_due (status, next_retry_ms, id)
+);
+
 CREATE TABLE IF NOT EXISTS archive_manifest (
   exchange VARCHAR(16) NOT NULL,
   timeframe VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,

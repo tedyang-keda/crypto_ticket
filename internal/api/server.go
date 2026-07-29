@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 
 	"crypto-ticket/internal/app"
 	"crypto-ticket/internal/market"
+	"crypto-ticket/internal/monitoring"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/timeframe"
 )
@@ -23,10 +26,11 @@ type Server struct {
 	hub          *realtime.Hub
 	dashboardDir string
 	upgrader     websocket.Upgrader
+	monitor      *monitoring.Service
 }
 
-func NewServer(marketService *app.MarketService, hub *realtime.Hub, dashboardDir string) *Server {
-	return &Server{
+func NewServer(marketService *app.MarketService, hub *realtime.Hub, dashboardDir string, monitors ...*monitoring.Service) *Server {
+	server := &Server{
 		market:       marketService,
 		hub:          hub,
 		dashboardDir: dashboardDir,
@@ -34,11 +38,19 @@ func NewServer(marketService *app.MarketService, hub *realtime.Hub, dashboardDir
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+	if len(monitors) > 0 {
+		server.monitor = monitors[0]
+	}
+	return server
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /readyz", s.readyz)
+	if s.monitor != nil {
+		mux.Handle("GET /metrics", s.monitor.Registry().MetricsHandler())
+	}
 	mux.HandleFunc("GET /api/v1/ticker/latest", s.latestTicker)
 	mux.HandleFunc("GET /api/v1/klines", s.klines)
 	mux.HandleFunc("GET /api/v1/symbols", s.symbols)
@@ -47,11 +59,34 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.Handle("/", s.dashboard())
-	return gzipResponses(cors(mux))
+	handler := gzipResponses(cors(mux))
+	if s.monitor != nil {
+		handler = s.observeHTTP(handler)
+	}
+	return handler
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ts_ms": market.NowMS()})
+	startedAtMS := int64(0)
+	uptimeSeconds := int64(0)
+	if s.monitor != nil {
+		startedAtMS = s.monitor.StartedAt().UnixMilli()
+		uptimeSeconds = int64(time.Since(s.monitor.StartedAt()).Seconds())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ts_ms": market.NowMS(), "started_at_ms": startedAtMS, "uptime_seconds": uptimeSeconds})
+}
+
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	if s.monitor == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ts_ms": market.NowMS(), "status": "monitoring_disabled"})
+		return
+	}
+	report := s.monitor.Readiness(r.Context())
+	status := http.StatusOK
+	if !report.OK {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, report)
 }
 
 func (s *Server) latestTicker(w http.ResponseWriter, r *http.Request) {
@@ -189,11 +224,67 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 			if err := conn.WriteJSON(event); err != nil {
 				return
 			}
+			if s.monitor != nil {
+				s.monitor.Registry().WSEventSent()
+			}
 		case <-ping.C:
 			if err := conn.WriteJSON(map[string]any{"op": "ping", "ts_ms": market.NowMS()}); err != nil {
 				return
 			}
 		}
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (w *statusWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) observeHTTP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		writer := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(writer, r)
+		status := writer.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		s.monitor.Registry().HTTPRequest(routeName(r.URL.Path), r.Method, status, time.Since(started))
+	})
+}
+
+func routeName(path string) string {
+	switch path {
+	case "/healthz", "/readyz", "/metrics", "/api/v1/ticker/latest", "/api/v1/klines", "/api/v1/symbols", "/api/v1/ws":
+		return path
+	default:
+		return "dashboard"
 	}
 }
 

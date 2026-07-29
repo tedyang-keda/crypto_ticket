@@ -16,4 +16,8 @@ logs/
 node_modules/
 web/dist/
 .playwright-mcp/
+.playwright-cli/
+*.tsv
+marketd
+health_watchdog
 *.tsbuildinfo

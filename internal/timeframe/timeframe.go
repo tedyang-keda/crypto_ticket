@@ -122,6 +122,26 @@ func NextStartMS(startMS int64, tf string) int64 {
 	panic("unreachable timeframe")
 }
 
+// PreviousStartMS returns the start of the bucket immediately before startMS.
+// startMS is expected to already be aligned to tf.
+func PreviousStartMS(startMS int64, tf string) int64 {
+	tf = MustNormalize(tf)
+	if minutes, ok := fixedMinuteFrames[tf]; ok {
+		return startMS - minutes*MinuteMS
+	}
+	dt := time.UnixMilli(startMS).UTC()
+	if days, ok := dayFrames[tf]; ok {
+		return dt.AddDate(0, 0, -int(days)).UnixMilli()
+	}
+	if weeks, ok := weekFrames[tf]; ok {
+		return dt.AddDate(0, 0, -int(weeks*7)).UnixMilli()
+	}
+	if months, ok := monthFrames[tf]; ok {
+		return dt.AddDate(0, -months, 0).UnixMilli()
+	}
+	panic("unreachable timeframe")
+}
+
 func EndMS(startMS int64, tf string) int64 {
 	return NextStartMS(startMS, tf) - 1
 }

@@ -16,6 +16,13 @@ type BinanceFuturesAdapter struct {
 	wsURL      string
 }
 
+type binanceExchangeInfoSymbol struct {
+	Symbol         string `json:"symbol"`
+	Status         string `json:"status"`
+	ContractStatus string `json:"contractStatus"`
+	ContractType   string `json:"contractType"`
+}
+
 func NewBinanceFuturesAdapter(marketType string, restURL string, wsURL string) *BinanceFuturesAdapter {
 	return &BinanceFuturesAdapter{
 		marketType: strings.TrimSpace(marketType),
@@ -41,6 +48,50 @@ func (a *BinanceFuturesAdapter) WSURL() string {
 }
 
 func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]market.SymbolInfo, error) {
+	payload, err := a.fetchExchangeInfo(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	now := market.NowMS()
+	symbols := make([]market.SymbolInfo, 0, len(payload))
+	for _, item := range payload {
+		symbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if symbol == "" {
+			continue
+		}
+		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
+		symbols = append(symbols, market.SymbolInfo{
+			Exchange:      a.Name(),
+			Symbol:        symbol,
+			MarketType:    a.marketType,
+			Status:        status,
+			IsActive:      status == "TRADING",
+			FirstSeenAtMS: now,
+			LastSeenAtMS:  now,
+			UpdatedAtMS:   now,
+		})
+	}
+	return symbols, nil
+}
+
+func (a *BinanceFuturesAdapter) ForwardAdjustmentSymbols(ctx context.Context, client *http.Client) (map[string]bool, error) {
+	if !strings.EqualFold(a.marketType, "um_futures") {
+		return nil, nil
+	}
+	payload, err := a.fetchExchangeInfo(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	symbols := make(map[string]bool)
+	for _, item := range payload {
+		if strings.EqualFold(strings.TrimSpace(item.ContractType), "TRADIFI_PERPETUAL") {
+			symbols[strings.ToUpper(strings.TrimSpace(item.Symbol))] = true
+		}
+	}
+	return symbols, nil
+}
+
+func (a *BinanceFuturesAdapter) fetchExchangeInfo(ctx context.Context, client *http.Client) ([]binanceExchangeInfoSymbol, error) {
 	path := "/api/v3/exchangeInfo"
 	if a.marketType == "" || strings.EqualFold(a.marketType, "um_futures") {
 		path = "/fapi/v1/exchangeInfo"
@@ -60,35 +111,12 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 		return nil, fmt.Errorf("binance exchangeInfo status %s", resp.Status)
 	}
 	var payload struct {
-		Symbols []struct {
-			Symbol         string `json:"symbol"`
-			Status         string `json:"status"`
-			ContractStatus string `json:"contractStatus"`
-		} `json:"symbols"`
+		Symbols []binanceExchangeInfoSymbol `json:"symbols"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
-	now := market.NowMS()
-	symbols := make([]market.SymbolInfo, 0, len(payload.Symbols))
-	for _, item := range payload.Symbols {
-		symbol := strings.ToUpper(strings.TrimSpace(item.Symbol))
-		if symbol == "" {
-			continue
-		}
-		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
-		symbols = append(symbols, market.SymbolInfo{
-			Exchange:      a.Name(),
-			Symbol:        symbol,
-			MarketType:    a.marketType,
-			Status:        status,
-			IsActive:      status == "TRADING",
-			FirstSeenAtMS: now,
-			LastSeenAtMS:  now,
-			UpdatedAtMS:   now,
-		})
-	}
-	return symbols, nil
+	return payload.Symbols, nil
 }
 
 func (a *BinanceFuturesAdapter) BuildSubscribePayload(symbols []string, requestID int64) ([]byte, error) {

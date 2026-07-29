@@ -103,6 +103,59 @@ func runRetention(ctx context.Context, cfg config.Config, opts options) error {
 
 	for _, tf := range opts.timeframes {
 		rule := retention.RuleFor(tf)
+		if rule.KeepBars > 0 {
+			series, err := store.BarSeriesForTimeframe(ctx, tf)
+			if err != nil {
+				return err
+			}
+			var total int64
+			batches := 0
+			limitReached := false
+			for _, item := range series {
+				count, err := store.CountSeriesBars(ctx, item, tf)
+				if err != nil {
+					return err
+				}
+				excess := count - int64(rule.KeepBars)
+				if excess < 0 {
+					excess = 0
+				}
+				if opts.dryRun {
+					log.Printf("dry-run retention timeframe=%s exchange=%s symbol=%s keep_bars=%d rows=%d excess=%d", tf, item.Exchange, item.Symbol, rule.KeepBars, count, excess)
+					continue
+				}
+				if excess == 0 {
+					continue
+				}
+				cutoffMS, found, err := store.SeriesBarCutoff(ctx, item, tf, rule.KeepBars)
+				if err != nil {
+					return err
+				}
+				if !found {
+					continue
+				}
+				for {
+					deleted, err := store.DeleteSeriesBarsBefore(ctx, item, tf, cutoffMS, opts.batchSize)
+					if err != nil {
+						return err
+					}
+					batches++
+					total += deleted
+					if opts.maxBatches > 0 && batches >= opts.maxBatches {
+						limitReached = true
+						break
+					}
+					if deleted < int64(opts.batchSize) {
+						break
+					}
+				}
+				if limitReached {
+					break
+				}
+			}
+			log.Printf("retention complete timeframe=%s mode=keep_bars keep_bars=%d series=%d batches=%d deleted=%d", tf, rule.KeepBars, len(series), batches, total)
+			continue
+		}
 		cutoffMS, ok := retention.CutoffMS(rule, opts.now)
 		if !ok {
 			log.Printf("retention timeframe=%s keep=forever skip", tf)
@@ -117,17 +170,36 @@ func runRetention(ctx context.Context, cfg config.Config, opts options) error {
 			continue
 		}
 		var total int64
-		for batch := 1; ; batch++ {
-			deleted, err := store.DeleteBarsBefore(ctx, tf, cutoffMS, opts.batchSize)
-			if err != nil {
-				return err
+		series, err := store.BarSeriesForTimeframe(ctx, tf)
+		if err != nil {
+			return err
+		}
+		batches := 0
+		limitReached := false
+		for _, item := range series {
+			for {
+				deleted, err := store.DeleteSeriesBarsBefore(ctx, item, tf, cutoffMS, opts.batchSize)
+				if err != nil {
+					return err
+				}
+				batches++
+				total += deleted
+				if batches%100 == 0 {
+					log.Printf("retention progress timeframe=%s batches=%d total=%d cutoff_ms=%d", tf, batches, total, cutoffMS)
+				}
+				if opts.maxBatches > 0 && batches >= opts.maxBatches {
+					limitReached = true
+					break
+				}
+				if deleted < int64(opts.batchSize) {
+					break
+				}
 			}
-			total += deleted
-			log.Printf("retention timeframe=%s batch=%d deleted=%d total=%d cutoff_ms=%d", tf, batch, deleted, total, cutoffMS)
-			if deleted < int64(opts.batchSize) || (opts.maxBatches > 0 && batch >= opts.maxBatches) {
+			if limitReached {
 				break
 			}
 		}
+		log.Printf("retention complete timeframe=%s series=%d batches=%d deleted=%d cutoff_ms=%d", tf, len(series), batches, total, cutoffMS)
 	}
 	return nil
 }

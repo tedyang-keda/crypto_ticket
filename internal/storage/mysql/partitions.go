@@ -133,7 +133,7 @@ func futurePartitionName(tf string) string {
 }
 
 func hasMonthlyPartitions(tf string) bool {
-	return !retention.RuleFor(tf).KeepForever
+	return retention.RuleFor(tf).KeepDays > 0
 }
 
 func futurePartitionDDL(tf string, frameIndex int, frames []string, trailingComma bool) string {

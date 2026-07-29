@@ -17,6 +17,11 @@ type Store struct {
 	db *sql.DB
 }
 
+type BarSeries struct {
+	Exchange string
+	Symbol   string
+}
+
 func New(dsn string) (*Store, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -30,6 +35,65 @@ func New(dsn string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
+func (s *Store) DBStats() sql.DBStats {
+	return s.db.Stats()
+}
+
+func (s *Store) ContinuousOneMinuteSeries(ctx context.Context, startMS int64, endMS int64, minimumHours int) ([]market.MarketSeries, error) {
+	if minimumHours <= 0 {
+		minimumHours = 70
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT exchange, symbol, market_type
+		FROM symbol_registry
+		WHERE is_active = 1
+		ORDER BY exchange, symbol`)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []market.MarketSeries
+	for rows.Next() {
+		var item market.MarketSeries
+		if err := rows.Scan(&item.Exchange, &item.Symbol, &item.MarketType); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	// The primary key starts with exchange, symbol and timeframe. Querying one
+	// symbol at a time keeps the 72-hour audit on that index range instead of
+	// building a disk-backed temporary table for the whole market.
+	statement, err := s.db.PrepareContext(ctx, `SELECT COUNT(DISTINCT FLOOR(start_ms / 3600000))
+		FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = '1m' AND is_final = 1
+			AND start_ms BETWEEN ? AND ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer statement.Close()
+	var out []market.MarketSeries
+	for _, item := range candidates {
+		var hours int
+		if err := statement.QueryRowContext(ctx, item.Exchange, item.Symbol, startMS, endMS).Scan(&hours); err != nil {
+			return nil, err
+		}
+		if hours >= minimumHours {
+			out = append(out, item)
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) EnsureSchema(ctx context.Context) error {
@@ -82,6 +146,31 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 				PRIMARY KEY (id),
 				KEY idx_guardian_event_market_time (exchange, symbol, timeframe, start_ms),
 				KEY idx_guardian_event_type (event_type, created_at)
+			)`,
+		`CREATE TABLE IF NOT EXISTS corporate_action_job (
+				id BIGINT NOT NULL AUTO_INCREMENT,
+				exchange VARCHAR(16) NOT NULL,
+				symbol VARCHAR(64) NOT NULL,
+				market_type VARCHAR(32) NOT NULL DEFAULT '',
+				effective_ms BIGINT NOT NULL,
+				observed_ratio DECIMAL(28, 12) NOT NULL DEFAULT 0,
+				factor DECIMAL(28, 12) NOT NULL DEFAULT 0,
+				detector VARCHAR(32) NOT NULL DEFAULT '',
+				status VARCHAR(32) NOT NULL DEFAULT 'pending',
+				attempts INT NOT NULL DEFAULT 0,
+				next_retry_ms BIGINT NOT NULL DEFAULT 0,
+				last_error TEXT NULL,
+				rows_written BIGINT NOT NULL DEFAULT 0,
+				verification_status VARCHAR(32) NOT NULL DEFAULT '',
+				verification_json JSON NULL,
+				created_at_ms BIGINT NOT NULL DEFAULT 0,
+				updated_at_ms BIGINT NOT NULL DEFAULT 0,
+				completed_at_ms BIGINT NOT NULL DEFAULT 0,
+				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				PRIMARY KEY (id),
+				UNIQUE KEY uk_corporate_action_event (exchange, symbol, effective_ms),
+				KEY idx_corporate_action_due (status, next_retry_ms, id)
 			)`,
 	}
 	for _, statement := range statements {
@@ -167,14 +256,54 @@ func (s *Store) ClearBars(ctx context.Context) (int64, error) {
 	return deleted, nil
 }
 
+func (s *Store) DeleteBarsInRange(ctx context.Context, exchange string, symbol string, timeframe string, startMS int64, endMS int64) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ? AND start_ms >= ? AND start_ms <= ?`,
+		strings.ToLower(exchange), strings.ToUpper(symbol), timeframe, startMS, endMS)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (s *Store) DeleteBarsBefore(ctx context.Context, timeframe string, cutoffMS int64, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 10_000
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM bar_history
 		WHERE timeframe = ? AND start_ms < ?
-		ORDER BY start_ms ASC
 		LIMIT ?`, timeframe, cutoffMS, limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func (s *Store) BarSeriesForTimeframe(ctx context.Context, timeframe string) ([]BarSeries, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT exchange, symbol FROM bar_history
+		WHERE timeframe = ?`, timeframe)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var series []BarSeries
+	for rows.Next() {
+		var item BarSeries
+		if err := rows.Scan(&item.Exchange, &item.Symbol); err != nil {
+			return nil, err
+		}
+		series = append(series, item)
+	}
+	return series, rows.Err()
+}
+
+func (s *Store) DeleteSeriesBarsBefore(ctx context.Context, series BarSeries, timeframe string, cutoffMS int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 10_000
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ? AND start_ms < ?
+		LIMIT ?`, series.Exchange, series.Symbol, timeframe, cutoffMS, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -186,6 +315,32 @@ func (s *Store) CountBarsBefore(ctx context.Context, timeframe string, cutoffMS 
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bar_history
 		WHERE timeframe = ? AND start_ms < ?`, timeframe, cutoffMS).Scan(&count)
 	return count, err
+}
+
+func (s *Store) CountSeriesBars(ctx context.Context, series BarSeries, timeframe string) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ?`, series.Exchange, series.Symbol, timeframe).Scan(&count)
+	return count, err
+}
+
+// SeriesBarCutoff returns the start_ms of the keepBars-th newest bar. Rows
+// older than this value can be removed while retaining exactly keepBars rows.
+func (s *Store) SeriesBarCutoff(ctx context.Context, series BarSeries, timeframe string, keepBars int) (int64, bool, error) {
+	if keepBars <= 0 {
+		return 0, false, nil
+	}
+	var cutoff int64
+	err := s.db.QueryRowContext(ctx, `SELECT start_ms FROM bar_history
+		WHERE exchange = ? AND symbol = ? AND timeframe = ?
+		ORDER BY start_ms DESC LIMIT 1 OFFSET ?`, series.Exchange, series.Symbol, timeframe, keepBars-1).Scan(&cutoff)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return cutoff, true, nil
 }
 
 func (s *Store) RecentBars(ctx context.Context, query market.KlineQuery) ([]market.Bar, error) {
@@ -397,6 +552,116 @@ func (s *Store) InsertKlineGuardianEvents(ctx context.Context, events []market.K
 	return nil
 }
 
+func (s *Store) LoadCorporateActionJob(ctx context.Context, exchange string, symbol string, effectiveMS int64) (*market.CorporateActionJob, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, exchange, symbol, market_type, effective_ms, observed_ratio, factor,
+		detector, status, attempts, next_retry_ms, COALESCE(last_error, ''), rows_written,
+		verification_status, COALESCE(CAST(verification_json AS CHAR), ''), created_at_ms, updated_at_ms, completed_at_ms
+		FROM corporate_action_job WHERE exchange = ? AND symbol = ? AND effective_ms = ?`,
+		strings.ToLower(exchange), strings.ToUpper(symbol), effectiveMS)
+	job, err := scanCorporateActionJob(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (s *Store) InsertCorporateActionJob(ctx context.Context, job market.CorporateActionJob) error {
+	nowMS := market.NowMS()
+	if job.CreatedAtMS == 0 {
+		job.CreatedAtMS = nowMS
+	}
+	if job.UpdatedAtMS == 0 {
+		job.UpdatedAtMS = nowMS
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT IGNORE INTO corporate_action_job
+		(exchange, symbol, market_type, effective_ms, observed_ratio, factor, detector, status, attempts,
+		 next_retry_ms, last_error, rows_written, verification_status, verification_json, created_at_ms, updated_at_ms, completed_at_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.ToLower(job.Exchange), strings.ToUpper(job.Symbol), job.MarketType, job.EffectiveMS,
+		job.ObservedRatio, job.Factor, job.Detector, job.Status, job.Attempts, job.NextRetryMS,
+		nullableString(job.LastError), job.RowsWritten, job.VerificationStatus, nullableJSON(job.VerificationJSON),
+		job.CreatedAtMS, job.UpdatedAtMS, job.CompletedAtMS)
+	return err
+}
+
+func (s *Store) ListDueCorporateActionJobs(ctx context.Context, nowMS int64, limit int) ([]market.CorporateActionJob, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, exchange, symbol, market_type, effective_ms, observed_ratio, factor,
+		detector, status, attempts, next_retry_ms, COALESCE(last_error, ''), rows_written,
+		verification_status, COALESCE(CAST(verification_json AS CHAR), ''), created_at_ms, updated_at_ms, completed_at_ms
+		FROM corporate_action_job
+		WHERE ((status IN ('pending', 'retry') AND next_retry_ms <= ?) OR
+		       (status = 'running' AND updated_at_ms <= ?))
+		ORDER BY id ASC LIMIT ?`, nowMS, nowMS-int64((10*time.Minute)/time.Millisecond), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []market.CorporateActionJob
+	for rows.Next() {
+		job, err := scanCorporateActionJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+func (s *Store) UpdateCorporateActionJob(ctx context.Context, job market.CorporateActionJob) error {
+	job.UpdatedAtMS = market.NowMS()
+	_, err := s.db.ExecContext(ctx, `UPDATE corporate_action_job SET
+		market_type = ?, observed_ratio = ?, factor = ?, detector = ?, status = ?, attempts = ?,
+		next_retry_ms = ?, last_error = ?, rows_written = ?, verification_status = ?, verification_json = ?,
+		updated_at_ms = ?, completed_at_ms = ?
+		WHERE exchange = ? AND symbol = ? AND effective_ms = ?`,
+		job.MarketType, job.ObservedRatio, job.Factor, job.Detector, job.Status, job.Attempts,
+		job.NextRetryMS, nullableString(job.LastError), job.RowsWritten, job.VerificationStatus,
+		nullableJSON(job.VerificationJSON), job.UpdatedAtMS, job.CompletedAtMS,
+		strings.ToLower(job.Exchange), strings.ToUpper(job.Symbol), job.EffectiveMS)
+	return err
+}
+
+func (s *Store) ListCorporateActionFactors(ctx context.Context, exchange string, symbol string) ([]market.CorporateActionJob, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, exchange, symbol, market_type, effective_ms, observed_ratio, factor,
+		detector, status, attempts, next_retry_ms, COALESCE(last_error, ''), rows_written,
+		verification_status, COALESCE(CAST(verification_json AS CHAR), ''), created_at_ms, updated_at_ms, completed_at_ms
+		FROM corporate_action_job
+		WHERE exchange = ? AND symbol = ? AND factor > 0 AND status IN ('confirmed', 'running', 'retry', 'completed')
+		ORDER BY effective_ms ASC`, strings.ToLower(exchange), strings.ToUpper(symbol))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []market.CorporateActionJob
+	for rows.Next() {
+		job, err := scanCorporateActionJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanCorporateActionJob(row rowScanner) (market.CorporateActionJob, error) {
+	var job market.CorporateActionJob
+	err := row.Scan(&job.ID, &job.Exchange, &job.Symbol, &job.MarketType, &job.EffectiveMS,
+		&job.ObservedRatio, &job.Factor, &job.Detector, &job.Status, &job.Attempts, &job.NextRetryMS,
+		&job.LastError, &job.RowsWritten, &job.VerificationStatus, &job.VerificationJSON,
+		&job.CreatedAtMS, &job.UpdatedAtMS, &job.CompletedAtMS)
+	return job, err
+}
+
 func barArgs(bar market.Bar) []any {
 	return []any{
 		strings.ToLower(bar.Exchange),
@@ -424,6 +689,13 @@ func barArgs(bar market.Bar) []any {
 }
 
 func nullableJSON(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableString(value string) any {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}

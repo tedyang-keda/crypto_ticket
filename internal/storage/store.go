@@ -14,3 +14,11 @@ type HistoricalStore interface {
 	UpsertSymbols(ctx context.Context, symbols []market.SymbolInfo) error
 	ListSymbols(ctx context.Context, exchange string, activeOnly *bool) ([]market.SymbolInfo, error)
 }
+
+type CorporateActionStore interface {
+	LoadCorporateActionJob(ctx context.Context, exchange string, symbol string, effectiveMS int64) (*market.CorporateActionJob, error)
+	InsertCorporateActionJob(ctx context.Context, job market.CorporateActionJob) error
+	ListDueCorporateActionJobs(ctx context.Context, nowMS int64, limit int) ([]market.CorporateActionJob, error)
+	UpdateCorporateActionJob(ctx context.Context, job market.CorporateActionJob) error
+	ListCorporateActionFactors(ctx context.Context, exchange string, symbol string) ([]market.CorporateActionJob, error)
+}

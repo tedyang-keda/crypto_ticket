@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -45,6 +46,30 @@ func TestBinanceFetchKlinesUsesOfficialVolumeFields(t *testing.T) {
 	}
 }
 
+func TestBinanceFetchContinuousKlinesUsesTradFiEndpoint(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/fapi/v1/continuousKlines" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("pair") != "KORUUSDT" || query.Get("contractType") != "TRADIFI_PERPETUAL" || query.Get("interval") != "1d" {
+			t.Fatalf("unexpected query %s", r.URL.RawQuery)
+		}
+		return jsonResponse(`[[3600000,"100.0","110.0","90.0","105.0","1.234",7199999,"129.570",7,"0","0","0"]]`), nil
+	})}
+
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+	bars, err := adapter.FetchContinuousKlines(context.Background(), client, KlineRequest{
+		Symbol: "KORUUSDT", Timeframe: "1D", Limit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 || bars[0].Source != "rest" {
+		t.Fatalf("unexpected continuous bars: %+v", bars)
+	}
+}
+
 func TestOKXFetchKlinesUsesBaseAndQuoteVolumeFields(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/api/v5/market/candles" {
@@ -76,6 +101,103 @@ func TestOKXFetchKlinesUsesBaseAndQuoteVolumeFields(t *testing.T) {
 	assertFloatEqual(t, bar.QuoteVolume, 129.570)
 	if bar.TradeCount != 0 {
 		t.Fatalf("okx REST candles do not provide trade count, got %d", bar.TradeCount)
+	}
+}
+
+func TestOKXFetchKlinesAutoRequestsForwardAdjustment(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if got := r.URL.Query().Get("adjust"); got != "forward" {
+			t.Fatalf("expected adjust=forward, got %q", got)
+		}
+		return jsonResponse(`{"code":"0","data":[["3600000","5","6","4","5.5","10","20","100","1"]]}`), nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol:     "TEST-USDT-SWAP",
+		Timeframe:  "1H",
+		Limit:      1,
+		Adjustment: KlineAdjustmentAuto,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bars) != 1 || bars[0].OpenPrice != 5 {
+		t.Fatalf("unexpected bars: %+v", bars)
+	}
+}
+
+func TestOKXFetchKlinesAutoFallsBackToRaw(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			if got := r.URL.Query().Get("adjust"); got != "forward" {
+				t.Fatalf("expected first request to use forward adjustment, got %q", got)
+			}
+			return jsonResponse(`{"code":"51000","msg":"Parameter adjust error","data":[]}`), nil
+		}
+		if got := r.URL.Query().Get("adjust"); got != "" {
+			t.Fatalf("expected raw fallback without adjust, got %q", got)
+		}
+		return jsonResponse(`{"code":"0","data":[["3600000","100","110","90","105","10","20","2000","1"]]}`), nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol:     "TEST-USDT-SWAP",
+		Timeframe:  "1H",
+		Limit:      1,
+		Adjustment: KlineAdjustmentAuto,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(bars) != 1 || bars[0].OpenPrice != 100 {
+		t.Fatalf("unexpected fallback result requests=%d bars=%+v", requests, bars)
+	}
+}
+
+func TestOKXFetchKlinesForwardDoesNotSilentlyFallback(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResponse(`{"code":"51000","msg":"Parameter adjust error","data":[]}`), nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	_, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol:     "TEST-USDT-SWAP",
+		Timeframe:  "1H",
+		Limit:      1,
+		Adjustment: KlineAdjustmentForward,
+	})
+	if !errors.Is(err, ErrUnsupportedKlineAdjustment) {
+		t.Fatalf("expected unsupported adjustment error, got %v", err)
+	}
+}
+
+func TestKlineRequestRetriesRateLimit(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Body:       io.NopCloser(strings.NewReader(`{"code":"50011"}`)),
+			}, nil
+		}
+		return jsonResponse(`{"code":"0","data":[["3600000","100","110","90","105","10","20","2000","1"]]}`), nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	_, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "TEST-USDT-SWAP", Timeframe: "1H", Limit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("expected one retry, got %d requests", requests)
 	}
 }
 
@@ -115,6 +237,36 @@ func TestOKXFetchKlinesUsesHistoryEndpointForExplicitStart(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOKXFetchKlinesContinuesAfterShortHistoryPage(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return jsonResponse(`{"code":"0","data":[["240000","10","10","10","10","1","1","10","1"],["180000","10","10","10","10","1","1","10","1"]]}`), nil
+		case 2:
+			if got := r.URL.Query().Get("after"); got != "180000" {
+				t.Fatalf("unexpected second-page cursor %s", got)
+			}
+			return jsonResponse(`{"code":"0","data":[["120000","10","10","10","10","1","1","10","1"],["60000","10","10","10","10","1","1","10","1"]]}`), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "TEST-USDT-SWAP", Timeframe: "1m", StartMS: 60_000, EndMS: 300_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(bars) != 4 {
+		t.Fatalf("short history page stopped pagination requests=%d bars=%d", requests, len(bars))
 	}
 }
 

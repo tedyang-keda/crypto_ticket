@@ -109,6 +109,27 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `50` | 每轮最多校验多少个 active symbol，按轮询 cursor 分批 |
 | `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | symbol 之间 REST 请求节流 |
 | `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` | `600` | 只审计最近被 collector 刷新过的 active symbol，避免旧脏 symbol 进入 REST 校验 |
+| `ENABLE_HEALTH_MONITOR` | 跟随 `ENABLE_COLLECTOR` | 启用进程内健康评估、Prometheus 指标、P0 告警和每日摘要 |
+| `MONITOR_P1_ALERTS_ENABLED` | `false` | P1 实时飞书告警开关；关闭时仍采集指标并在日报统计 would-fire |
+| `MONITOR_EVALUATION_SECONDS` | `15` | 健康评估周期；MySQL 连续失败 3 次后产生 P0 告警 |
+| `MONITOR_DAILY_REPORT_HOUR` | `9` | 每日北京时间发送健康摘要的小时 |
+| `MONITOR_INTEGRITY_INTERVAL_SECONDS` | `600` | 高周期只读审计周期，不会自动覆盖 K 线 |
+| `MONITOR_INTEGRITY_SYMBOLS_PER_RUN` | `50` | 每轮审计的 active symbol 数量，按 cursor 轮转 |
+| `MONITOR_INTEGRITY_TIMEFRAMES` | `15m,30m,1H,4H,1D,2D,1W` | 高周期审计范围；只使用本地 source bars 重算和检查缺失/非法/不一致 |
+| `WATCHDOG_READY_URL` | `http://127.0.0.1:8088/readyz` | 独立 watchdog 探测地址 |
+| `WATCHDOG_DISK_PATH` | `.` | watchdog 和进程内资源采样检查的文件系统路径 |
+| `WATCHDOG_STATE_FILE` | `/var/lib/crypto-ticket-watchdog/state.json` | watchdog 告警状态和重启窗口持久化位置 |
+| `WATCHDOG_INTERVAL_SECONDS` | `30` | watchdog 探测周期；连续 2 次 ready 失败告警 |
+| `WATCHDOG_SERVICE_UNIT` | `crypto-ticket.service` | watchdog 查询 `NRestarts` 的 systemd unit |
+| `ENABLE_CORPORATE_ACTION` | `false` | 是否启用复权事件检测、历史回填、验证和飞书通知 |
+| `CORPORATE_ACTION_POLL_SECONDS` | `15` | 待处理复权任务轮询周期 |
+| `CORPORATE_ACTION_MAX_ATTEMPTS` | `5` | 单个回填任务最大尝试次数 |
+| `CORPORATE_ACTION_RETRY_BASE_SECONDS` | `60` | 第一次失败后的重试基准间隔，后续指数退避 |
+| `CORPORATE_ACTION_JOBS_PER_RUN` | `1` | 每轮最多执行的复权任务数 |
+| `CORPORATE_ACTION_REQUEST_DELAY_MS` | `100` | 复权任务中相邻官方 REST 请求之间的节流 |
+| `CORPORATE_ACTION_ANCHOR_SECONDS` | `60` | OKX 日线前复权锚点审计周期 |
+| `CORPORATE_ACTION_ANCHOR_SYMBOLS_PER_RUN` | `1` | 每轮锚点审计的品种数，按轮询 cursor 分摊请求 |
+| `FEISHU_WEBHOOK_URL` | 空 | 复权疑似、确认、回填、重试和验证报告发送地址；为空时只写日志和数据库 |
 | `ENABLE_MOCK_SYMBOLS` | collector 关闭时默认 `true` | 是否插入 demo symbols |
 | `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
@@ -359,6 +380,38 @@ WS 时效性：
 curl 'http://127.0.0.1:8088/healthz'
 ```
 
+`/healthz` 只表示进程能响应，返回 `started_at_ms` 和 `uptime_seconds`，不会因为 MySQL 或行情停滞返回失败。
+
+就绪检查：
+
+```bash
+curl -i 'http://127.0.0.1:8088/readyz'
+curl 'http://127.0.0.1:8088/metrics'
+```
+
+`/readyz` 检查 MySQL，以及每个 `exchange + market_type` 的 WS 最后有效 `1m` K 线、final 入库和发布水位；失败返回 `503`，启动宽限期内的 collector 会显示为 `initializing`。collector 未启用时行情水位检查显示为 `disabled`。`/metrics` 是 Prometheus 文本格式，标签不包含 symbol。
+
+### 健康监控和告警
+
+进程内监控每 15 秒评估一次，并通过 `FEISHU_WEBHOOK_URL` 发送告警。P0 默认立即启用，P1 默认影子运行：P1 只写日志、Prometheus 指标和每日摘要中的 `would-fire` 统计，观察 24 小时后再设置 `MONITOR_P1_ALERTS_ENABLED=true`。
+
+- P0：MySQL 连续失败、WS 90 秒无有效 K 线、final `1m` 入库/发布停滞、Collector 重连风暴、Guardian 修复失败和队列丢弃。
+- P1：HTTP 5xx/延迟、WebSocket 慢消费者、高周期完整性、连续活跃 7x24 品种局部停滞，以及 CPU、RSS、FD、goroutine 等资源阈值。
+- 同一告警 key 状态变化或严重度升级立即通知；持续异常最多每 30 分钟提醒一次；连续两次健康后发送恢复通知。通知失败最多重试 3 次，不阻塞行情处理。
+- 高周期审计每轮最多检查 50 个品种最近 3 个已结束桶，先验证底层 source bars 完整，再检查 OHLC 和本地重算结果；审计本身只读，不替代 Guardian 或 backfill。
+
+独立 watchdog 与 `marketd` 分开运行，负责每 30 秒探测 `/readyz`、统计 10 分钟内重启次数和检查磁盘。Linux/systemd 部署时构建并安装：
+
+```bash
+go build -o bin/marketd ./cmd/marketd
+go build -o bin/health_watchdog ./cmd/health_watchdog
+sudo install -m 0644 deployments/systemd/crypto-ticket-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now crypto-ticket-watchdog.service
+```
+
+watchdog 的状态文件默认写入 `/var/lib/crypto-ticket-watchdog/state.json`。磁盘使用率达到 80%/90% 分别告警/严重告警，恢复阈值为 75%/85%。它只能发现同机进程和文件系统问题，无法覆盖整机断电或网络完全不可达。
+
 最新 ticker：
 
 ```bash
@@ -485,10 +538,10 @@ final 1m received
 
 | 周期 | 保留 |
 | --- | --- |
-| `1m` | 15 天 |
-| `5m` / `15m` / `30m` | 90 天 |
+| `1m` | 7 天 |
+| `5m` / `15m` / `30m` | 30 天 |
 | `1H` / `2H` / `4H` / `6H` / `12H` | 180 天 |
-| `1D` 及以上 | 全部保留 |
+| `1D` / `2D` / `3D` / `5D` / `1W` / `2W` / `1M` / `3M` | 每个 exchange + symbol + timeframe 最新 300 根 |
 
 清理命令默认是 dry-run，只统计将删除的行数：
 
@@ -506,7 +559,7 @@ MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
 go run ./cmd/maintain_klines -mode=retention -dry-run=false -batch-size=10000
 ```
 
-`sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`。会过期的周期按 timeframe + month 分区，`1D` 及以上只保留 future 分区。生成迁移 SQL：
+`sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`。按天数过期的周期使用 timeframe + month 分区；`1D` 及以上按每个品种的最新 300 根逐行清理，因此只使用 future 分区。生成迁移 SQL：
 
 ```bash
 go run ./cmd/maintain_klines -mode=partition-create-sql -partition-start=2026-01 -partition-months=12 > /tmp/bar_history_timeframe_partition.sql
@@ -524,6 +577,14 @@ go run ./cmd/maintain_klines -mode=partition-drop-sql -partition-start=2026-01 -
 go run ./cmd/maintain_klines -mode=partition-add-sql -partition-start=2029-01 -partition-months=12
 ```
 
+## Corporate Action Worker
+
+复权 worker 使用 WS final `1m` 做低成本触发信号：只有相邻分钟的开盘/前收比例接近常见拆分比例（例如 `20:1`、`4:1`）时才访问官方 REST。REST 确认通过后写入 `corporate_action_job`，任务状态持久化为 `pending`、`running`、`retry`、`completed` 或 `failed`，进程重启后仍可继续重试。
+
+回填按当前 retention 规则覆盖全部配置周期，`1D` 及以上每次只处理最新 300 根。OKX 优先请求官方 `adjust=forward`；不支持时明确记录 raw fallback。Corporate Action Worker 对 Binance `TRADIFI_PERPETUAL` 使用官方 raw K 线和已确认的拆分因子计算前复权。每个周期写入后立即和本次官方结果做逐根校验，结果及 mismatch 数量写入任务的验证摘要。
+
+飞书通知不参与主流程的成功判定。通知失败会单独重试并记录日志，不会阻断行情回填；回填失败则按指数退避重试，超过最大次数后发送最终失败告警。
+
 ## Backfill 和 Redis
 
 历史回填：
@@ -532,15 +593,33 @@ go run ./cmd/maintain_klines -mode=partition-add-sql -partition-start=2029-01 -p
 USE_MEMORY_STORE=false \
 MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
 REDIS_URL='redis://127.0.0.1:6379/0' \
-go run ./cmd/backfill_klines -exchanges=binance,okx -timeframes=1m,5m,15m,30m,1H -limit=300
+go run ./cmd/backfill_klines -exchanges=binance,okx -timeframes=1m,5m,15m,30m,1H -limit=300 -adjustment=auto
 ```
 
 `cmd/backfill_klines` 会：
 
 1. 读取 / 刷新 symbols。
-2. 调用交易所 REST kline 接口拉历史 official final bars。
-3. 批量 upsert 到 MySQL `bar_history`。
-4. 默认清理旧 Redis kline recent/live cache key。
+2. 默认使用 `-adjustment=auto`：OKX 优先请求官方 `adjust=forward`，官方明确不支持该参数时回退 raw。
+3. Binance 没有 `adjust=forward` 参数。对官方标记为 `TRADIFI_PERPETUAL` 的 USD-M 品种，工具优先请求 `/fapi/v1/continuousKlines`，并用同范围 raw 日线识别拆并股、验证连续日线是否真正消除了跳变。验证通过后直接回填官方连续目标周期；验证不通过时使用日线识别的因子修正 raw 目标周期，只对跨事件的单个桶补拉 `1m` 重建。
+4. 优先拉取交易所官方目标周期 final bars；交易所没有目标周期接口时，从官方低周期 final bars 合并生成，例如 `5D <- 1D`、`2W <- 1D`。
+5. 默认使用 `-respect-retention=true`：根据 `maintain_klines` 的 policy 截断各周期起点，`1m` 最多回填 7 天，`5m` / `15m` / `30m` 最多 30 天，`1H` 到 `12H` 最多 180 天，`1D` 及以上最多回填最新 300 根。
+6. 默认使用 `-replace-existing=true`：成功拉完一个 symbol/timeframe 后，删除本次官方结果覆盖区间内的旧行，再批量 upsert 新结果，避免旧 rollup 错位桶残留。
+7. 默认清理旧 Redis kline recent/live cache key。
+
+也可以显式指定 `-adjustment=forward` 或 `-adjustment=raw`。`forward` 在官方不支持时返回错误；`auto` 才会自动回退。
+
+确实需要绕过 retention 做诊断时，必须同时传 `-respect-retention=false`、`-start` 和 `-limit=0`。正常修复不建议使用全历史模式：
+
+```bash
+go run ./cmd/backfill_klines \
+  -exchanges=okx \
+  -market-types=SWAP \
+  -symbols=KORU-USDT-SWAP \
+  -timeframes=1m,5m,15m,30m,1H,2H,4H,6H,12H,1D,2D,3D,5D,1W,2W,1M,3M \
+  -start=2026-01-01 -limit=0 -respect-retention=false -adjustment=auto -clear-redis=false
+```
+
+Binance USD-M 和 COIN-M 可能存在同名 symbol，而 `bar_history` 主键不包含 market type。股票永续回填必须显式传 `-market-types=um_futures`，避免 COIN-M 同名数据覆盖 USD-M。
 
 如果当前环境没有 Redis，回填时加 `-clear-redis=false`：
 

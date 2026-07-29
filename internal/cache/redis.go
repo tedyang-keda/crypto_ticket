@@ -21,6 +21,21 @@ type KlineCacheClearOptions struct {
 	ScanCount     int64
 }
 
+func (r *RedisMarketCache) ClearSymbolKlines(ctx context.Context, exchange string, symbol string, timeframes []string) (int64, error) {
+	var total int64
+	for _, tf := range timeframes {
+		count, err := r.ClearKlineCache(ctx, KlineCacheClearOptions{
+			Exchange: exchange, Symbol: symbol, Timeframe: tf,
+			IncludeRecent: true, IncludeLive: true,
+		})
+		if err != nil {
+			return total, err
+		}
+		total += count
+	}
+	return total, nil
+}
+
 func NewRedisMarketCache(redisURL string) (*RedisMarketCache, error) {
 	options, err := redis.ParseURL(redisURL)
 	if err != nil {

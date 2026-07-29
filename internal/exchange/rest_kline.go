@@ -5,17 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/timeframe"
 )
 
 var ErrUnsupportedKlineInterval = errors.New("unsupported REST kline interval")
+var ErrUnsupportedKlineAdjustment = errors.New("unsupported REST kline adjustment")
+
+type KlineAdjustment string
+
+const (
+	KlineAdjustmentRaw     KlineAdjustment = "raw"
+	KlineAdjustmentForward KlineAdjustment = "forward"
+	KlineAdjustmentAuto    KlineAdjustment = "auto"
+)
 
 const (
 	binanceMaxKlineLimit = 1500
@@ -25,16 +36,35 @@ const (
 )
 
 type KlineRequest struct {
-	Symbol    string
-	Timeframe string
-	StartMS   int64
-	EndMS     int64
-	Limit     int
+	Symbol     string
+	Timeframe  string
+	StartMS    int64
+	EndMS      int64
+	Limit      int
+	Adjustment KlineAdjustment
+	PageDelay  time.Duration
+}
+
+func ParseKlineAdjustment(value string) (KlineAdjustment, error) {
+	switch KlineAdjustment(strings.ToLower(strings.TrimSpace(value))) {
+	case "", KlineAdjustmentRaw:
+		return KlineAdjustmentRaw, nil
+	case KlineAdjustmentForward:
+		return KlineAdjustmentForward, nil
+	case KlineAdjustmentAuto:
+		return KlineAdjustmentAuto, nil
+	default:
+		return "", fmt.Errorf("unsupported kline adjustment %q", value)
+	}
 }
 
 type RESTKlineFetcher interface {
 	Name() string
 	FetchKlines(ctx context.Context, client *http.Client, request KlineRequest) ([]market.Bar, error)
+}
+
+type ContinuousKlineFetcher interface {
+	FetchContinuousKlines(ctx context.Context, client *http.Client, request KlineRequest) ([]market.Bar, error)
 }
 
 func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Client, request KlineRequest) ([]market.Bar, error) {
@@ -53,6 +83,35 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 		path = "/fapi/v1/klines"
 	} else if a.marginType() == "coinmargin" {
 		path = "/dapi/v1/klines"
+	}
+
+	return a.fetchBinanceKlines(ctx, client, request, path, "symbol", interval)
+}
+
+// FetchContinuousKlines uses Binance's TRADIFI_PERPETUAL continuous contract
+// endpoint. Binance does not expose an adjust=forward parameter; this endpoint
+// is therefore only used after the caller validates its corporate-action data.
+func (a *BinanceFuturesAdapter) FetchContinuousKlines(ctx context.Context, client *http.Client, request KlineRequest) ([]market.Bar, error) {
+	interval, err := binanceKlineInterval(request.Timeframe)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(a.marketType, "um_futures") && a.marketType != "" {
+		return nil, fmt.Errorf("%w: Binance continuous TRADIFI_PERPETUAL requires um_futures", ErrUnsupportedKlineInterval)
+	}
+	request.Symbol = strings.ToUpper(strings.TrimSpace(request.Symbol))
+	request.Timeframe = timeframe.MustNormalize(request.Timeframe)
+	if request.Symbol == "" {
+		return nil, nil
+	}
+	return a.fetchBinanceKlines(ctx, client, request, "/fapi/v1/continuousKlines", "pair", interval)
+}
+
+func (a *BinanceFuturesAdapter) fetchBinanceKlines(ctx context.Context, client *http.Client, request KlineRequest, path string, symbolParam string, interval string) ([]market.Bar, error) {
+	request.Symbol = strings.ToUpper(strings.TrimSpace(request.Symbol))
+	request.Timeframe = timeframe.MustNormalize(request.Timeframe)
+	if request.Symbol == "" {
+		return nil, nil
 	}
 
 	var all []market.Bar
@@ -76,8 +135,11 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 			return nil, err
 		}
 		query := endpoint.Query()
-		query.Set("symbol", request.Symbol)
+		query.Set(symbolParam, request.Symbol)
 		query.Set("interval", interval)
+		if path == "/fapi/v1/continuousKlines" {
+			query.Set("contractType", "TRADIFI_PERPETUAL")
+		}
 		query.Set("limit", strconv.Itoa(pageLimit))
 		if cursorStart > 0 {
 			query.Set("startTime", strconv.FormatInt(cursorStart, 10))
@@ -117,17 +179,16 @@ func (a *BinanceFuturesAdapter) FetchKlines(ctx context.Context, client *http.Cl
 		if len(page) < pageLimit {
 			break
 		}
+		if err := waitKlinePage(ctx, request.PageDelay); err != nil {
+			return nil, err
+		}
 	}
 	sortBars(all)
 	return trimBars(all, request.Limit), nil
 }
 
 func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, client *http.Client, endpoint string, symbol string, tf string) ([]market.Bar, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
+	resp, err := doKlineGET(ctx, client, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +261,10 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 	if err != nil {
 		return nil, err
 	}
+	adjustment, err := ParseKlineAdjustment(string(request.Adjustment))
+	if err != nil {
+		return nil, err
+	}
 	request.Symbol = strings.ToUpper(strings.TrimSpace(request.Symbol))
 	request.Timeframe = timeframe.MustNormalize(request.Timeframe)
 	if request.Symbol == "" {
@@ -214,7 +279,8 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 	}
 	after := int64(0)
 	if request.EndMS > 0 {
-		after = request.EndMS + 1
+		endStartMS := timeframe.FloorStartMS(request.EndMS, request.Timeframe)
+		after = timeframe.NextStartMS(timeframe.NextStartMS(endStartMS, request.Timeframe), request.Timeframe)
 	}
 
 	useRecentEndpoint := request.StartMS == 0 && request.EndMS == 0
@@ -228,7 +294,11 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 		if remaining > 0 && remaining < pageLimit {
 			pageLimit = remaining
 		}
-		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit)
+		page, err := a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit, adjustment)
+		if errors.Is(err, ErrUnsupportedKlineAdjustment) && adjustment == KlineAdjustmentAuto {
+			adjustment = KlineAdjustmentRaw
+			page, err = a.fetchOKXKlinePage(ctx, client, endpointPath, request.Symbol, request.Timeframe, bar, after, pageLimit, adjustment)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -269,15 +339,15 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 		}
 		useRecentEndpoint = false
 		after = oldest
-		if len(page) < pageLimit && endpointPath != "/api/v5/market/candles" {
-			break
+		if err := waitKlinePage(ctx, request.PageDelay); err != nil {
+			return nil, err
 		}
 	}
 	sortBars(all)
 	return trimBars(all, request.Limit), nil
 }
 
-func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int) ([]market.Bar, error) {
+func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client, endpointPath string, symbol string, tf string, bar string, after int64, limit int, adjustment KlineAdjustment) ([]market.Bar, error) {
 	endpoint, err := url.Parse(a.restURL + endpointPath)
 	if err != nil {
 		return nil, err
@@ -286,16 +356,15 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 	query.Set("instId", symbol)
 	query.Set("bar", bar)
 	query.Set("limit", strconv.Itoa(limit))
+	if adjustment == KlineAdjustmentForward || adjustment == KlineAdjustmentAuto {
+		query.Set("adjust", "forward")
+	}
 	if after > 0 {
 		query.Set("after", strconv.FormatInt(after, 10))
 	}
 	endpoint.RawQuery = query.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
+	resp, err := doKlineGET(ctx, client, endpoint.String())
 	if err != nil {
 		return nil, err
 	}
@@ -312,6 +381,10 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 		return nil, err
 	}
 	if payload.Code != "" && payload.Code != "0" {
+		if (adjustment == KlineAdjustmentForward || adjustment == KlineAdjustmentAuto) &&
+			strings.Contains(strings.ToLower(payload.Msg), "adjust") {
+			return nil, fmt.Errorf("%w: okx code=%s msg=%s path=%s", ErrUnsupportedKlineAdjustment, payload.Code, payload.Msg, endpointPath)
+		}
 		return nil, fmt.Errorf("okx candles code=%s msg=%s path=%s", payload.Code, payload.Msg, endpointPath)
 	}
 	now := market.NowMS()
@@ -466,4 +539,42 @@ func trimBars(bars []market.Bar, limit int) []market.Bar {
 
 func validOHLC(bar market.Bar) bool {
 	return bar.OpenPrice > 0 && bar.HighPrice > 0 && bar.LowPrice > 0 && bar.ClosePrice > 0
+}
+
+func doKlineGET(ctx context.Context, client *http.Client, endpoint string) (*http.Response, error) {
+	const attempts = 4
+	for attempt := 0; attempt < attempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		transient := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
+		if !transient || attempt == attempts-1 {
+			return resp, nil
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if err := waitKlinePage(ctx, time.Duration(1<<attempt)*250*time.Millisecond); err != nil {
+			return nil, err
+		}
+	}
+	panic("unreachable kline retry loop")
+}
+
+func waitKlinePage(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

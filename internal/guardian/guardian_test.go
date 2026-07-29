@@ -112,19 +112,45 @@ func TestAuditTargetsSkipStaleSymbols(t *testing.T) {
 	}
 }
 
+func TestGuardianUsesForwardAdjustmentForOKX(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := int64(1_710_000_000_000)
+	fetcher := &fakeFetcher{name: "okx", marketType: "SWAP", bars: []market.Bar{
+		testBarFor("okx", "KORU-USDT-SWAP", base, 5),
+	}}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{Enabled: true})
+	if _, err := g.repairRangeWithFetcher(ctx, fetcher, "okx", "KORU-USDT-SWAP", base, base, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if fetcher.lastRequest.Adjustment != exchange.KlineAdjustmentAuto {
+		t.Fatalf("expected OKX auto/forward adjustment, got %q", fetcher.lastRequest.Adjustment)
+	}
+}
+
 type fakeFetcher struct {
-	bars []market.Bar
+	name        string
+	marketType  string
+	bars        []market.Bar
+	lastRequest exchange.KlineRequest
 }
 
 func (f *fakeFetcher) Name() string {
+	if f.name != "" {
+		return f.name
+	}
 	return "binance"
 }
 
 func (f *fakeFetcher) MarketType() string {
+	if f.marketType != "" {
+		return f.marketType
+	}
 	return "um_futures"
 }
 
 func (f *fakeFetcher) FetchKlines(_ context.Context, _ *http.Client, request exchange.KlineRequest) ([]market.Bar, error) {
+	f.lastRequest = request
 	var out []market.Bar
 	for _, bar := range f.bars {
 		if bar.Symbol != request.Symbol || bar.Timeframe != request.Timeframe {
@@ -139,6 +165,13 @@ func (f *fakeFetcher) FetchKlines(_ context.Context, _ *http.Client, request exc
 		out = append(out, bar)
 	}
 	return out, nil
+}
+
+func testBarFor(exchangeName string, symbol string, startMS int64, closePrice float64) market.Bar {
+	bar := testBar(startMS, closePrice, closePrice, closePrice, closePrice, 1)
+	bar.Exchange = exchangeName
+	bar.Symbol = symbol
+	return market.DecorateBar(bar)
 }
 
 type storeRepairer struct {

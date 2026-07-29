@@ -40,6 +40,13 @@ type Config struct {
 	SymbolsPerRun  int
 	SymbolMaxAge   time.Duration
 	FloatTolerance float64
+	Observer       Observer
+}
+
+type Observer interface {
+	GuardianQueueDropped(exchange string)
+	GuardianEvent(event market.KlineGuardianEvent)
+	GuardianAudit(success bool)
 }
 
 type Store interface {
@@ -52,6 +59,10 @@ type Store interface {
 
 type Repairer interface {
 	RepairFinalBars(ctx context.Context, bars []market.Bar) error
+}
+
+type corporateActionFactorStore interface {
+	ListCorporateActionFactors(ctx context.Context, exchange string, symbol string) ([]market.CorporateActionJob, error)
 }
 
 type Fetcher interface {
@@ -70,6 +81,7 @@ type Guardian struct {
 	fetchersByMarket   map[string]Fetcher
 	fetchersByExchange map[string][]Fetcher
 	auditCursor        int
+	observer           Observer
 }
 
 type auditTarget struct {
@@ -95,6 +107,7 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		finalBars:          make(chan market.Bar, cfg.QueueSize),
 		fetchersByMarket:   make(map[string]Fetcher),
 		fetchersByExchange: make(map[string][]Fetcher),
+		observer:           cfg.Observer,
 	}
 	for _, fetcher := range fetchers {
 		if fetcher == nil {
@@ -144,6 +157,9 @@ func (g *Guardian) ObserveFinalBar(_ context.Context, bar market.Bar) error {
 	case g.finalBars <- market.DecorateBar(bar):
 	default:
 		log.Printf("kline guardian final-bar queue full exchange=%s symbol=%s start_ms=%d", bar.Exchange, bar.Symbol, bar.StartMS)
+		if g.observer != nil {
+			g.observer.GuardianQueueDropped(bar.Exchange)
+		}
 	}
 	return nil
 }
@@ -186,7 +202,12 @@ func (g *Guardian) runAudits(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := g.AuditOnce(ctx); err != nil {
+				if g.observer != nil {
+					g.observer.GuardianAudit(false)
+				}
 				log.Printf("kline guardian audit failed: %v", err)
+			} else if g.observer != nil {
+				g.observer.GuardianAudit(true)
 			}
 		}
 	}
@@ -243,7 +264,7 @@ func (g *Guardian) handleFinalBar(ctx context.Context, bar market.Bar) error {
 		}
 	}
 	if len(events) > 0 {
-		if err := g.store.InsertKlineGuardianEvents(ctx, events); err != nil {
+		if err := g.insertEvents(ctx, events); err != nil {
 			return err
 		}
 	}
@@ -396,14 +417,19 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 	limit := int((endMS-startMS)/timeframe.MinuteMS) + 1
 	official, err := fetcher.FetchKlines(ctx, g.client, exchange.KlineRequest{
 		Symbol: symbol, Timeframe: aggregator.OneMinute, StartMS: startMS, EndMS: endMS, Limit: limit,
+		Adjustment: guardianAdjustment(exchangeName),
 	})
 	if err != nil {
 		event := market.KlineGuardianEvent{
 			Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
 			StartMS: startMS, EndMS: endMS, EventType: "rest_error", NewValueJSON: quoteError(err), CreatedAtMS: market.NowMS(),
 		}
-		_ = g.store.InsertKlineGuardianEvents(ctx, []market.KlineGuardianEvent{event})
+		_ = g.insertEvents(ctx, []market.KlineGuardianEvent{event})
 		g.upsertAuditState(ctx, exchangeName, symbol, startMS, endMS, "rest_error")
+		return repairResult{}, err
+	}
+	official, err = g.applyCorporateActionFactors(ctx, exchangeName, symbol, official)
+	if err != nil {
 		return repairResult{}, err
 	}
 	local, err := g.store.BarsInRange(ctx, exchangeName, symbol, aggregator.OneMinute, startMS, endMS)
@@ -429,7 +455,7 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 			}
 		}
 		if err := g.repairer.RepairFinalBars(ctx, toRepair); err != nil {
-			_ = g.store.InsertKlineGuardianEvents(ctx, []market.KlineGuardianEvent{{
+			_ = g.insertEvents(ctx, []market.KlineGuardianEvent{{
 				Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
 				StartMS: startMS, EndMS: endMS, EventType: "repair_error", NewValueJSON: quoteError(err), CreatedAtMS: market.NowMS(),
 			}})
@@ -437,7 +463,7 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 		}
 	}
 	if len(result.Events) > 0 {
-		if err := g.store.InsertKlineGuardianEvents(ctx, result.Events); err != nil {
+		if err := g.insertEvents(ctx, result.Events); err != nil {
 			return result, err
 		}
 	}
@@ -449,6 +475,64 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 		return result, err
 	}
 	return result, nil
+}
+
+func (g *Guardian) insertEvents(ctx context.Context, events []market.KlineGuardianEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if err := g.store.InsertKlineGuardianEvents(ctx, events); err != nil {
+		return err
+	}
+	if g.observer != nil {
+		for _, event := range events {
+			g.observer.GuardianEvent(event)
+		}
+	}
+	return nil
+}
+
+func guardianAdjustment(exchangeName string) exchange.KlineAdjustment {
+	if normalizeExchange(exchangeName) == "okx" {
+		return exchange.KlineAdjustmentAuto
+	}
+	return exchange.KlineAdjustmentRaw
+}
+
+func (g *Guardian) applyCorporateActionFactors(ctx context.Context, exchangeName string, symbol string, bars []market.Bar) ([]market.Bar, error) {
+	if normalizeExchange(exchangeName) != "binance" {
+		return bars, nil
+	}
+	store, ok := g.store.(corporateActionFactorStore)
+	if !ok {
+		return bars, nil
+	}
+	factors, err := store.ListCorporateActionFactors(ctx, exchangeName, symbol)
+	if err != nil || len(factors) == 0 {
+		return bars, err
+	}
+	out := append([]market.Bar(nil), bars...)
+	for i := range out {
+		multiplier := float64(1)
+		for _, action := range factors {
+			if action.Factor > 0 && out[i].StartMS < action.EffectiveMS {
+				multiplier *= action.Factor
+			}
+		}
+		if multiplier == 1 {
+			continue
+		}
+		out[i].OpenPrice *= multiplier
+		out[i].HighPrice *= multiplier
+		out[i].LowPrice *= multiplier
+		out[i].ClosePrice *= multiplier
+		out[i].Volume /= multiplier
+		out[i].ContractVolume /= multiplier
+		out[i].Source = "rest_forward_adjusted"
+		out[i].Reason = "guardian_corporate_action_forward_adjustment"
+		out[i] = market.DecorateBar(out[i])
+	}
+	return out, nil
 }
 
 func (g *Guardian) diffOfficialBars(exchangeName string, symbol string, official []market.Bar, local []market.Bar, reason string) repairResult {

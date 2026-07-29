@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"crypto-ticket/internal/aggregator"
 	"crypto-ticket/internal/market"
@@ -26,24 +27,35 @@ type MarketService struct {
 	recentMax      int
 	liveBars       map[string]market.Bar
 	finalObservers []FinalBarObserver
+	telemetry      Telemetry
 }
 
 type FinalBarObserver interface {
 	ObserveFinalBar(ctx context.Context, bar market.Bar) error
 }
 
-func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int) *MarketService {
+type Telemetry interface {
+	BarPersisted(bar market.Bar)
+	BarPublished(bar market.Bar)
+	StorageOperation(operation string, duration time.Duration, err error)
+}
+
+func NewMarketService(store storage.HistoricalStore, hub *realtime.Hub, frames []string, recentLimit int, telemetry ...Telemetry) *MarketService {
 	if recentLimit <= 0 {
 		recentLimit = defaultRecentLimit
 	}
 	normalized := normalizeFrames(frames)
-	return &MarketService{
+	service := &MarketService{
 		store:     store,
 		hub:       hub,
 		frames:    normalized,
 		recentMax: recentLimit,
 		liveBars:  make(map[string]market.Bar),
 	}
+	if len(telemetry) > 0 {
+		service.telemetry = telemetry[0]
+	}
+	return service
 }
 
 func (s *MarketService) IngestKline(ctx context.Context, bar market.Bar) error {
@@ -205,7 +217,9 @@ func (s *MarketService) previousClose(ctx context.Context, bar market.Bar) (floa
 	if previousStart < 0 {
 		return 0, nil
 	}
+	started := time.Now()
 	bars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, bar.Timeframe, previousStart, previousStart)
+	s.observeStorage("previous_close", started, err)
 	if err != nil {
 		return 0, err
 	}
@@ -239,8 +253,16 @@ func (s *MarketService) persistFinalBars(ctx context.Context, bars []market.Bar,
 	for i := range bars {
 		bars[i] = market.DecorateBar(bars[i])
 	}
+	started := time.Now()
 	if err := s.store.UpsertBars(ctx, bars); err != nil {
+		s.observeStorage("upsert_bars", started, err)
 		return err
+	}
+	s.observeStorage("upsert_bars", started, nil)
+	if s.telemetry != nil {
+		for _, bar := range bars {
+			s.telemetry.BarPersisted(bar)
+		}
 	}
 	for _, bar := range bars {
 		s.publishBar(bar)
@@ -269,7 +291,9 @@ func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar, 
 			if !repairRollups && bar.EndMS < targetEnd {
 				continue
 			}
+			started := time.Now()
 			sourceBars, err := s.store.BarsInRange(ctx, bar.Exchange, bar.Symbol, bar.Timeframe, targetStart, targetEnd)
+			s.observeStorage("rollup_source", started, err)
 			if err != nil {
 				return err
 			}
@@ -284,8 +308,14 @@ func (s *MarketService) rollupFinalBars(ctx context.Context, bars []market.Bar, 
 			if err != nil {
 				return err
 			}
+			started = time.Now()
 			if err := s.store.UpsertBars(ctx, []market.Bar{enriched}); err != nil {
+				s.observeStorage("rollup_upsert", started, err)
 				return err
+			}
+			s.observeStorage("rollup_upsert", started, nil)
+			if s.telemetry != nil {
+				s.telemetry.BarPersisted(enriched)
 			}
 			s.publishBar(enriched)
 			queue = append(queue, enriched)
@@ -354,7 +384,9 @@ func (s *MarketService) buildLiveRollup(ctx context.Context, target string, live
 	}
 
 	targetStart := timeframe.FloorStartMS(liveOneMinute.StartMS, target)
+	started := time.Now()
 	partialInputs, err := s.store.BarsInRange(ctx, liveOneMinute.Exchange, liveOneMinute.Symbol, source, targetStart, liveSource.StartMS-1)
+	s.observeStorage("live_rollup_source", started, err)
 	if err != nil {
 		return nil, err
 	}
@@ -379,6 +411,9 @@ func (s *MarketService) publishBar(bar market.Bar) {
 		Timeframe: barCopy.Timeframe,
 		Bar:       &barCopy,
 	})
+	if s.telemetry != nil {
+		s.telemetry.BarPublished(barCopy)
+	}
 	if barCopy.Timeframe != aggregator.OneMinute {
 		return
 	}
@@ -399,7 +434,9 @@ func (s *MarketService) LatestTick(ctx context.Context, exchange string, symbol 
 	if ok {
 		return tickFromBar(live), nil
 	}
+	started := time.Now()
 	bars, err := s.store.RecentBars(ctx, market.KlineQuery{Exchange: exchange, Symbol: symbol, Timeframe: aggregator.OneMinute, Limit: 1})
+	s.observeStorage("latest_tick", started, err)
 	if err != nil || len(bars) == 0 {
 		return nil, err
 	}
@@ -430,7 +467,9 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		query.Limit = 1000
 	}
 
+	started := time.Now()
 	bars, err := s.store.RecentBars(ctx, query)
+	s.observeStorage("recent_bars", started, err)
 	if err != nil {
 		return nil, err
 	}
@@ -456,6 +495,12 @@ func (s *MarketService) Klines(ctx context.Context, query market.KlineQuery) ([]
 		return trimBars(bars, query.Limit), nil
 	}
 	return trimBars(mergeLiveBar(bars, partial), query.Limit+1), nil
+}
+
+func (s *MarketService) observeStorage(operation string, started time.Time, err error) {
+	if s.telemetry != nil {
+		s.telemetry.StorageOperation(operation, time.Since(started), err)
+	}
 }
 
 func (s *MarketService) liveOneMinute(exchange string, symbol string) *market.Bar {

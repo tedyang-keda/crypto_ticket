@@ -11,11 +11,14 @@ import (
 
 	"crypto-ticket/internal/api"
 	"crypto-ticket/internal/app"
+	"crypto-ticket/internal/cache"
 	"crypto-ticket/internal/collector"
 	"crypto-ticket/internal/config"
+	"crypto-ticket/internal/corporateaction"
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/guardian"
 	"crypto-ticket/internal/market"
+	"crypto-ticket/internal/monitoring"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
 	mysqlstore "crypto-ticket/internal/storage/mysql"
@@ -52,12 +55,27 @@ func main() {
 		})
 	}
 
-	hub := realtime.NewHub()
-	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit)
-	server := api.NewServer(marketService, hub, cfg.DashboardDir)
+	registry := monitoring.NewRegistry()
+	var pinger monitoring.Pinger
+	if candidate, ok := store.(monitoring.Pinger); ok {
+		pinger = candidate
+	}
+	var activityStore monitoring.ActivityStore
+	if candidate, ok := store.(monitoring.ActivityStore); ok {
+		activityStore = candidate
+	}
+	monitorService := monitoring.NewService(registry, pinger, activityStore, cfg.FeishuWebhookURL, monitoring.Config{
+		Enabled: cfg.EnableHealthMonitor, CollectorEnabled: cfg.EnableCollector, P1AlertsEnabled: cfg.MonitorP1AlertsEnabled,
+		EvaluationInterval: time.Duration(cfg.MonitorEvaluationSeconds) * time.Second,
+		DailyReportHour:    cfg.MonitorDailyReportHour,
+		DiskPath:           cfg.MonitorDiskPath,
+	})
+	hub := realtime.NewHub(registry)
+	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit, registry)
+	server := api.NewServer(marketService, hub, cfg.DashboardDir, monitorService)
 
 	errCh := make(chan error, 8)
-	startBackgroundWorkers(ctx, cfg, store, marketService, errCh)
+	startBackgroundWorkers(ctx, cfg, store, marketService, monitorService, registry, errCh)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: server.Handler()}
 	go func() {
 		log.Printf("marketd listening on http://%s", cfg.HTTPAddr)
@@ -84,11 +102,33 @@ func startBackgroundWorkers(
 	cfg config.Config,
 	store storage.HistoricalStore,
 	marketService *app.MarketService,
+	monitorService *monitoring.Service,
+	registry *monitoring.Registry,
 	errCh chan<- error,
 ) {
+	if cfg.EnableHealthMonitor {
+		go func() {
+			if err := monitorService.Run(ctx); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+		integrity := monitoring.NewIntegrityAuditor(store, registry, monitoring.IntegrityConfig{
+			Enabled: true, Exchanges: enabledExchangeNames(cfg.Exchanges), Timeframes: cfg.MonitorIntegrityTimeframes,
+			Interval:      time.Duration(cfg.MonitorIntegrityIntervalSeconds) * time.Second,
+			SymbolsPerRun: cfg.MonitorIntegritySymbolsPerRun,
+		})
+		go func() {
+			if err := integrity.Run(ctx); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+		log.Printf("health monitoring started interval=%ds p1_alerts=%t integrity=%ds/%d",
+			cfg.MonitorEvaluationSeconds, cfg.MonitorP1AlertsEnabled,
+			cfg.MonitorIntegrityIntervalSeconds, cfg.MonitorIntegritySymbolsPerRun)
+	}
 	if cfg.EnableCollector {
 		runtimes := makeCollectorRuntimes(cfg.Exchanges, cfg)
-		runner := collector.NewRunner(runtimes, store, marketService)
+		runner := collector.NewRunner(runtimes, store, marketService, registry)
 		go func() {
 			if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
 				errCh <- err
@@ -115,6 +155,7 @@ func startBackgroundWorkers(
 			SymbolsPerRun: cfg.KlineGuardianSymbolsPerRun,
 			RequestDelay:  time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
 			SymbolMaxAge:  time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
+			Observer:      registry,
 		})
 		marketService.AddFinalBarObserver(worker)
 		go func() {
@@ -129,6 +170,58 @@ func startBackgroundWorkers(
 			cfg.KlineGuardianDelaySeconds,
 		)
 	}
+	if cfg.EnableCorporateAction {
+		corporateStore, ok := store.(corporateaction.Store)
+		if !ok {
+			log.Printf("corporate action worker disabled: store does not implement corporate action interface")
+			return
+		}
+		fetchers := makeCorporateActionFetchers(cfg.Exchanges)
+		if len(fetchers) == 0 {
+			log.Printf("corporate action worker disabled: no REST kline fetchers")
+			return
+		}
+		var cacheClearer corporateaction.CacheClearer
+		redisCache, err := cache.NewRedisMarketCache(cfg.RedisURL)
+		if err != nil {
+			log.Printf("corporate action Redis cache clearing disabled: %v", err)
+		} else {
+			cacheClearer = redisCache
+		}
+		notifier := corporateaction.NewFeishuNotifier(cfg.FeishuWebhookURL, nil)
+		worker := corporateaction.New(corporateStore, fetchers, notifier, cacheClearer, corporateaction.Config{
+			Enabled:             true,
+			Timeframes:          cfg.Timeframes,
+			PollInterval:        time.Duration(cfg.CorporateActionPollSeconds) * time.Second,
+			MaxAttempts:         cfg.CorporateActionMaxAttempts,
+			RetryBaseDelay:      time.Duration(cfg.CorporateActionRetryBaseSeconds) * time.Second,
+			JobsPerRun:          cfg.CorporateActionJobsPerRun,
+			RequestDelay:        time.Duration(cfg.CorporateActionRequestDelayMS) * time.Millisecond,
+			AnchorInterval:      time.Duration(cfg.CorporateActionAnchorSeconds) * time.Second,
+			AnchorSymbolsPerRun: cfg.CorporateActionAnchorSymbolsPerRun,
+		})
+		marketService.AddFinalBarObserver(worker)
+		go func() {
+			if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+				errCh <- err
+			}
+		}()
+		log.Printf("corporate action worker started fetchers=%d poll=%ds max_attempts=%d anchor=%ds/%d",
+			len(fetchers), cfg.CorporateActionPollSeconds, cfg.CorporateActionMaxAttempts,
+			cfg.CorporateActionAnchorSeconds, cfg.CorporateActionAnchorSymbolsPerRun)
+	}
+}
+
+func enabledExchangeNames(configs []config.ExchangeConfig) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, exchangeConfig := range configs {
+		if exchangeConfig.Enabled && !seen[exchangeConfig.Name] {
+			seen[exchangeConfig.Name] = true
+			out = append(out, exchangeConfig.Name)
+		}
+	}
+	return out
 }
 
 func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) []collector.Runtime {
@@ -162,6 +255,22 @@ func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) [
 
 func makeKlineGuardianFetchers(configs []config.ExchangeConfig) []guardian.Fetcher {
 	fetchers := make([]guardian.Fetcher, 0, len(configs))
+	for _, exchangeConfig := range configs {
+		if !exchangeConfig.Enabled {
+			continue
+		}
+		switch exchangeConfig.Name {
+		case "binance":
+			fetchers = append(fetchers, exchange.NewBinanceFuturesAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		case "okx":
+			fetchers = append(fetchers, exchange.NewOKXAdapter(exchangeConfig.MarketType, exchangeConfig.RestURL, exchangeConfig.WSURL))
+		}
+	}
+	return fetchers
+}
+
+func makeCorporateActionFetchers(configs []config.ExchangeConfig) []corporateaction.Fetcher {
+	fetchers := make([]corporateaction.Fetcher, 0, len(configs))
 	for _, exchangeConfig := range configs {
 		if !exchangeConfig.Enabled {
 			continue

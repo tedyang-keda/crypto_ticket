@@ -1,9 +1,35 @@
 package exchange
 
 import (
+	"context"
+	"io"
 	"math"
+	"net/http"
+	"strings"
 	"testing"
 )
+
+func TestBinanceForwardAdjustmentSymbolsUsesTradFiContractType(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body: io.NopCloser(strings.NewReader(`{"symbols":[
+				{"symbol":"KORUUSDT","status":"TRADING","contractType":"TRADIFI_PERPETUAL"},
+				{"symbol":"BTCUSDT","status":"TRADING","contractType":"PERPETUAL"}
+			]}`)),
+		}, nil
+	})}
+
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+	symbols, err := adapter.ForwardAdjustmentSymbols(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !symbols["KORUUSDT"] || symbols["BTCUSDT"] || len(symbols) != 1 {
+		t.Fatalf("unexpected forward-adjustment symbols: %v", symbols)
+	}
+}
 
 func TestBinanceParseTradeMessage(t *testing.T) {
 	adapter := NewBinanceFuturesAdapter("um_futures", "https://fapi.binance.com", "wss://example")

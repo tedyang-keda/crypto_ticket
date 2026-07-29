@@ -9,26 +9,43 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                          string
-	RedisURL                          string
-	MySQLDSN                          string
-	UseMemory                         bool
-	RecentCacheLimit                  int
-	Timeframes                        []string
-	DashboardDir                      string
-	EnableMockSymbols                 bool
-	EnableCollector                   bool
-	EnableKlineGuardian               bool
-	KlineGuardianAuditIntervalSeconds int
-	KlineGuardianWindowMinutes        int
-	KlineGuardianDelaySeconds         int
-	KlineGuardianSymbolsPerRun        int
-	KlineGuardianRequestDelayMS       int
-	KlineGuardianSymbolMaxAgeSeconds  int
-	SymbolRefreshIntervalSeconds      int
-	ReconnectBaseDelaySeconds         int
-	ReconnectMaxDelaySeconds          int
-	Exchanges                         []ExchangeConfig
+	HTTPAddr                           string
+	RedisURL                           string
+	MySQLDSN                           string
+	UseMemory                          bool
+	RecentCacheLimit                   int
+	Timeframes                         []string
+	DashboardDir                       string
+	EnableMockSymbols                  bool
+	EnableCollector                    bool
+	EnableKlineGuardian                bool
+	KlineGuardianAuditIntervalSeconds  int
+	KlineGuardianWindowMinutes         int
+	KlineGuardianDelaySeconds          int
+	KlineGuardianSymbolsPerRun         int
+	KlineGuardianRequestDelayMS        int
+	KlineGuardianSymbolMaxAgeSeconds   int
+	EnableCorporateAction              bool
+	CorporateActionPollSeconds         int
+	CorporateActionMaxAttempts         int
+	CorporateActionRetryBaseSeconds    int
+	CorporateActionJobsPerRun          int
+	CorporateActionRequestDelayMS      int
+	CorporateActionAnchorSeconds       int
+	CorporateActionAnchorSymbolsPerRun int
+	FeishuWebhookURL                   string
+	EnableHealthMonitor                bool
+	MonitorP1AlertsEnabled             bool
+	MonitorEvaluationSeconds           int
+	MonitorDailyReportHour             int
+	MonitorIntegrityIntervalSeconds    int
+	MonitorIntegritySymbolsPerRun      int
+	MonitorIntegrityTimeframes         []string
+	MonitorDiskPath                    string
+	SymbolRefreshIntervalSeconds       int
+	ReconnectBaseDelaySeconds          int
+	ReconnectMaxDelaySeconds           int
+	Exchanges                          []ExchangeConfig
 }
 
 type ExchangeConfig struct {
@@ -52,27 +69,61 @@ func Load() Config {
 	}
 	enableCollector := envBool("ENABLE_COLLECTOR", false)
 	return Config{
-		HTTPAddr:                          env("HTTP_ADDR", "127.0.0.1:8088"),
-		RedisURL:                          env("REDIS_URL", "redis://127.0.0.1:6379/0"),
-		MySQLDSN:                          env("MYSQL_DSN", mysqlDSNFromEnv()),
-		UseMemory:                         envBool("USE_MEMORY_STORE", true),
-		RecentCacheLimit:                  envInt("RECENT_CACHE_LIMIT", 300),
-		Timeframes:                        outFrames,
-		DashboardDir:                      env("DASHBOARD_DIR", "./web/dist"),
-		EnableMockSymbols:                 envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
-		EnableCollector:                   enableCollector,
-		EnableKlineGuardian:               envBool("ENABLE_KLINE_GUARDIAN", enableCollector),
-		KlineGuardianAuditIntervalSeconds: envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 60),
-		KlineGuardianWindowMinutes:        envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
-		KlineGuardianDelaySeconds:         envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
-		KlineGuardianSymbolsPerRun:        envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 50),
-		KlineGuardianRequestDelayMS:       envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
-		KlineGuardianSymbolMaxAgeSeconds:  envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
-		SymbolRefreshIntervalSeconds:      envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
-		ReconnectBaseDelaySeconds:         envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
-		ReconnectMaxDelaySeconds:          envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
-		Exchanges:                         loadExchangeConfigs(),
+		HTTPAddr:                           env("HTTP_ADDR", "127.0.0.1:8088"),
+		RedisURL:                           env("REDIS_URL", "redis://127.0.0.1:6379/0"),
+		MySQLDSN:                           env("MYSQL_DSN", mysqlDSNFromEnv()),
+		UseMemory:                          envBool("USE_MEMORY_STORE", true),
+		RecentCacheLimit:                   envInt("RECENT_CACHE_LIMIT", 300),
+		Timeframes:                         outFrames,
+		DashboardDir:                       env("DASHBOARD_DIR", "./web/dist"),
+		EnableMockSymbols:                  envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
+		EnableCollector:                    enableCollector,
+		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", enableCollector),
+		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 60),
+		KlineGuardianWindowMinutes:         envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
+		KlineGuardianDelaySeconds:          envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
+		KlineGuardianSymbolsPerRun:         envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 50),
+		KlineGuardianRequestDelayMS:        envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
+		KlineGuardianSymbolMaxAgeSeconds:   envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
+		EnableCorporateAction:              envBool("ENABLE_CORPORATE_ACTION", false),
+		CorporateActionPollSeconds:         envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
+		CorporateActionMaxAttempts:         envInt("CORPORATE_ACTION_MAX_ATTEMPTS", 5),
+		CorporateActionRetryBaseSeconds:    envInt("CORPORATE_ACTION_RETRY_BASE_SECONDS", 60),
+		CorporateActionJobsPerRun:          envInt("CORPORATE_ACTION_JOBS_PER_RUN", 1),
+		CorporateActionRequestDelayMS:      envInt("CORPORATE_ACTION_REQUEST_DELAY_MS", 100),
+		CorporateActionAnchorSeconds:       envInt("CORPORATE_ACTION_ANCHOR_SECONDS", 60),
+		CorporateActionAnchorSymbolsPerRun: envInt("CORPORATE_ACTION_ANCHOR_SYMBOLS_PER_RUN", 1),
+		FeishuWebhookURL:                   env("FEISHU_WEBHOOK_URL", ""),
+		EnableHealthMonitor:                envBool("ENABLE_HEALTH_MONITOR", enableCollector),
+		MonitorP1AlertsEnabled:             envBool("MONITOR_P1_ALERTS_ENABLED", false),
+		MonitorEvaluationSeconds:           envInt("MONITOR_EVALUATION_SECONDS", 15),
+		MonitorDailyReportHour:             envInt("MONITOR_DAILY_REPORT_HOUR", 9),
+		MonitorIntegrityIntervalSeconds:    envInt("MONITOR_INTEGRITY_INTERVAL_SECONDS", 600),
+		MonitorIntegritySymbolsPerRun:      envInt("MONITOR_INTEGRITY_SYMBOLS_PER_RUN", 50),
+		MonitorIntegrityTimeframes:         normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),
+		MonitorDiskPath:                    env("WATCHDOG_DISK_PATH", "."),
+		SymbolRefreshIntervalSeconds:       envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
+		ReconnectBaseDelaySeconds:          envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
+		ReconnectMaxDelaySeconds:           envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
+		Exchanges:                          loadExchangeConfigs(),
 	}
+}
+
+func normalizedTimeframes(raw string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		normalized := timeframe.MustNormalize(item)
+		if !seen[normalized] {
+			seen[normalized] = true
+			out = append(out, normalized)
+		}
+	}
+	return out
 }
 
 func loadExchangeConfigs() []ExchangeConfig {
