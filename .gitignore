@@ -12,6 +12,8 @@ dist/
 data/
 logs/
 .env
+.env.bak*
+backups/
 .DS_Store
 node_modules/
 web/dist/
