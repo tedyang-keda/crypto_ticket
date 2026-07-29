@@ -20,6 +20,6 @@ web/dist/
 .playwright-mcp/
 .playwright-cli/
 *.tsv
-marketd
-health_watchdog
+/marketd
+/health_watchdog
 *.tsbuildinfo
