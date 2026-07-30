@@ -27,3 +27,15 @@ func TestDiffSymbolsNoChanges(t *testing.T) {
 		t.Fatalf("expected no diff, subscribe=%+v unsubscribe=%+v", subscribe, unsubscribe)
 	}
 }
+
+func TestSameSymbolsIgnoresOrderAndDuplicates(t *testing.T) {
+	if !sameSymbols(
+		[]string{"BTCUSDT", "ETHUSDT", "BTCUSDT"},
+		[]string{"ethusdt", "btcusdt"},
+	) {
+		t.Fatal("expected equivalent symbol sets")
+	}
+	if sameSymbols([]string{"BTCUSDT"}, []string{"BTCUSDT", "SOLUSDT"}) {
+		t.Fatal("expected added symbol to require reconnect")
+	}
+}

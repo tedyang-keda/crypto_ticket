@@ -137,7 +137,7 @@ go run ./cmd/marketd
 | `MARKET_TIMEFRAMES` | 全部支持周期 | final 高周期 rollup 入库的目标周期列表；会自动补齐级联 rollup 依赖；live WS 会扫描全部支持周期并只为有订阅者的 channel 合成 |
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
-| `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | OKX 订阅刷新间隔；Binance static streams 只在重连时重新拉 symbols |
+| `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | 交易所 symbol 元数据刷新间隔；OKX 增量调整订阅，Binance 名单变化时重建 static streams |
 | `BINANCE_UM_ENABLED` | `true` | 是否启用 Binance USDT-M futures |
 | `BINANCE_COIN_ENABLED` | `false` | 是否启用 Binance COIN-M futures；默认关闭，避免订阅当前及未来币本位合约 |
 | `OKX_ENABLED` | `true` | 是否启用 OKX |

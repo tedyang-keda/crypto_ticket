@@ -211,9 +211,29 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 			errCh <- r.readStaticStream(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk))
 		}()
 	}
-	err := <-errCh
-	cancel()
-	return err
+	if cfg.SymbolRefreshInterval <= 0 {
+		return <-errCh
+	}
+	refreshTicker := time.NewTicker(cfg.SymbolRefreshInterval)
+	defer refreshTicker.Stop()
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case <-refreshTicker.C:
+			next, err := r.refreshSymbols(ctx, adapter)
+			if err != nil {
+				return err
+			}
+			if len(next) == 0 {
+				return errors.New("no active symbols")
+			}
+			if !sameSymbols(symbols, next) {
+				log.Printf("%s %s static subscriptions changed active=%d; reconnecting streams", adapter.Name(), adapter.MarketType(), len(next))
+				return nil
+			}
+		}
+	}
 }
 
 func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) error {
@@ -384,6 +404,11 @@ func diffSymbols(current []string, next []string) ([]string, []string) {
 	sort.Strings(subscribe)
 	sort.Strings(unsubscribe)
 	return subscribe, unsubscribe
+}
+
+func sameSymbols(current []string, next []string) bool {
+	subscribe, unsubscribe := diffSymbols(current, next)
+	return len(subscribe) == 0 && len(unsubscribe) == 0
 }
 
 func chunkSymbols(symbols []string, chunkSize int) [][]string {
