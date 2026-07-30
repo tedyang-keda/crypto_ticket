@@ -28,18 +28,19 @@ type DBStatsProvider interface {
 }
 
 type Config struct {
-	Enabled            bool
-	CollectorEnabled   bool
-	P1AlertsEnabled    bool
-	EvaluationInterval time.Duration
-	DatabaseTimeout    time.Duration
-	StartupGrace       time.Duration
-	WSWarningAge       time.Duration
-	WSCriticalAge      time.Duration
-	FinalCriticalAge   time.Duration
-	DailyReportHour    int
-	DailyLocation      *time.Location
-	DiskPath           string
+	Enabled              bool
+	CollectorEnabled     bool
+	P1AlertsEnabled      bool
+	EvaluationInterval   time.Duration
+	DatabaseTimeout      time.Duration
+	StartupGrace         time.Duration
+	WSWarningAge         time.Duration
+	WSCriticalAge        time.Duration
+	FinalCriticalAge     time.Duration
+	DailyReportHour      int
+	DailyLocation        *time.Location
+	MarketReportInterval time.Duration
+	DiskPath             string
 }
 
 type Check struct {
@@ -105,6 +106,9 @@ func NewService(registry *Registry, pinger Pinger, activityStore ActivityStore, 
 	if cfg.DailyLocation == nil {
 		cfg.DailyLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
 	}
+	if cfg.MarketReportInterval <= 0 {
+		cfg.MarketReportInterval = 30 * time.Minute
+	}
 	if strings.TrimSpace(cfg.DiskPath) == "" {
 		cfg.DiskPath = "."
 	}
@@ -136,9 +140,11 @@ func (s *Service) Run(ctx context.Context) error {
 	evaluation := time.NewTicker(s.cfg.EvaluationInterval)
 	activity := time.NewTicker(time.Hour)
 	daily := time.NewTimer(s.untilNextDaily(s.registry.now()))
+	marketReport := time.NewTimer(s.untilNextMarketReport(s.registry.now()))
 	defer evaluation.Stop()
 	defer activity.Stop()
 	defer daily.Stop()
+	defer marketReport.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -152,6 +158,13 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Printf("monitoring daily report failed: %v", err)
 			}
 			daily.Reset(s.untilNextDaily(s.registry.now()))
+		case <-marketReport.C:
+			if err := s.sendMarketQualityReport(ctx); err != nil {
+				log.Printf("monitoring market quality report failed: %v", err)
+			} else {
+				log.Printf("monitoring market quality report sent")
+			}
+			marketReport.Reset(s.untilNextMarketReport(s.registry.now()))
 		}
 	}
 }
@@ -319,34 +332,20 @@ func (s *Service) conditions(now time.Time, snapshot Snapshot) []Condition {
 	out = append(out, Condition{Key: "mysql_latency", Title: "MySQL 延迟异常", Severity: SeverityWarning, P1: true,
 		Active: s.sustained("mysql_latency", snapshot.Window.StorageP95 >= 500*time.Millisecond, 5*time.Minute, now), Message: fmt.Sprintf("**5 分钟 P95**: `%s`", snapshot.Window.StorageP95.Round(time.Millisecond))})
 
-	integrityTotal := snapshot.Window.Integrity.Missing + snapshot.Window.Integrity.Mismatch + snapshot.Window.Integrity.InvalidOHLC
-	integritySeverity := SeverityWarning
-	if integrityTotal >= 20 || len(snapshot.Window.Integrity.Affected) >= 5 {
-		integritySeverity = SeverityCritical
-	}
-	out = append(out, Condition{Key: "high_timeframe_integrity", Title: "高级周期 K 线完整性异常", Severity: integritySeverity, P1: true,
-		Active: integrityTotal > 0, Message: formatIntegrity(snapshot.Window.Integrity)})
-	out = append(out, s.symbolStaleConditions(now, snapshot)...)
 	out = append(out, s.resourceConditions(now, snapshot.Resources)...)
 	return out
 }
 
 func (s *Service) resourceConditions(now time.Time, resources ResourceSnapshot) []Condition {
 	cpuActive := s.sustained("cpu", resources.CPURatio >= 0.85, 10*time.Minute, now)
-	memoryActive := s.sustained("memory", resources.MemoryRatio >= 0.80, 5*time.Minute, now)
 	fdActive := s.sustained("fd", resources.FDRatio >= 0.80, 5*time.Minute, now)
 	goroutineActive := s.sustained("goroutines", resources.Goroutines >= 5000, 10*time.Minute, now)
-	memorySeverity := SeverityWarning
-	if resources.MemoryRatio >= 0.95 {
-		memorySeverity = SeverityCritical
-	}
 	fdSeverity := SeverityWarning
 	if resources.FDRatio >= 0.95 {
 		fdSeverity = SeverityCritical
 	}
 	return []Condition{
 		{Key: "process_cpu", Title: "进程 CPU 使用率异常", Severity: SeverityWarning, P1: true, Active: cpuActive, Message: fmt.Sprintf("**CPU 占整机比例**: `%.2f%%`", resources.CPURatio*100)},
-		{Key: "process_memory", Title: "进程内存使用率异常", Severity: memorySeverity, P1: true, Active: memoryActive, Message: fmt.Sprintf("**RSS**: `%d`\n**占整机内存**: `%.2f%%`", resources.RSSBytes, resources.MemoryRatio*100)},
 		{Key: "process_fd", Title: "进程文件描述符使用率异常", Severity: fdSeverity, P1: true, Active: fdActive, Message: fmt.Sprintf("**FD**: `%d/%d` (`%.2f%%`)", resources.OpenFDs, resources.FDLimit, resources.FDRatio*100)},
 		{Key: "process_goroutines", Title: "goroutine 数量异常", Severity: SeverityWarning, P1: true, Active: goroutineActive, Message: fmt.Sprintf("**goroutines**: `%d`", resources.Goroutines)},
 	}
@@ -365,54 +364,6 @@ func (s *Service) sustained(key string, above bool, required time.Duration, now 
 		return false
 	}
 	return now.Sub(started) >= required
-}
-
-func (s *Service) symbolStaleConditions(now time.Time, snapshot Snapshot) []Condition {
-	grouped := make(map[string][]SymbolSnapshot)
-	for _, symbol := range snapshot.Symbols {
-		if !symbol.Continuous || symbol.MarketType == "" {
-			continue
-		}
-		key := symbol.Exchange + ":" + symbol.MarketType
-		grouped[key] = append(grouped[key], symbol)
-	}
-	var out []Condition
-	for key, symbols := range grouped {
-		if len(symbols) < 5 {
-			continue
-		}
-		fresh := 0
-		var stale []string
-		critical := false
-		for _, symbol := range symbols {
-			age := ageFromMS(now, symbol.LastFinalMS)
-			if symbol.LastFinalMS > 0 && age < 2*time.Minute {
-				fresh++
-			}
-			if symbol.LastFinalMS == 0 || age >= 3*time.Minute {
-				stale = append(stale, symbol.Symbol)
-				if age >= 10*time.Minute {
-					critical = true
-				}
-			}
-		}
-		if float64(fresh)/float64(len(symbols)) < 0.80 || len(stale) == 0 {
-			out = append(out, Condition{Key: "symbol_stale:" + key, Title: "局部品种行情停滞", Severity: SeverityWarning, P1: true, Active: false})
-			continue
-		}
-		sort.Strings(stale)
-		display := stale
-		if len(display) > 20 {
-			display = display[:20]
-		}
-		severity := SeverityWarning
-		if critical {
-			severity = SeverityCritical
-		}
-		out = append(out, Condition{Key: "symbol_stale:" + key, Title: "局部品种行情停滞", Severity: severity, P1: true, Active: true,
-			Message: fmt.Sprintf("**市场**: `%s`\n**异常品种**: `%d`\n%s", key, len(stale), strings.Join(display, ", "))})
-	}
-	return out
 }
 
 func (s *Service) checkDatabase(ctx context.Context) {
@@ -489,6 +440,11 @@ func (s *Service) untilNextDaily(now time.Time) time.Duration {
 	return next.Sub(local)
 }
 
+func (s *Service) untilNextMarketReport(now time.Time) time.Duration {
+	next := now.Truncate(s.cfg.MarketReportInterval).Add(s.cfg.MarketReportInterval)
+	return next.Sub(now)
+}
+
 func ageFromMS(now time.Time, value int64) time.Duration {
 	if value <= 0 {
 		return time.Duration(math.MaxInt64)
@@ -508,8 +464,25 @@ func formatMS(value int64) string {
 }
 
 func formatIntegrity(summary IntegritySummary) string {
-	return fmt.Sprintf("checked=%d, missing=%d, mismatch=%d, invalid_ohlc=%d, affected=%d",
-		summary.CheckedSymbols, summary.Missing, summary.Mismatch, summary.InvalidOHLC, len(summary.Affected))
+	const maxDetails = 20
+	lines := []string{fmt.Sprintf("checked=%d, missing=%d, mismatch=%d, invalid_ohlc=%d, affected=%d",
+		summary.CheckedSymbols, summary.Missing, summary.Mismatch, summary.InvalidOHLC, len(summary.Affected))}
+	if len(summary.Issues) == 0 {
+		return lines[0]
+	}
+	lines = append(lines, "", "**异常明细**:")
+	displayCount := len(summary.Issues)
+	if displayCount > maxDetails {
+		displayCount = maxDetails
+	}
+	for _, issue := range summary.Issues[:displayCount] {
+		lines = append(lines, fmt.Sprintf("- `%s:%s`, `%s`, `%s`, `%s`",
+			issue.Exchange, issue.Symbol, issue.Timeframe, time.UnixMilli(issue.StartMS).UTC().Format(time.RFC3339), issue.Type))
+	}
+	if omitted := len(summary.Issues) - displayCount; omitted > 0 {
+		lines = append(lines, fmt.Sprintf("- 其余 `%d` 条异常已省略", omitted))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func formatUintMap(values map[string]uint64) string {

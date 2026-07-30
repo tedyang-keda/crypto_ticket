@@ -103,16 +103,19 @@ go run ./cmd/marketd
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
 | `ENABLE_KLINE_GUARDIAN` | 跟随 `ENABLE_COLLECTOR` | 是否启动轻量 K 线守护者 |
-| `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` | `60` | 近窗口 REST 校验周期 |
+| `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` | `120` | 全市场近窗口 REST 校验周期 |
 | `KLINE_GUARDIAN_WINDOW_MINUTES` | `30` | 每次校验最近多少分钟的 final `1m` |
 | `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
-| `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `50` | 每轮最多校验多少个 active symbol，按轮询 cursor 分批 |
-| `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | symbol 之间 REST 请求节流 |
+| `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `0` | 每轮最多校验多少个 active symbol；`0` 表示全量 |
+| `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | 未配置交易所专属速率时的 REST 请求节流 |
+| `KLINE_GUARDIAN_BINANCE_RPS` | `8` | Binance Guardian REST 请求速率上限 |
+| `KLINE_GUARDIAN_OKX_RPS` | `5` | OKX Guardian REST 请求速率上限 |
 | `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` | `600` | 只审计最近被 collector 刷新过的 active symbol，避免旧脏 symbol 进入 REST 校验 |
 | `ENABLE_HEALTH_MONITOR` | 跟随 `ENABLE_COLLECTOR` | 启用进程内健康评估、Prometheus 指标、P0 告警和每日摘要 |
 | `MONITOR_P1_ALERTS_ENABLED` | `false` | P1 实时飞书告警开关；关闭时仍采集指标并在日报统计 would-fire |
 | `MONITOR_EVALUATION_SECONDS` | `15` | 健康评估周期；MySQL 连续失败 3 次后产生 P0 告警 |
 | `MONITOR_DAILY_REPORT_HOUR` | `9` | 每日北京时间发送健康摘要的小时 |
+| `MONITOR_MARKET_REPORT_INTERVAL_MINUTES` | `30` | 精简行情接入与质量报告发送间隔 |
 | `MONITOR_INTEGRITY_INTERVAL_SECONDS` | `600` | 高周期只读审计周期，不会自动覆盖 K 线 |
 | `MONITOR_INTEGRITY_SYMBOLS_PER_RUN` | `50` | 每轮审计的 active symbol 数量，按 cursor 轮转 |
 | `MONITOR_INTEGRITY_TIMEFRAMES` | `15m,30m,1H,4H,1D,2D,1W` | 高周期审计范围；只使用本地 source bars 重算和检查缺失/非法/不一致 |
@@ -136,7 +139,7 @@ go run ./cmd/marketd
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
 | `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | OKX 订阅刷新间隔；Binance static streams 只在重连时重新拉 symbols |
 | `BINANCE_UM_ENABLED` | `true` | 是否启用 Binance USDT-M futures |
-| `BINANCE_COIN_ENABLED` | `true` | 是否启用 Binance COIN-M futures |
+| `BINANCE_COIN_ENABLED` | `false` | 是否启用 Binance COIN-M futures；默认关闭，避免订阅当前及未来币本位合约 |
 | `OKX_ENABLED` | `true` | 是否启用 OKX |
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | 仅 backfill 清理旧 Redis kline cache 时使用 |
 
@@ -222,9 +225,11 @@ final `1m`：
 守护者有两条路径：
 
 1. 实时水位检测：每次 final `1m` 成功入库后，检查 `(exchange, symbol, 1m)` 的上一根 final start。若新 final start 跳过了一个或多个分钟桶，则立即用交易所 REST official `1m` kline 拉取缺口区间并修复。
-2. 近窗口 REST 校验：按 `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` 定时轮询 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。
+2. 近窗口 REST 校验：默认每两分钟检查全部 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。Binance 与 OKX 分组并行，分别受各自的 RPS 配置限制。
 
 为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
+
+监控服务默认每 30 分钟发送一份“行情接入与质量报告”，内容只包含实际订阅品种数、连接数、最后 WS 消息、连续行情延迟品种，以及近 30 分钟 Guardian 的缺失、不一致、REST 失败和修复失败明细。`missing_repair` 与 `mismatch_repair` 表示修复写入成功，不额外执行二次 REST 复核。
 
 校验字段：
 

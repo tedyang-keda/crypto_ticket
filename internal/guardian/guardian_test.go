@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -98,6 +99,7 @@ func TestAuditTargetsSkipStaleSymbols(t *testing.T) {
 	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{
 		{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", Status: "TRADING", IsActive: true, LastSeenAtMS: now},
 		{Exchange: "binance", Symbol: "OLDUSDT", MarketType: "um_futures", Status: "TRADING", IsActive: true, LastSeenAtMS: now - int64(time.Hour/time.Millisecond)},
+		{Exchange: "binance", Symbol: "UNKNOWNUSDT", MarketType: "um_futures", Status: "TRADING", IsActive: true},
 	}); err != nil {
 		t.Fatalf("upsert symbols: %v", err)
 	}
@@ -109,6 +111,31 @@ func TestAuditTargetsSkipStaleSymbols(t *testing.T) {
 	}
 	if len(targets) != 1 || targets[0].Symbol != "BTCUSDT" {
 		t.Fatalf("expected only fresh symbol, got %+v", targets)
+	}
+}
+
+func TestAuditOnceChecksAllTargetsWhenSymbolsPerRunIsZero(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	now := market.NowMS()
+	var symbols []market.SymbolInfo
+	for i := 0; i < 75; i++ {
+		symbols = append(symbols, market.SymbolInfo{
+			Exchange: "binance", Symbol: fmt.Sprintf("TEST%03dUSDT", i), MarketType: "um_futures",
+			Status: "TRADING", IsActive: true, LastSeenAtMS: now,
+		})
+	}
+	if err := store.UpsertSymbols(ctx, symbols); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &countingFetcher{name: "binance", marketType: "um_futures"}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{Enabled: true, SymbolsPerRun: 0})
+	result, err := g.auditOnce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CheckedSymbols != len(symbols) || fetcher.count != len(symbols) {
+		t.Fatalf("expected full audit of %d symbols, result=%+v requests=%d", len(symbols), result, fetcher.count)
 	}
 }
 
@@ -133,6 +160,19 @@ type fakeFetcher struct {
 	marketType  string
 	bars        []market.Bar
 	lastRequest exchange.KlineRequest
+}
+
+type countingFetcher struct {
+	name       string
+	marketType string
+	count      int
+}
+
+func (f *countingFetcher) Name() string       { return f.name }
+func (f *countingFetcher) MarketType() string { return f.marketType }
+func (f *countingFetcher) FetchKlines(_ context.Context, _ *http.Client, _ exchange.KlineRequest) ([]market.Bar, error) {
+	f.count++
+	return nil, nil
 }
 
 func (f *fakeFetcher) Name() string {

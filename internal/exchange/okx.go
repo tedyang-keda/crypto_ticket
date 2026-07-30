@@ -77,6 +77,7 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 		Data []struct {
 			InstID    string `json:"instId"`
 			State     string `json:"state"`
+			CtType    string `json:"ctType"`
 			BaseCcy   string `json:"baseCcy"`
 			QuoteCcy  string `json:"quoteCcy"`
 			SettleCcy string `json:"settleCcy"`
@@ -108,12 +109,13 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 			ctValCcy:  strings.ToUpper(strings.TrimSpace(item.CtValCcy)),
 		}
 		status := strings.ToLower(item.State)
+		contractType := strings.ToLower(strings.TrimSpace(item.CtType))
 		symbols = append(symbols, market.SymbolInfo{
 			Exchange:      a.Name(),
 			Symbol:        symbol,
 			MarketType:    a.instType,
 			Status:        status,
-			IsActive:      status == "live",
+			IsActive:      status == "live" && contractType != "inverse",
 			FirstSeenAtMS: now,
 			LastSeenAtMS:  now,
 			UpdatedAtMS:   now,

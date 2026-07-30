@@ -97,18 +97,29 @@ func (a *IntegrityAuditor) AuditOnce(ctx context.Context) (IntegritySummary, err
 		target := targets[(a.cursor+i)%len(targets)]
 		summary.CheckedSymbols++
 		for _, tf := range a.cfg.Timeframes {
-			missing, mismatch, invalid, err := a.auditSeries(ctx, target, tf)
+			issues, err := a.auditSeries(ctx, target, tf)
 			if err != nil {
 				return summary, err
 			}
-			if missing+mismatch+invalid > 0 {
+			if len(issues) > 0 {
 				affected[target.Exchange+":"+target.Symbol] = true
 			}
-			summary.Missing += missing
-			summary.Mismatch += mismatch
-			summary.InvalidOHLC += invalid
-			previous := summary.ByTimeframe[tf]
-			summary.ByTimeframe[tf] = [3]int{previous[0] + missing, previous[1] + mismatch, previous[2] + invalid}
+			byTimeframe := summary.ByTimeframe[tf]
+			for _, issue := range issues {
+				summary.Issues = append(summary.Issues, issue)
+				switch issue.Type {
+				case "missing":
+					summary.Missing++
+					byTimeframe[0]++
+				case "mismatch":
+					summary.Mismatch++
+					byTimeframe[1]++
+				case "invalid_ohlc":
+					summary.InvalidOHLC++
+					byTimeframe[2]++
+				}
+			}
+			summary.ByTimeframe[tf] = byTimeframe
 		}
 	}
 	a.cursor = (a.cursor + count) % len(targets)
@@ -145,12 +156,13 @@ func (a *IntegrityAuditor) targets(ctx context.Context) ([]market.SymbolInfo, er
 	return out, nil
 }
 
-func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.SymbolInfo, tf string) (missing int, mismatch int, invalid int, err error) {
+func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.SymbolInfo, tf string) ([]IntegrityIssue, error) {
 	eligible := a.now().Add(-a.cfg.Grace).UnixMilli()
 	start := timeframe.FloorStartMS(eligible, tf)
 	if timeframe.EndMS(start, tf) > eligible {
 		start = timeframe.PreviousStartMS(start, tf)
 	}
+	var issues []IntegrityIssue
 	for i := 0; i < a.cfg.Buckets; i++ {
 		bucketStart := start
 		for step := 0; step < i; step++ {
@@ -159,10 +171,10 @@ func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.Symbol
 		bucketEnd := timeframe.EndMS(bucketStart, tf)
 		targetBars, queryErr := a.store.BarsInRange(ctx, target.Exchange, target.Symbol, tf, bucketStart, bucketStart)
 		if queryErr != nil {
-			return missing, mismatch, invalid, queryErr
+			return nil, queryErr
 		}
 		if len(targetBars) > 0 && !validOHLC(targetBars[len(targetBars)-1]) {
-			invalid++
+			issues = append(issues, newIntegrityIssue(target, tf, bucketStart, "invalid_ohlc"))
 		}
 		sourceTF := aggregator.RollupSourceTimeframe(tf)
 		if sourceTF == "" {
@@ -170,7 +182,7 @@ func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.Symbol
 		}
 		sourceBars, queryErr := a.store.BarsInRange(ctx, target.Exchange, target.Symbol, sourceTF, bucketStart, bucketEnd)
 		if queryErr != nil {
-			return missing, mismatch, invalid, queryErr
+			return nil, queryErr
 		}
 		if !completeSource(sourceBars, sourceTF, bucketStart, bucketEnd) {
 			continue
@@ -180,14 +192,20 @@ func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.Symbol
 			continue
 		}
 		if len(targetBars) == 0 {
-			missing++
+			issues = append(issues, newIntegrityIssue(target, tf, bucketStart, "missing"))
 			continue
 		}
 		if barsDifferForIntegrity(targetBars[len(targetBars)-1], *expected, a.cfg.Tolerance) {
-			mismatch++
+			issues = append(issues, newIntegrityIssue(target, tf, bucketStart, "mismatch"))
 		}
 	}
-	return missing, mismatch, invalid, nil
+	return issues, nil
+}
+
+func newIntegrityIssue(target market.SymbolInfo, tf string, startMS int64, issueType string) IntegrityIssue {
+	return IntegrityIssue{
+		Exchange: target.Exchange, Symbol: target.Symbol, Timeframe: tf, StartMS: startMS, Type: issueType,
+	}
 }
 
 func completeSource(bars []market.Bar, sourceTF string, targetStart int64, targetEnd int64) bool {

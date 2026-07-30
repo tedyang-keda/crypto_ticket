@@ -178,6 +178,10 @@ func (e *AlertEngine) SendDaily(ctx context.Context, body string) error {
 	return e.notifier.SendCard(ctx, notify.Card{Title: "行情系统每日健康摘要", Template: "blue", Body: strings.TrimSpace(body)})
 }
 
+func (e *AlertEngine) SendMarketQuality(ctx context.Context, body string) error {
+	return e.notifier.SendCard(ctx, notify.Card{Title: "行情接入与质量报告", Template: "blue", Body: strings.TrimSpace(body)})
+}
+
 func (e *AlertEngine) updateMetricsLocked() {
 	warning := 0
 	critical := 0

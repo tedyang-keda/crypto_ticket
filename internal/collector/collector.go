@@ -30,6 +30,7 @@ type KlinePublisher interface {
 
 type Observer interface {
 	RegisterCollectorRuntime(exchange string, marketType string)
+	CollectorSubscriptions(exchange string, marketType string, symbols []string)
 	CollectorConnection(exchange string, marketType string, delta int)
 	CollectorMessage(exchange string, marketType string)
 	CollectorBarReceived(exchange string, marketType string, bar market.Bar)
@@ -303,6 +304,9 @@ func (r *Runner) refreshSymbols(ctx context.Context, adapter exchange.Adapter) (
 		if symbol.IsActive {
 			active = append(active, symbol.Symbol)
 		}
+	}
+	if r.observer != nil {
+		r.observer.CollectorSubscriptions(adapter.Name(), adapter.MarketType(), active)
 	}
 	return active, nil
 }

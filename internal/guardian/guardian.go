@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"crypto-ticket/internal/aggregator"
@@ -19,34 +20,34 @@ import (
 )
 
 const (
-	defaultAuditInterval  = time.Minute
+	defaultAuditInterval  = 2 * time.Minute
 	defaultAuditWindow    = 30 * time.Minute
 	defaultAuditDelay     = 2 * time.Minute
 	defaultHTTPTimeout    = 20 * time.Second
 	defaultQueueSize      = 4096
-	defaultSymbolsPerRun  = 50
 	defaultSymbolMaxAge   = 10 * time.Minute
 	defaultFloatTolerance = 1e-8
 )
 
 type Config struct {
-	Enabled        bool
-	AuditInterval  time.Duration
-	AuditWindow    time.Duration
-	AuditDelay     time.Duration
-	RequestDelay   time.Duration
-	HTTPTimeout    time.Duration
-	QueueSize      int
-	SymbolsPerRun  int
-	SymbolMaxAge   time.Duration
-	FloatTolerance float64
-	Observer       Observer
+	Enabled          bool
+	AuditInterval    time.Duration
+	AuditWindow      time.Duration
+	AuditDelay       time.Duration
+	RequestDelay     time.Duration
+	HTTPTimeout      time.Duration
+	QueueSize        int
+	SymbolsPerRun    int
+	SymbolMaxAge     time.Duration
+	FloatTolerance   float64
+	RequestIntervals map[string]time.Duration
+	Observer         Observer
 }
 
 type Observer interface {
 	GuardianQueueDropped(exchange string)
 	GuardianEvent(event market.KlineGuardianEvent)
-	GuardianAudit(success bool)
+	GuardianAudit(success bool, checkedSymbols int, checkedBars int, failedSymbols int, duration time.Duration)
 }
 
 type Store interface {
@@ -82,6 +83,7 @@ type Guardian struct {
 	fetchersByExchange map[string][]Fetcher
 	auditCursor        int
 	observer           Observer
+	requestPacers      map[string]*requestPacer
 }
 
 type auditTarget struct {
@@ -97,6 +99,18 @@ type repairResult struct {
 	Events   []market.KlineGuardianEvent
 }
 
+type auditResult struct {
+	CheckedSymbols int
+	CheckedBars    int
+	FailedSymbols  int
+}
+
+type requestPacer struct {
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time
+}
+
 func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardian {
 	cfg = normalizeConfig(cfg)
 	g := &Guardian{
@@ -107,6 +121,7 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		finalBars:          make(chan market.Bar, cfg.QueueSize),
 		fetchersByMarket:   make(map[string]Fetcher),
 		fetchersByExchange: make(map[string][]Fetcher),
+		requestPacers:      make(map[string]*requestPacer),
 		observer:           cfg.Observer,
 	}
 	for _, fetcher := range fetchers {
@@ -117,6 +132,13 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		marketType := normalizeMarketType(fetcher.MarketType())
 		g.fetchersByMarket[fetcherKey(exchangeName, marketType)] = fetcher
 		g.fetchersByExchange[exchangeName] = append(g.fetchersByExchange[exchangeName], fetcher)
+		if g.requestPacers[exchangeName] == nil {
+			interval := cfg.RequestDelay
+			if configured := cfg.RequestIntervals[exchangeName]; configured > 0 {
+				interval = configured
+			}
+			g.requestPacers[exchangeName] = &requestPacer{interval: interval}
+		}
 	}
 	return g
 }
@@ -137,8 +159,8 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueueSize
 	}
-	if cfg.SymbolsPerRun <= 0 {
-		cfg.SymbolsPerRun = defaultSymbolsPerRun
+	if cfg.SymbolsPerRun < 0 {
+		cfg.SymbolsPerRun = 0
 	}
 	if cfg.SymbolMaxAge <= 0 {
 		cfg.SymbolMaxAge = defaultSymbolMaxAge
@@ -146,6 +168,13 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.FloatTolerance <= 0 {
 		cfg.FloatTolerance = defaultFloatTolerance
 	}
+	normalizedIntervals := make(map[string]time.Duration, len(cfg.RequestIntervals))
+	for exchangeName, interval := range cfg.RequestIntervals {
+		if interval > 0 {
+			normalizedIntervals[normalizeExchange(exchangeName)] = interval
+		}
+	}
+	cfg.RequestIntervals = normalizedIntervals
 	return cfg
 }
 
@@ -201,13 +230,21 @@ func (g *Guardian) runAudits(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := g.AuditOnce(ctx); err != nil {
+			started := time.Now()
+			result, err := g.auditOnce(ctx)
+			duration := time.Since(started)
+			success := err == nil && result.FailedSymbols == 0
+			if err != nil {
 				if g.observer != nil {
-					g.observer.GuardianAudit(false)
+					g.observer.GuardianAudit(success, result.CheckedSymbols, result.CheckedBars, result.FailedSymbols, duration)
 				}
 				log.Printf("kline guardian audit failed: %v", err)
-			} else if g.observer != nil {
-				g.observer.GuardianAudit(true)
+			} else {
+				if g.observer != nil {
+					g.observer.GuardianAudit(success, result.CheckedSymbols, result.CheckedBars, result.FailedSymbols, duration)
+				}
+				log.Printf("kline guardian audit completed checked_symbols=%d checked_bars=%d failed_symbols=%d duration=%s",
+					result.CheckedSymbols, result.CheckedBars, result.FailedSymbols, duration.Round(time.Millisecond))
 			}
 		}
 	}
@@ -310,9 +347,14 @@ func (g *Guardian) localBaselineStart(ctx context.Context, bar market.Bar) (int6
 }
 
 func (g *Guardian) AuditOnce(ctx context.Context) error {
+	_, err := g.auditOnce(ctx)
+	return err
+}
+
+func (g *Guardian) auditOnce(ctx context.Context) (auditResult, error) {
 	endStart := g.auditEndStart()
 	if endStart <= 0 {
-		return nil
+		return auditResult{}, nil
 	}
 	windowMinutes := int64(g.cfg.AuditWindow / time.Minute)
 	if windowMinutes <= 0 {
@@ -324,30 +366,67 @@ func (g *Guardian) AuditOnce(ctx context.Context) error {
 	}
 	targets, err := g.auditTargets(ctx)
 	if err != nil {
-		return err
+		return auditResult{}, err
 	}
 	if len(targets) == 0 {
-		return nil
+		return auditResult{}, nil
 	}
-	count := minInt(g.cfg.SymbolsPerRun, len(targets))
+	count := len(targets)
+	if g.cfg.SymbolsPerRun > 0 {
+		count = minInt(g.cfg.SymbolsPerRun, len(targets))
+	}
+	selected := make([]auditTarget, 0, count)
 	for i := 0; i < count; i++ {
 		index := (g.auditCursor + i) % len(targets)
-		target := targets[index]
-		if _, err := g.repairRangeWithFetcher(ctx, target.Fetcher, target.Exchange, target.Symbol, start, endStart, "window_audit"); err != nil {
-			log.Printf("kline guardian target audit failed exchange=%s symbol=%s err=%v", target.Exchange, target.Symbol, err)
+		selected = append(selected, targets[index])
+	}
+	g.auditCursor = (g.auditCursor + count) % len(targets)
+
+	grouped := make(map[string][]auditTarget)
+	for _, target := range selected {
+		grouped[target.Exchange] = append(grouped[target.Exchange], target)
+	}
+	results := make(chan auditResult, len(grouped))
+	var wg sync.WaitGroup
+	for _, exchangeTargets := range grouped {
+		exchangeTargets := append([]auditTarget(nil), exchangeTargets...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- g.auditTargetGroup(ctx, exchangeTargets, start, endStart)
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var combined auditResult
+	for result := range results {
+		combined.CheckedSymbols += result.CheckedSymbols
+		combined.CheckedBars += result.CheckedBars
+		combined.FailedSymbols += result.FailedSymbols
+	}
+	if err := ctx.Err(); err != nil {
+		return combined, err
+	}
+	return combined, nil
+}
+
+func (g *Guardian) auditTargetGroup(ctx context.Context, targets []auditTarget, startMS int64, endMS int64) auditResult {
+	var summary auditResult
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			return summary
 		}
-		if g.cfg.RequestDelay > 0 && i < count-1 {
-			timer := time.NewTimer(g.cfg.RequestDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
+		result, err := g.repairRangeWithFetcher(ctx, target.Fetcher, target.Exchange, target.Symbol, startMS, endMS, "window_audit")
+		summary.CheckedSymbols++
+		summary.CheckedBars += result.Checked
+		if err != nil {
+			summary.FailedSymbols++
+			if ctx.Err() == nil {
+				log.Printf("kline guardian target audit failed exchange=%s symbol=%s err=%v", target.Exchange, target.Symbol, err)
 			}
 		}
 	}
-	g.auditCursor = (g.auditCursor + count) % len(targets)
-	return nil
+	return summary
 }
 
 func (g *Guardian) auditEndStart() int64 {
@@ -368,7 +447,7 @@ func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 			if !symbol.IsActive {
 				continue
 			}
-			if symbol.LastSeenAtMS > 0 && now-symbol.LastSeenAtMS > int64(g.cfg.SymbolMaxAge/time.Millisecond) {
+			if symbol.LastSeenAtMS <= 0 || now-symbol.LastSeenAtMS > int64(g.cfg.SymbolMaxAge/time.Millisecond) {
 				continue
 			}
 			fetcher := g.fetcherFor(symbol.Exchange, symbol.MarketType)
@@ -415,6 +494,9 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 		return repairResult{}, nil
 	}
 	limit := int((endMS-startMS)/timeframe.MinuteMS) + 1
+	if err := g.waitForRequest(ctx, exchangeName); err != nil {
+		return repairResult{}, err
+	}
 	official, err := fetcher.FetchKlines(ctx, g.client, exchange.KlineRequest{
 		Symbol: symbol, Timeframe: aggregator.OneMinute, StartMS: startMS, EndMS: endMS, Limit: limit,
 		Adjustment: guardianAdjustment(exchangeName),
@@ -475,6 +557,39 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 		return result, err
 	}
 	return result, nil
+}
+
+func (g *Guardian) waitForRequest(ctx context.Context, exchangeName string) error {
+	pacer := g.requestPacers[normalizeExchange(exchangeName)]
+	if pacer == nil {
+		return nil
+	}
+	return pacer.Wait(ctx)
+}
+
+func (p *requestPacer) Wait(ctx context.Context) error {
+	if p == nil || p.interval <= 0 {
+		return nil
+	}
+	p.mu.Lock()
+	now := time.Now()
+	startAt := now
+	if p.next.After(startAt) {
+		startAt = p.next
+	}
+	p.next = startAt.Add(p.interval)
+	p.mu.Unlock()
+	if !startAt.After(now) {
+		return nil
+	}
+	timer := time.NewTimer(startAt.Sub(now))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (g *Guardian) insertEvents(ctx context.Context, events []market.KlineGuardianEvent) error {

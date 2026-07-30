@@ -60,12 +60,14 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 			continue
 		}
 		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
+		contractType := strings.ToUpper(strings.TrimSpace(item.ContractType))
+		isPerpetual := contractType == "PERPETUAL" || contractType == "TRADIFI_PERPETUAL"
 		symbols = append(symbols, market.SymbolInfo{
 			Exchange:      a.Name(),
 			Symbol:        symbol,
 			MarketType:    a.marketType,
 			Status:        status,
-			IsActive:      status == "TRADING",
+			IsActive:      status == "TRADING" && isPerpetual,
 			FirstSeenAtMS: now,
 			LastSeenAtMS:  now,
 			UpdatedAtMS:   now,

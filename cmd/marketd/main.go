@@ -66,9 +66,10 @@ func main() {
 	}
 	monitorService := monitoring.NewService(registry, pinger, activityStore, cfg.FeishuWebhookURL, monitoring.Config{
 		Enabled: cfg.EnableHealthMonitor, CollectorEnabled: cfg.EnableCollector, P1AlertsEnabled: cfg.MonitorP1AlertsEnabled,
-		EvaluationInterval: time.Duration(cfg.MonitorEvaluationSeconds) * time.Second,
-		DailyReportHour:    cfg.MonitorDailyReportHour,
-		DiskPath:           cfg.MonitorDiskPath,
+		EvaluationInterval:   time.Duration(cfg.MonitorEvaluationSeconds) * time.Second,
+		DailyReportHour:      cfg.MonitorDailyReportHour,
+		MarketReportInterval: time.Duration(cfg.MonitorMarketReportIntervalMinutes) * time.Minute,
+		DiskPath:             cfg.MonitorDiskPath,
 	})
 	hub := realtime.NewHub(registry)
 	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit, registry)
@@ -154,8 +155,12 @@ func startBackgroundWorkers(
 			AuditDelay:    time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
 			SymbolsPerRun: cfg.KlineGuardianSymbolsPerRun,
 			RequestDelay:  time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
-			SymbolMaxAge:  time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
-			Observer:      registry,
+			RequestIntervals: map[string]time.Duration{
+				"binance": requestInterval(cfg.KlineGuardianBinanceRPS),
+				"okx":     requestInterval(cfg.KlineGuardianOKXRPS),
+			},
+			SymbolMaxAge: time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
+			Observer:     registry,
 		})
 		marketService.AddFinalBarObserver(worker)
 		go func() {
@@ -163,11 +168,14 @@ func startBackgroundWorkers(
 				errCh <- err
 			}
 		}()
-		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds",
+		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds symbols_per_run=%d binance_rps=%d okx_rps=%d",
 			len(fetchers),
 			cfg.KlineGuardianAuditIntervalSeconds,
 			cfg.KlineGuardianWindowMinutes,
 			cfg.KlineGuardianDelaySeconds,
+			cfg.KlineGuardianSymbolsPerRun,
+			cfg.KlineGuardianBinanceRPS,
+			cfg.KlineGuardianOKXRPS,
 		)
 	}
 	if cfg.EnableCorporateAction {
@@ -210,6 +218,13 @@ func startBackgroundWorkers(
 			len(fetchers), cfg.CorporateActionPollSeconds, cfg.CorporateActionMaxAttempts,
 			cfg.CorporateActionAnchorSeconds, cfg.CorporateActionAnchorSymbolsPerRun)
 	}
+}
+
+func requestInterval(requestsPerSecond int) time.Duration {
+	if requestsPerSecond <= 0 {
+		return 0
+	}
+	return time.Second / time.Duration(requestsPerSecond)
 }
 
 func enabledExchangeNames(configs []config.ExchangeConfig) []string {

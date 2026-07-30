@@ -43,6 +43,13 @@ func TestIntegrityAuditOnlyReportsMissingWhenSourceComplete(t *testing.T) {
 	if summary.Missing != 1 || summary.Mismatch != 0 {
 		t.Fatalf("expected one missing target, got %+v", summary)
 	}
+	if len(summary.Issues) != 1 {
+		t.Fatalf("expected one issue detail, got %+v", summary.Issues)
+	}
+	issue := summary.Issues[0]
+	if issue.Exchange != symbol.Exchange || issue.Symbol != symbol.Symbol || issue.Timeframe != "15m" || issue.StartMS != bucketStart || issue.Type != "missing" {
+		t.Fatalf("unexpected issue detail: %+v", issue)
+	}
 
 	expected := aggregator.RollupBars("15m", source, true, "test", now.UnixMilli())
 	if err := store.UpsertBars(ctx, []market.Bar{*expected}); err != nil {
@@ -52,8 +59,11 @@ func TestIntegrityAuditOnlyReportsMissingWhenSourceComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Missing != 0 || summary.Mismatch != 0 || summary.InvalidOHLC != 0 {
+	if summary.Missing != 0 || summary.Mismatch != 0 || summary.InvalidOHLC != 0 || len(summary.Issues) != 0 {
 		t.Fatalf("expected clean audit, got %+v", summary)
+	}
+	if values, ok := summary.ByTimeframe["15m"]; !ok || values != [3]int{} {
+		t.Fatalf("expected clean timeframe counters to be retained, got %+v", summary.ByTimeframe)
 	}
 
 	if err := store.UpsertBars(ctx, source[:14]); err != nil {

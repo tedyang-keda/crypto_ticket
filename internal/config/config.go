@@ -24,6 +24,8 @@ type Config struct {
 	KlineGuardianDelaySeconds          int
 	KlineGuardianSymbolsPerRun         int
 	KlineGuardianRequestDelayMS        int
+	KlineGuardianBinanceRPS            int
+	KlineGuardianOKXRPS                int
 	KlineGuardianSymbolMaxAgeSeconds   int
 	EnableCorporateAction              bool
 	CorporateActionPollSeconds         int
@@ -38,6 +40,7 @@ type Config struct {
 	MonitorP1AlertsEnabled             bool
 	MonitorEvaluationSeconds           int
 	MonitorDailyReportHour             int
+	MonitorMarketReportIntervalMinutes int
 	MonitorIntegrityIntervalSeconds    int
 	MonitorIntegritySymbolsPerRun      int
 	MonitorIntegrityTimeframes         []string
@@ -79,11 +82,13 @@ func Load() Config {
 		EnableMockSymbols:                  envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
 		EnableCollector:                    enableCollector,
 		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", enableCollector),
-		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 60),
+		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 120),
 		KlineGuardianWindowMinutes:         envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
 		KlineGuardianDelaySeconds:          envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
-		KlineGuardianSymbolsPerRun:         envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 50),
+		KlineGuardianSymbolsPerRun:         envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 0),
 		KlineGuardianRequestDelayMS:        envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
+		KlineGuardianBinanceRPS:            envInt("KLINE_GUARDIAN_BINANCE_RPS", 8),
+		KlineGuardianOKXRPS:                envInt("KLINE_GUARDIAN_OKX_RPS", 5),
 		KlineGuardianSymbolMaxAgeSeconds:   envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
 		EnableCorporateAction:              envBool("ENABLE_CORPORATE_ACTION", false),
 		CorporateActionPollSeconds:         envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
@@ -98,6 +103,7 @@ func Load() Config {
 		MonitorP1AlertsEnabled:             envBool("MONITOR_P1_ALERTS_ENABLED", false),
 		MonitorEvaluationSeconds:           envInt("MONITOR_EVALUATION_SECONDS", 15),
 		MonitorDailyReportHour:             envInt("MONITOR_DAILY_REPORT_HOUR", 9),
+		MonitorMarketReportIntervalMinutes: envInt("MONITOR_MARKET_REPORT_INTERVAL_MINUTES", 30),
 		MonitorIntegrityIntervalSeconds:    envInt("MONITOR_INTEGRITY_INTERVAL_SECONDS", 600),
 		MonitorIntegritySymbolsPerRun:      envInt("MONITOR_INTEGRITY_SYMBOLS_PER_RUN", 50),
 		MonitorIntegrityTimeframes:         normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),
@@ -142,7 +148,7 @@ func loadExchangeConfigs() []ExchangeConfig {
 			MarketType:            env("BINANCE_COIN_KIND", "coin_futures"),
 			RestURL:               env("BINANCE_COIN_REST_URL", "https://dapi.binance.com"),
 			WSURL:                 env("BINANCE_COIN_WS_URL", "wss://dstream.binance.com/ws"),
-			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_COIN_ENABLED", true),
+			Enabled:               enabled["binance"] && envBool("BINANCE_ENABLED", true) && envBool("BINANCE_COIN_ENABLED", false),
 			SubscriptionChunkSize: envInt("BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE", 50),
 		},
 		{

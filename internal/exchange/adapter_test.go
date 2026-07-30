@@ -31,6 +31,38 @@ func TestBinanceForwardAdjustmentSymbolsUsesTradFiContractType(t *testing.T) {
 	}
 }
 
+func TestBinanceFetchSymbolsOnlyActivatesPerpetualContracts(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body: io.NopCloser(strings.NewReader(`{"symbols":[
+				{"symbol":"BTCUSDT","status":"TRADING","contractType":"PERPETUAL"},
+				{"symbol":"KORUUSDT","status":"TRADING","contractType":"TRADIFI_PERPETUAL"},
+				{"symbol":"BTCUSDT_260925","status":"TRADING","contractType":"CURRENT_QUARTER"},
+				{"symbol":"BTCUSDT_261225","status":"TRADING","contractType":"NEXT_QUARTER"},
+				{"symbol":"OLDUSDT","status":"BREAK","contractType":"PERPETUAL"}
+			]}`)),
+		}, nil
+	})}
+
+	adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+	symbols, err := adapter.FetchSymbols(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := make(map[string]bool, len(symbols))
+	for _, symbol := range symbols {
+		active[symbol.Symbol] = symbol.IsActive
+	}
+	if !active["BTCUSDT"] || !active["KORUUSDT"] {
+		t.Fatalf("expected perpetual contracts to be active: %v", active)
+	}
+	if active["BTCUSDT_260925"] || active["BTCUSDT_261225"] || active["OLDUSDT"] {
+		t.Fatalf("expected delivery and non-trading contracts to be inactive: %v", active)
+	}
+}
+
 func TestBinanceParseTradeMessage(t *testing.T) {
 	adapter := NewBinanceFuturesAdapter("um_futures", "https://fapi.binance.com", "wss://example")
 	ticks, err := adapter.ParseMessage([]byte(`{"e":"trade","E":1779340001001,"T":1779340001000,"s":"BTCUSDT","t":123,"p":"100000.12","q":"0.01","m":true}`))
@@ -112,6 +144,36 @@ func TestOKXParseTradesMessage(t *testing.T) {
 	}
 	if tick.Side != "buy" || tick.TradeID != "9" {
 		t.Fatalf("unexpected side/trade id: %+v", tick)
+	}
+}
+
+func TestOKXFetchSymbolsExcludesInverseContracts(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body: io.NopCloser(strings.NewReader(`{"data":[
+				{"instId":"BTC-USDT-SWAP","state":"live","ctType":"linear","settleCcy":"USDT"},
+				{"instId":"BTC-USD-SWAP","state":"live","ctType":"inverse","settleCcy":"BTC"},
+				{"instId":"OLD-USDT-SWAP","state":"suspend","ctType":"linear","settleCcy":"USDT"}
+			]}`)),
+		}, nil
+	})}
+
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	symbols, err := adapter.FetchSymbols(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := make(map[string]bool, len(symbols))
+	for _, symbol := range symbols {
+		active[symbol.Symbol] = symbol.IsActive
+	}
+	if !active["BTC-USDT-SWAP"] {
+		t.Fatalf("expected linear swap to be active: %v", active)
+	}
+	if active["BTC-USD-SWAP"] || active["OLD-USDT-SWAP"] {
+		t.Fatalf("expected inverse and non-live swaps to be inactive: %v", active)
 	}
 }
 

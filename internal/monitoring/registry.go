@@ -15,7 +15,10 @@ import (
 	"crypto-ticket/internal/market"
 )
 
-const observationRetention = 24 * time.Hour
+const (
+	observationRetention   = 5 * time.Minute
+	guardianEventRetention = 30 * time.Minute
+)
 
 type runtimeKey struct {
 	Exchange   string
@@ -24,6 +27,7 @@ type runtimeKey struct {
 
 type runtimeState struct {
 	Connected          int
+	SubscribedSymbols  int
 	LastMessageAt      time.Time
 	LastBarAt          time.Time
 	LastFinalAt        time.Time
@@ -39,15 +43,24 @@ type runtimeState struct {
 
 type symbolState struct {
 	Runtime          runtimeKey
+	Subscribed       bool
 	LastFinalAt      time.Time
 	LastFinalStartMS int64
 	Continuous       bool
 }
 
 type timedGuardianEvent struct {
-	At     time.Time
-	Event  string
-	Symbol string
+	At    time.Time
+	Event market.KlineGuardianEvent
+}
+
+type GuardianAuditSnapshot struct {
+	Success        bool
+	CheckedSymbols int
+	CheckedBars    int
+	FailedSymbols  int
+	Duration       time.Duration
+	CompletedAtMS  int64
 }
 
 type httpObservation struct {
@@ -71,12 +84,22 @@ type IntegritySummary struct {
 	InvalidOHLC    int               `json:"invalid_ohlc"`
 	Affected       []string          `json:"affected,omitempty"`
 	ByTimeframe    map[string][3]int `json:"by_timeframe,omitempty"`
+	Issues         []IntegrityIssue  `json:"issues,omitempty"`
+}
+
+type IntegrityIssue struct {
+	Exchange  string `json:"exchange"`
+	Symbol    string `json:"symbol"`
+	Timeframe string `json:"timeframe"`
+	StartMS   int64  `json:"start_ms"`
+	Type      string `json:"type"`
 }
 
 type RuntimeSnapshot struct {
 	Exchange           string `json:"exchange"`
 	MarketType         string `json:"market_type"`
 	Connected          int    `json:"connected"`
+	SubscribedSymbols  int    `json:"subscribed_symbols"`
 	LastMessageMS      int64  `json:"last_message_ms"`
 	LastBarMS          int64  `json:"last_bar_ms"`
 	LastFinalMS        int64  `json:"last_final_ms"`
@@ -98,6 +121,7 @@ type SymbolSnapshot struct {
 	LastFinalMS      int64
 	LastFinalStartMS int64
 	Continuous       bool
+	Subscribed       bool
 }
 
 type WindowSnapshot struct {
@@ -110,6 +134,8 @@ type WindowSnapshot struct {
 	StorageP95        time.Duration
 	StorageFailures5m int
 	GuardianTotals    map[string]uint64
+	GuardianEvents30m []market.KlineGuardianEvent
+	GuardianAudit     GuardianAuditSnapshot
 	HTTPRequestsTotal uint64
 	HTTP5xxTotal      uint64
 	WSDropsTotal      uint64
@@ -140,6 +166,7 @@ type Registry struct {
 	wsDropsTotal   uint64
 	integrity      IntegritySummary
 	resources      ResourceSnapshot
+	guardianAudit  GuardianAuditSnapshot
 	prometheus     *prometheus.Registry
 
 	collectorConnected       *prometheus.GaugeVec
@@ -229,6 +256,32 @@ func (r *Registry) RegisterCollectorRuntime(exchangeName string, marketType stri
 	r.runtimeLocked(exchangeName, marketType)
 }
 
+func (r *Registry) CollectorSubscriptions(exchangeName string, marketType string, symbols []string) {
+	key := normalizeRuntimeKey(exchangeName, marketType)
+	r.mu.Lock()
+	for _, state := range r.symbols {
+		if state.Runtime == key {
+			state.Subscribed = false
+		}
+	}
+	for _, symbol := range symbols {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol == "" {
+			continue
+		}
+		entryKey := symbolKey(key.Exchange, symbol)
+		entry := r.symbols[entryKey]
+		if entry == nil {
+			entry = &symbolState{}
+			r.symbols[entryKey] = entry
+		}
+		entry.Runtime = key
+		entry.Subscribed = true
+	}
+	r.runtimeLocked(key.Exchange, key.MarketType).SubscribedSymbols = len(symbols)
+	r.mu.Unlock()
+}
+
 func (r *Registry) CollectorConnection(exchangeName string, marketType string, delta int) {
 	key := normalizeRuntimeKey(exchangeName, marketType)
 	r.mu.Lock()
@@ -261,7 +314,15 @@ func (r *Registry) CollectorBarReceived(exchangeName string, marketType string, 
 	if bar.IsFinal && bar.Timeframe == "1m" {
 		state.LastFinalAt = now
 		state.LastFinalStartMS = bar.StartMS
-		r.symbols[symbolKey(bar.Exchange, bar.Symbol)] = &symbolState{Runtime: key, LastFinalAt: now, LastFinalStartMS: bar.StartMS, Continuous: r.symbolContinuousLocked(bar.Exchange, bar.Symbol)}
+		entryKey := symbolKey(bar.Exchange, bar.Symbol)
+		entry := r.symbols[entryKey]
+		if entry == nil {
+			entry = &symbolState{}
+			r.symbols[entryKey] = entry
+		}
+		entry.Runtime = key
+		entry.LastFinalAt = now
+		entry.LastFinalStartMS = bar.StartMS
 	} else {
 		entry := r.symbols[symbolKey(bar.Exchange, bar.Symbol)]
 		if entry == nil {
@@ -350,7 +411,7 @@ func (r *Registry) BarPublished(bar market.Bar) {
 func (r *Registry) GuardianQueueDropped(exchangeName string) {
 	now := r.now()
 	r.mu.Lock()
-	r.guardianEvents = append(r.guardianEvents, timedGuardianEvent{At: now, Event: "queue_dropped"})
+	r.guardianEvents = append(r.guardianEvents, timedGuardianEvent{At: now, Event: market.KlineGuardianEvent{Exchange: exchangeName, EventType: "queue_dropped", CreatedAtMS: now.UnixMilli()}})
 	r.guardianTotals["queue_dropped"]++
 	r.mu.Unlock()
 	r.guardianQueueDrops.WithLabelValues(strings.ToLower(exchangeName)).Inc()
@@ -359,17 +420,23 @@ func (r *Registry) GuardianQueueDropped(exchangeName string) {
 func (r *Registry) GuardianEvent(event market.KlineGuardianEvent) {
 	now := r.now()
 	r.mu.Lock()
-	r.guardianEvents = append(r.guardianEvents, timedGuardianEvent{At: now, Event: event.EventType, Symbol: event.Symbol})
+	r.guardianEvents = append(r.guardianEvents, timedGuardianEvent{At: now, Event: event})
 	r.guardianTotals[event.EventType]++
 	r.mu.Unlock()
 	r.guardianEventTotal.WithLabelValues(strings.ToLower(event.Exchange), event.EventType).Inc()
 }
 
-func (r *Registry) GuardianAudit(success bool) {
+func (r *Registry) GuardianAudit(success bool, checkedSymbols int, checkedBars int, failedSymbols int, duration time.Duration) {
 	result := "success"
 	if !success {
 		result = "failed"
 	}
+	r.mu.Lock()
+	r.guardianAudit = GuardianAuditSnapshot{
+		Success: success, CheckedSymbols: checkedSymbols, CheckedBars: checkedBars,
+		FailedSymbols: failedSymbols, Duration: duration, CompletedAtMS: r.now().UnixMilli(),
+	}
+	r.mu.Unlock()
 	r.guardianAuditTotal.WithLabelValues(result).Inc()
 }
 
@@ -478,6 +545,7 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cutoff := now.Add(-observationRetention)
+	guardianCutoff := now.Add(-guardianEventRetention)
 	fiveMinutes := now.Add(-5 * time.Minute)
 	tenMinutes := now.Add(-10 * time.Minute)
 	for _, state := range r.runtimes {
@@ -485,7 +553,7 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 		state.ParseErrors = pruneTimes(state.ParseErrors, cutoff)
 		state.IngestErrors = pruneTimes(state.IngestErrors, cutoff)
 	}
-	r.guardianEvents = pruneGuardianEvents(r.guardianEvents, cutoff)
+	r.guardianEvents = pruneGuardianEvents(r.guardianEvents, guardianCutoff)
 	r.httpRequests = pruneHTTP(r.httpRequests, cutoff)
 	r.storageOps = pruneStorage(r.storageOps, cutoff)
 	r.wsDrops = pruneTimes(r.wsDrops, cutoff)
@@ -493,7 +561,7 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	snapshot := Snapshot{StartedAt: r.startedAt}
 	for key, state := range r.runtimes {
 		snapshot.Runtimes = append(snapshot.Runtimes, RuntimeSnapshot{
-			Exchange: key.Exchange, MarketType: key.MarketType, Connected: state.Connected,
+			Exchange: key.Exchange, MarketType: key.MarketType, Connected: state.Connected, SubscribedSymbols: state.SubscribedSymbols,
 			LastMessageMS: timeMS(state.LastMessageAt), LastBarMS: timeMS(state.LastBarAt), LastFinalMS: timeMS(state.LastFinalAt),
 			LastFinalStartMS: state.LastFinalStartMS, LastPersistedMS: timeMS(state.LastPersistedAt), LastPublishedMS: timeMS(state.LastPublishedAt),
 			Reconnects5m: countTimesSince(state.Reconnects, fiveMinutes), Reconnects10m: countTimesSince(state.Reconnects, tenMinutes),
@@ -505,7 +573,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 		exchangeName, symbol := splitSymbolKey(key)
 		snapshot.Symbols = append(snapshot.Symbols, SymbolSnapshot{
 			Exchange: exchangeName, MarketType: state.Runtime.MarketType, Symbol: symbol,
-			LastFinalMS: timeMS(state.LastFinalAt), LastFinalStartMS: state.LastFinalStartMS, Continuous: state.Continuous,
+			LastFinalMS: timeMS(state.LastFinalAt), LastFinalStartMS: state.LastFinalStartMS,
+			Continuous: state.Continuous, Subscribed: state.Subscribed,
 		})
 	}
 	sort.Slice(snapshot.Runtimes, func(i, j int) bool {
@@ -526,7 +595,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 		GuardianSymbols5m: make(map[string]int),
 		GuardianTotals:    cloneUintMap(r.guardianTotals),
 		HTTPRequestsTotal: r.httpTotal, HTTP5xxTotal: r.http5xxTotal, WSDropsTotal: r.wsDropsTotal,
-		Integrity: r.integrity,
+		Integrity:     r.integrity,
+		GuardianAudit: r.guardianAudit,
 	}
 	var httpDurations []time.Duration
 	for _, item := range r.httpRequests {
@@ -542,12 +612,14 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	window.HTTPP95 = percentile95(httpDurations)
 	window.WSDrops5m = countTimesSince(r.wsDrops, fiveMinutes)
 	for _, event := range r.guardianEvents {
-		if event.At.Before(fiveMinutes) {
-			continue
+		if !event.At.Before(now.Add(-guardianEventRetention)) {
+			window.GuardianEvents30m = append(window.GuardianEvents30m, event.Event)
 		}
-		window.GuardianEvents5m[event.Event]++
-		if event.Symbol != "" {
-			window.GuardianSymbols5m[event.Symbol]++
+		if !event.At.Before(fiveMinutes) {
+			window.GuardianEvents5m[event.Event.EventType]++
+			if event.Event.Symbol != "" {
+				window.GuardianSymbols5m[event.Event.Symbol]++
+			}
 		}
 	}
 	var storageDurations []time.Duration
