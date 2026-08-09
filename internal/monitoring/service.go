@@ -66,6 +66,8 @@ type Service struct {
 	pinger        Pinger
 	activityStore ActivityStore
 	dbStats       DBStatsProvider
+	mysqlStatus   MySQLStatusProvider
+	redisStatus   RedisStatusProvider
 	alerts        *AlertEngine
 	cfg           Config
 
@@ -73,12 +75,15 @@ type Service struct {
 	dbFailures      int
 	dbLastOK        time.Time
 	dbLastError     string
+	dbLastLatency   time.Duration
+	mysqlQuestions  uint64
+	mysqlSampledAt  time.Time
 	lastActivityAt  time.Time
 	resourceSampler ResourceSampler
 	aboveSince      map[string]time.Time
 }
 
-func NewService(registry *Registry, pinger Pinger, activityStore ActivityStore, webhookURL string, cfg Config) *Service {
+func NewService(registry *Registry, pinger Pinger, activityStore ActivityStore, webhookURL string, cfg Config, dependencies ...Dependencies) *Service {
 	if registry == nil {
 		registry = NewRegistry()
 	}
@@ -117,8 +122,14 @@ func NewService(registry *Registry, pinger Pinger, activityStore ActivityStore, 
 		registry: registry, pinger: pinger, activityStore: activityStore, cfg: cfg,
 		alerts: NewAlertEngine(notifier, registry, cfg.P1AlertsEnabled), aboveSince: make(map[string]time.Time),
 	}
+	if len(dependencies) > 0 {
+		service.redisStatus = dependencies[0].Redis
+	}
 	if provider, ok := pinger.(DBStatsProvider); ok {
 		service.dbStats = provider
+	}
+	if provider, ok := pinger.(MySQLStatusProvider); ok {
+		service.mysqlStatus = provider
 	}
 	return service
 }
@@ -171,10 +182,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 func (s *Service) EvaluateOnce(ctx context.Context) {
 	s.checkDatabase(ctx)
-	if s.dbStats != nil {
-		s.registry.SetMySQLPoolStats(s.dbStats.DBStats())
-	}
 	now := s.registry.now()
+	s.sampleMySQL(ctx, now)
+	s.sampleRedis(ctx)
 	s.registry.SetResources(s.resourceSampler.Sample(now, s.cfg.DiskPath))
 	snapshot := s.registry.Snapshot(now)
 	conditions := s.conditions(now, snapshot)
@@ -373,10 +383,12 @@ func (s *Service) checkDatabase(ctx context.Context) {
 	checkCtx, cancel := context.WithTimeout(ctx, s.cfg.DatabaseTimeout)
 	started := time.Now()
 	err := s.pinger.Ping(checkCtx)
+	latency := time.Since(started)
 	cancel()
-	s.registry.StorageOperation("ping", time.Since(started), err)
+	s.registry.StorageOperation("ping", latency, err)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dbLastLatency = latency
 	if err != nil {
 		s.dbFailures++
 		s.dbLastError = err.Error()
@@ -385,6 +397,67 @@ func (s *Service) checkDatabase(ctx context.Context) {
 	s.dbFailures = 0
 	s.dbLastError = ""
 	s.dbLastOK = s.registry.now()
+}
+
+func (s *Service) sampleMySQL(ctx context.Context, now time.Time) {
+	snapshot := MySQLSnapshot{}
+	s.mu.Lock()
+	snapshot.Available = s.pinger != nil && s.dbFailures == 0
+	snapshot.LastError = s.dbLastError
+	snapshot.PingLatency = s.dbLastLatency
+	previousQuestions := s.mysqlQuestions
+	previousAt := s.mysqlSampledAt
+	s.mu.Unlock()
+	if s.dbStats != nil {
+		stats := s.dbStats.DBStats()
+		snapshot.MaxOpenConnections = stats.MaxOpenConnections
+		snapshot.OpenConnections = stats.OpenConnections
+		snapshot.InUse = stats.InUse
+		snapshot.Idle = stats.Idle
+		snapshot.WaitCount = stats.WaitCount
+		snapshot.WaitDuration = stats.WaitDuration
+	}
+	if s.mysqlStatus != nil && snapshot.Available {
+		checkCtx, cancel := context.WithTimeout(ctx, s.cfg.DatabaseTimeout)
+		status, err := s.mysqlStatus.MySQLServerStatus(checkCtx)
+		cancel()
+		if err != nil {
+			snapshot.LastError = "status: " + err.Error()
+		} else {
+			snapshot.ThreadsConnected = status.ThreadsConnected
+			snapshot.ThreadsRunning = status.ThreadsRunning
+			snapshot.MaxUsedConnections = status.MaxUsedConnections
+			snapshot.SlowQueries = status.SlowQueries
+			if !previousAt.IsZero() && now.After(previousAt) && status.Questions >= previousQuestions {
+				snapshot.QPS = float64(status.Questions-previousQuestions) / now.Sub(previousAt).Seconds()
+			}
+			s.mu.Lock()
+			s.mysqlQuestions = status.Questions
+			s.mysqlSampledAt = now
+			s.mu.Unlock()
+		}
+	}
+	s.registry.SetMySQL(snapshot)
+}
+
+func (s *Service) sampleRedis(ctx context.Context) {
+	snapshot := RedisSnapshot{Enabled: s.redisStatus != nil}
+	if s.redisStatus == nil {
+		s.registry.SetRedis(snapshot)
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, s.cfg.DatabaseTimeout)
+	server, pool, latency, err := s.redisStatus.RedisStatus(checkCtx)
+	cancel()
+	snapshot.PingLatency = latency
+	snapshot.Server = server
+	snapshot.Pool = pool
+	if err != nil {
+		snapshot.LastError = err.Error()
+	} else {
+		snapshot.Available = true
+	}
+	s.registry.SetRedis(snapshot)
 }
 
 func (s *Service) refreshContinuousSeries(ctx context.Context) {
@@ -411,12 +484,12 @@ func (s *Service) sendDailyReport(ctx context.Context) error {
 		fmt.Sprintf("**时间**: `%s`", now.In(s.cfg.DailyLocation).Format(time.RFC3339)),
 		fmt.Sprintf("**运行时间**: `%s`", now.Sub(snapshot.StartedAt).Round(time.Second)),
 		fmt.Sprintf("**活跃告警**: warning=%d, critical=%d", warning, critical),
-		fmt.Sprintf("**HTTP**: requests=%d, 5xx=%d, P95=%s", snapshot.Window.HTTPRequestsTotal, snapshot.Window.HTTP5xxTotal, snapshot.Window.HTTPP95.Round(time.Millisecond)),
-		fmt.Sprintf("**WebSocket 丢弃**: `%d`", snapshot.Window.WSDropsTotal),
-		fmt.Sprintf("**资源**: CPU=%.2f%%, RSS=%d, FD=%d/%d, goroutines=%d, disk=%.2f%%", snapshot.Resources.CPURatio*100, snapshot.Resources.RSSBytes, snapshot.Resources.OpenFDs, snapshot.Resources.FDLimit, snapshot.Resources.Goroutines, snapshot.Resources.DiskRatio*100),
+		fmt.Sprintf("**HTTP累计**: requests=%d, 5xx=%d, P95=%s", snapshot.Window.HTTPRequestsTotal, snapshot.Window.HTTP5xxTotal, snapshot.Window.HTTPP95.Round(time.Millisecond)),
+		fmt.Sprintf("**WebSocket累计**: writes=%d, write_failures=%d, slow_consumer_drops=%d", snapshot.Window.WSWritesTotal, snapshot.Window.WSWriteFailuresTotal, snapshot.Window.WSDropsTotal),
 		fmt.Sprintf("**Guardian 累计**: `%s`", formatUintMap(snapshot.Window.GuardianTotals)),
 		"**高级周期审计**: " + formatIntegrity(snapshot.Window.Integrity),
 	}
+	lines = append(lines, formatSystemQuality(now, snapshot)...)
 	for _, runtime := range snapshot.Runtimes {
 		lines = append(lines, fmt.Sprintf("- `%s:%s`: last=%s, persist=%s, publish=%s, reconnect10m=%d",
 			runtime.Exchange, runtime.MarketType, formatMS(runtime.LastBarMS), formatMS(runtime.LastPersistedMS), formatMS(runtime.LastPublishedMS), runtime.Reconnects10m))

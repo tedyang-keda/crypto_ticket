@@ -43,9 +43,12 @@ func (s *Service) formatMarketQualityReport(now time.Time, snapshot Snapshot) st
 		if runtime.Connected > 0 && messageAge >= s.cfg.WSCriticalAge {
 			status = "在线但无消息"
 		}
-		lines = append(lines, fmt.Sprintf("- `%s:%s`: subscribed=%d, connections=%d, %s, last_message=%s",
-			runtime.Exchange, runtime.MarketType, runtime.SubscribedSymbols, runtime.Connected, status, formatAge(messageAge)))
+		connectRate := formatSuccessRate(runtime.ConnectSuccesses5m, runtime.ConnectAttempts5m)
+		lines = append(lines, fmt.Sprintf("- `%s:%s`: subscribed=%d, connections=%d, %s, last_message=%s, connect_5m=%d/%d (%s), reconnect_5m=%d, parse_error_5m=%d, ingest_error_5m=%d",
+			runtime.Exchange, runtime.MarketType, runtime.SubscribedSymbols, runtime.Connected, status, formatAge(messageAge),
+			runtime.ConnectSuccesses5m, runtime.ConnectAttempts5m, connectRate, runtime.Reconnects5m, runtime.ParseErrors5m, runtime.IngestErrors5m))
 	}
+	lines = append(lines, formatSystemQuality(now, snapshot)...)
 
 	delayed, continuousCount := delayedSubscribedSymbols(now, snapshot.Symbols)
 	warningCount := 0

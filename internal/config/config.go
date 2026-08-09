@@ -41,6 +41,7 @@ type Config struct {
 	MonitorEvaluationSeconds           int
 	MonitorDailyReportHour             int
 	MonitorMarketReportIntervalMinutes int
+	MonitorRedisEnabled                bool
 	MonitorIntegrityIntervalSeconds    int
 	MonitorIntegritySymbolsPerRun      int
 	MonitorIntegrityTimeframes         []string
@@ -104,6 +105,7 @@ func Load() Config {
 		MonitorEvaluationSeconds:           envInt("MONITOR_EVALUATION_SECONDS", 15),
 		MonitorDailyReportHour:             envInt("MONITOR_DAILY_REPORT_HOUR", 9),
 		MonitorMarketReportIntervalMinutes: envInt("MONITOR_MARKET_REPORT_INTERVAL_MINUTES", 30),
+		MonitorRedisEnabled:                envBool("MONITOR_REDIS_ENABLED", true),
 		MonitorIntegrityIntervalSeconds:    envInt("MONITOR_INTEGRITY_INTERVAL_SECONDS", 600),
 		MonitorIntegritySymbolsPerRun:      envInt("MONITOR_INTEGRITY_SYMBOLS_PER_RUN", 50),
 		MonitorIntegrityTimeframes:         normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),

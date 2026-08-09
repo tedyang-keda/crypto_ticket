@@ -116,6 +116,7 @@ go run ./cmd/marketd
 | `MONITOR_EVALUATION_SECONDS` | `15` | 健康评估周期；MySQL 连续失败 3 次后产生 P0 告警 |
 | `MONITOR_DAILY_REPORT_HOUR` | `9` | 每日北京时间发送健康摘要的小时 |
 | `MONITOR_MARKET_REPORT_INTERVAL_MINUTES` | `30` | 精简行情接入与质量报告发送间隔 |
+| `MONITOR_REDIS_ENABLED` | `true` | 在定时行情质量报告中探测 `REDIS_URL` 并展示 Redis 服务端和连接池状态；不可用不会阻断行情主链路 |
 | `MONITOR_INTEGRITY_INTERVAL_SECONDS` | `600` | 高周期只读审计周期，不会自动覆盖 K 线 |
 | `MONITOR_INTEGRITY_SYMBOLS_PER_RUN` | `50` | 每轮审计的 active symbol 数量，按 cursor 轮转 |
 | `MONITOR_INTEGRITY_TIMEFRAMES` | `15m,30m,1H,4H,1D,2D,1W` | 高周期审计范围；只使用本地 source bars 重算和检查缺失/非法/不一致 |
@@ -141,7 +142,7 @@ go run ./cmd/marketd
 | `BINANCE_UM_ENABLED` | `true` | 是否启用 Binance USDT-M futures |
 | `BINANCE_COIN_ENABLED` | `false` | 是否启用 Binance COIN-M futures；默认关闭，避免订阅当前及未来币本位合约 |
 | `OKX_ENABLED` | `true` | 是否启用 OKX |
-| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 仅 backfill 清理旧 Redis kline cache 时使用 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | backfill 清理旧 Redis kline cache，以及启用 `MONITOR_REDIS_ENABLED` 时进行只读健康探测 |
 
 运行测试：
 
@@ -229,7 +230,7 @@ final `1m`：
 
 为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
 
-监控服务默认每 30 分钟发送一份“行情接入与质量报告”，内容只包含实际订阅品种数、连接数、最后 WS 消息、连续行情延迟品种，以及近 30 分钟 Guardian 的缺失、不一致、REST 失败和修复失败明细。`missing_repair` 与 `mismatch_repair` 表示修复写入成功，不额外执行二次 REST 复核。
+监控服务默认每 30 分钟发送一份“行情接入与质量报告”，内容包括：实际订阅品种和交易所 WS 连接状态；服务器整体 CPU、内存和磁盘；`marketd` 进程 CPU、RSS、FD 和 goroutine；MySQL 可用性、连接池、服务端连接和 QPS；Redis 可用性、客户端连接、内存、ops/s 和连接池；近 5 分钟 HTTP 当前连接、QPS、非 5xx 成功率和 P95；公共 WebSocket 当前连接、握手成功率、写入成功率和慢消费者丢弃；连续行情延迟品种；以及近 30 分钟 Guardian 的缺失、不一致、REST 失败和修复失败明细。`missing_repair` 与 `mismatch_repair` 表示修复写入成功，不额外执行二次 REST 复核。
 
 校验字段：
 
@@ -650,8 +651,8 @@ go run ./cmd/backfill_klines -clear-all-bar-history -clear-all-redis-kline -limi
 
 Redis 当前定位：
 
-- `marketd` 实时服务不连接 Redis。
-- `REDIS_URL` 只被 `cmd/backfill_klines` 用来清理旧 key。
+- `marketd` 的实时行情读写链路不依赖 Redis；启用 `MONITOR_REDIS_ENABLED` 时只会定时执行 `PING` / `INFO` 并读取客户端连接池状态。
+- `cmd/backfill_klines` 继续使用 `REDIS_URL` 清理旧 key。
 - 清理的 key pattern 包括：
 
 ```text

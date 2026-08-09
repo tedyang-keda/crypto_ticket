@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -171,10 +172,23 @@ func (s *Server) symbols(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if s.monitor != nil {
+		s.monitor.Registry().WSHandshake(err == nil)
+	}
 	if err != nil {
 		return
 	}
 	defer conn.Close()
+	var writeMu sync.Mutex
+	writeJSON := func(value any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		err := conn.WriteJSON(value)
+		if s.monitor != nil {
+			s.monitor.Registry().WSWrite(err == nil)
+		}
+		return err
+	}
 	sub := s.hub.Subscribe()
 	defer sub.Close()
 
@@ -189,7 +203,9 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if message.Op == "ping" {
-				_ = conn.WriteJSON(map[string]any{"op": "pong", "ts_ms": market.NowMS()})
+				if err := writeJSON(map[string]any{"op": "pong", "ts_ms": market.NowMS()}); err != nil {
+					return
+				}
 				continue
 			}
 			if message.Op != "subscribe" {
@@ -207,7 +223,9 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			_ = conn.WriteJSON(map[string]any{"op": "subscribed", "req_id": message.ReqID, "channels": message.Channels})
+			if err := writeJSON(map[string]any{"op": "subscribed", "req_id": message.ReqID, "channels": message.Channels}); err != nil {
+				return
+			}
 		}
 	}()
 
@@ -221,14 +239,14 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if err := conn.WriteJSON(event); err != nil {
+			if err := writeJSON(event); err != nil {
 				return
 			}
 			if s.monitor != nil {
 				s.monitor.Registry().WSEventSent()
 			}
 		case <-ping.C:
-			if err := conn.WriteJSON(map[string]any{"op": "ping", "ts_ms": market.NowMS()}); err != nil {
+			if err := writeJSON(map[string]any{"op": "ping", "ts_ms": market.NowMS()}); err != nil {
 				return
 			}
 		}

@@ -12,49 +12,99 @@ import (
 )
 
 type ResourceSnapshot struct {
-	SampledAtMS int64   `json:"sampled_at_ms"`
-	CPURatio    float64 `json:"cpu_ratio"`
-	RSSBytes    uint64  `json:"rss_bytes"`
-	MemoryRatio float64 `json:"memory_ratio"`
-	OpenFDs     int     `json:"open_fds"`
-	FDLimit     uint64  `json:"fd_limit"`
-	FDRatio     float64 `json:"fd_ratio"`
-	Goroutines  int     `json:"goroutines"`
-	DiskRatio   float64 `json:"disk_ratio"`
+	SampledAtMS          int64   `json:"sampled_at_ms"`
+	CPURatio             float64 `json:"cpu_ratio"`
+	HostCPURatio         float64 `json:"host_cpu_ratio"`
+	RSSBytes             uint64  `json:"rss_bytes"`
+	MemoryRatio          float64 `json:"memory_ratio"`
+	HostMemoryUsedBytes  uint64  `json:"host_memory_used_bytes"`
+	HostMemoryTotalBytes uint64  `json:"host_memory_total_bytes"`
+	HostMemoryRatio      float64 `json:"host_memory_ratio"`
+	OpenFDs              int     `json:"open_fds"`
+	FDLimit              uint64  `json:"fd_limit"`
+	FDRatio              float64 `json:"fd_ratio"`
+	Goroutines           int     `json:"goroutines"`
+	DiskUsedBytes        uint64  `json:"disk_used_bytes"`
+	DiskTotalBytes       uint64  `json:"disk_total_bytes"`
+	DiskRatio            float64 `json:"disk_ratio"`
 }
 
 type ResourceSampler struct {
-	mu          sync.Mutex
-	previousCPU time.Duration
-	previousAt  time.Time
+	mu                sync.Mutex
+	previousCPU       time.Duration
+	previousAt        time.Time
+	previousHostIdle  uint64
+	previousHostTotal uint64
 }
 
 func (s *ResourceSampler) Sample(now time.Time, diskPath string) ResourceSnapshot {
 	result := ResourceSnapshot{SampledAtMS: now.UnixMilli(), Goroutines: runtime.NumGoroutine()}
 	result.RSSBytes, result.MemoryRatio = memoryUsage()
+	result.HostMemoryUsedBytes, result.HostMemoryTotalBytes, result.HostMemoryRatio = hostMemoryUsage()
 	result.OpenFDs, result.FDLimit, result.FDRatio = fileDescriptorUsage()
-	result.DiskRatio = processDiskRatio(diskPath)
+	result.DiskUsedBytes, result.DiskTotalBytes, result.DiskRatio = diskUsage(diskPath)
 	cpu := processCPUTime()
+	hostIdle, hostTotal := hostCPUTimes()
 	s.mu.Lock()
 	if !s.previousAt.IsZero() && now.After(s.previousAt) && cpu >= s.previousCPU {
 		elapsed := now.Sub(s.previousAt)
 		result.CPURatio = float64(cpu-s.previousCPU) / float64(elapsed) / float64(maxInt(runtime.NumCPU(), 1))
 	}
+	if s.previousHostTotal > 0 && hostTotal > s.previousHostTotal {
+		totalDelta := hostTotal - s.previousHostTotal
+		idleDelta := hostIdle - s.previousHostIdle
+		if totalDelta > 0 && idleDelta <= totalDelta {
+			result.HostCPURatio = float64(totalDelta-idleDelta) / float64(totalDelta)
+		}
+	}
 	s.previousCPU = cpu
 	s.previousAt = now
+	s.previousHostIdle = hostIdle
+	s.previousHostTotal = hostTotal
 	s.mu.Unlock()
 	return result
 }
 
-func processDiskRatio(path string) float64 {
+func diskUsage(path string) (uint64, uint64, float64) {
 	if strings.TrimSpace(path) == "" {
-		return 0
+		return 0, 0, 0
 	}
 	var stats syscall.Statfs_t
 	if syscall.Statfs(path, &stats) != nil || stats.Blocks == 0 {
-		return 0
+		return 0, 0, 0
 	}
-	return float64(stats.Blocks-stats.Bavail) / float64(stats.Blocks)
+	total := stats.Blocks * uint64(stats.Bsize)
+	used := (stats.Blocks - stats.Bavail) * uint64(stats.Bsize)
+	return used, total, float64(used) / float64(total)
+}
+
+func hostCPUTimes() (uint64, uint64) {
+	body, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	line, _, _ := strings.Cut(string(body), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0
+	}
+	var values []uint64
+	for _, field := range fields[1:] {
+		value, err := strconv.ParseUint(field, 10, 64)
+		if err != nil {
+			return 0, 0
+		}
+		values = append(values, value)
+	}
+	var total uint64
+	for _, value := range values {
+		total += value
+	}
+	idle := values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	return idle, total
 }
 
 func processCPUTime() time.Duration {
@@ -103,6 +153,35 @@ func totalMemoryBytes() uint64 {
 		}
 	}
 	return 0
+}
+
+func hostMemoryUsage() (uint64, uint64, float64) {
+	file, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0, 0, 0
+	}
+	defer file.Close()
+	var total uint64
+	var available uint64
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		value, _ := strconv.ParseUint(fields[1], 10, 64)
+		switch fields[0] {
+		case "MemTotal:":
+			total = value * 1024
+		case "MemAvailable:":
+			available = value * 1024
+		}
+	}
+	if total == 0 || available > total {
+		return 0, total, 0
+	}
+	used := total - available
+	return used, total, float64(used) / float64(total)
 }
 
 func fileDescriptorUsage() (int, uint64, float64) {

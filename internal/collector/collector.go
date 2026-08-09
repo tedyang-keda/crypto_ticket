@@ -32,6 +32,7 @@ type Observer interface {
 	RegisterCollectorRuntime(exchange string, marketType string)
 	CollectorSubscriptions(exchange string, marketType string, symbols []string)
 	CollectorConnection(exchange string, marketType string, delta int)
+	CollectorConnectAttempt(exchange string, marketType string, success bool)
 	CollectorMessage(exchange string, marketType string)
 	CollectorBarReceived(exchange string, marketType string, bar market.Bar)
 	CollectorIngested(exchange string, marketType string, bar market.Bar)
@@ -138,6 +139,9 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	}
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, adapter.WSURL(), nil)
+	if r.observer != nil {
+		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
+	}
 	if err != nil {
 		return err
 	}
@@ -238,6 +242,9 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 
 func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if r.observer != nil {
+		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
+	}
 	if err != nil {
 		return err
 	}

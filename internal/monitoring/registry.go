@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"database/sql"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -35,6 +36,8 @@ type runtimeState struct {
 	LastPersistedAt    time.Time
 	LastPublishedAt    time.Time
 	Reconnects         []time.Time
+	ConnectAttempts    []time.Time
+	ConnectSuccesses   []time.Time
 	ParseErrors        []time.Time
 	IngestErrors       []time.Time
 	ReceivedTotal      uint64
@@ -76,6 +79,16 @@ type storageObservation struct {
 	Failed    bool
 }
 
+type wsHandshakeObservation struct {
+	At      time.Time
+	Success bool
+}
+
+type wsWriteObservation struct {
+	At      time.Time
+	Success bool
+}
+
 type IntegritySummary struct {
 	CheckedAt      time.Time         `json:"checked_at"`
 	CheckedSymbols int               `json:"checked_symbols"`
@@ -108,6 +121,9 @@ type RuntimeSnapshot struct {
 	LastPublishedMS    int64  `json:"last_published_ms"`
 	Reconnects5m       int    `json:"reconnects_5m"`
 	Reconnects10m      int    `json:"reconnects_10m"`
+	ConnectAttempts5m  int    `json:"connect_attempts_5m"`
+	ConnectSuccesses5m int    `json:"connect_successes_5m"`
+	ConnectFailures5m  int    `json:"connect_failures_5m"`
 	ParseErrors5m      int    `json:"parse_errors_5m"`
 	IngestErrors5m     int    `json:"ingest_errors_5m"`
 	ReceivedTotal      uint64 `json:"received_total"`
@@ -125,21 +141,31 @@ type SymbolSnapshot struct {
 }
 
 type WindowSnapshot struct {
-	HTTPRequests5m    int
-	HTTP5xx5m         int
-	HTTPP95           time.Duration
-	WSDrops5m         int
-	GuardianEvents5m  map[string]int
-	GuardianSymbols5m map[string]int
-	StorageP95        time.Duration
-	StorageFailures5m int
-	GuardianTotals    map[string]uint64
-	GuardianEvents30m []market.KlineGuardianEvent
-	GuardianAudit     GuardianAuditSnapshot
-	HTTPRequestsTotal uint64
-	HTTP5xxTotal      uint64
-	WSDropsTotal      uint64
-	Integrity         IntegritySummary
+	HTTPRequests5m         int
+	HTTP5xx5m              int
+	HTTPP95                time.Duration
+	HTTPConnections        int
+	WSDrops5m              int
+	WSConnections          int
+	WSHandshakeAttempts5m  int
+	WSHandshakeSuccesses5m int
+	WSHandshakeFailures5m  int
+	WSWriteAttempts5m      int
+	WSWriteSuccesses5m     int
+	WSWriteFailures5m      int
+	GuardianEvents5m       map[string]int
+	GuardianSymbols5m      map[string]int
+	StorageP95             time.Duration
+	StorageFailures5m      int
+	GuardianTotals         map[string]uint64
+	GuardianEvents30m      []market.KlineGuardianEvent
+	GuardianAudit          GuardianAuditSnapshot
+	HTTPRequestsTotal      uint64
+	HTTP5xxTotal           uint64
+	WSDropsTotal           uint64
+	WSWritesTotal          uint64
+	WSWriteFailuresTotal   uint64
+	Integrity              IntegritySummary
 }
 
 type Snapshot struct {
@@ -148,31 +174,42 @@ type Snapshot struct {
 	Symbols   []SymbolSnapshot
 	Window    WindowSnapshot
 	Resources ResourceSnapshot
+	MySQL     MySQLSnapshot
+	Redis     RedisSnapshot
 }
 
 type Registry struct {
-	mu             sync.Mutex
-	now            func() time.Time
-	startedAt      time.Time
-	runtimes       map[runtimeKey]*runtimeState
-	symbols        map[string]*symbolState
-	guardianEvents []timedGuardianEvent
-	httpRequests   []httpObservation
-	storageOps     []storageObservation
-	wsDrops        []time.Time
-	guardianTotals map[string]uint64
-	httpTotal      uint64
-	http5xxTotal   uint64
-	wsDropsTotal   uint64
-	integrity      IntegritySummary
-	resources      ResourceSnapshot
-	guardianAudit  GuardianAuditSnapshot
-	prometheus     *prometheus.Registry
+	mu                   sync.Mutex
+	now                  func() time.Time
+	startedAt            time.Time
+	runtimes             map[runtimeKey]*runtimeState
+	symbols              map[string]*symbolState
+	guardianEvents       []timedGuardianEvent
+	httpRequests         []httpObservation
+	storageOps           []storageObservation
+	wsDrops              []time.Time
+	wsHandshakes         []wsHandshakeObservation
+	wsWrites             []wsWriteObservation
+	guardianTotals       map[string]uint64
+	httpTotal            uint64
+	http5xxTotal         uint64
+	wsDropsTotal         uint64
+	wsWritesTotal        uint64
+	wsWriteFailuresTotal uint64
+	httpConnections      int
+	wsConnectionsCurrent int
+	integrity            IntegritySummary
+	resources            ResourceSnapshot
+	mysql                MySQLSnapshot
+	redis                RedisSnapshot
+	guardianAudit        GuardianAuditSnapshot
+	prometheus           *prometheus.Registry
 
 	collectorConnected       *prometheus.GaugeVec
 	collectorLastMessage     *prometheus.GaugeVec
 	collectorLastBar         *prometheus.GaugeVec
 	collectorReconnects      *prometheus.CounterVec
+	collectorConnectAttempts *prometheus.CounterVec
 	collectorParseErrors     *prometheus.CounterVec
 	collectorIngestErrors    *prometheus.CounterVec
 	klineReceived            *prometheus.CounterVec
@@ -186,6 +223,9 @@ type Registry struct {
 	wsConnections            prometheus.Gauge
 	wsEventsSent             prometheus.Counter
 	wsEventsDropped          prometheus.Counter
+	wsWriteTotal             prometheus.Counter
+	wsWriteFailures          prometheus.Counter
+	httpConnectionsGauge     prometheus.Gauge
 	storageOperationTotal    *prometheus.CounterVec
 	storageOperationDuration *prometheus.HistogramVec
 	mysqlPoolConnections     *prometheus.GaugeVec
@@ -211,6 +251,7 @@ func newRegistry(now func() time.Time) *Registry {
 		collectorLastMessage:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "crypto_ticket_collector_last_message_timestamp_seconds", Help: "Unix timestamp of the latest collector message."}, []string{"exchange", "market_type"}),
 		collectorLastBar:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "crypto_ticket_collector_last_bar_timestamp_seconds", Help: "Unix timestamp of the latest parsed kline."}, []string{"exchange", "market_type"}),
 		collectorReconnects:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_collector_reconnects_total", Help: "Collector reconnect attempts."}, []string{"exchange", "market_type"}),
+		collectorConnectAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_collector_ws_connect_attempts_total", Help: "Collector WebSocket connection attempts by result."}, []string{"exchange", "market_type", "result"}),
 		collectorParseErrors:     prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_collector_parse_errors_total", Help: "Collector kline parse errors."}, []string{"exchange", "market_type"}),
 		collectorIngestErrors:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_collector_ingest_errors_total", Help: "Collector kline ingest errors."}, []string{"exchange", "market_type"}),
 		klineReceived:            prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_kline_received_total", Help: "Parsed klines received from exchange streams."}, []string{"exchange", "market_type", "final"}),
@@ -224,6 +265,9 @@ func newRegistry(now func() time.Time) *Registry {
 		wsConnections:            prometheus.NewGauge(prometheus.GaugeOpts{Name: "crypto_ticket_ws_connections", Help: "Current public WebSocket connections."}),
 		wsEventsSent:             prometheus.NewCounter(prometheus.CounterOpts{Name: "crypto_ticket_ws_events_sent_total", Help: "Events written to public WebSocket clients."}),
 		wsEventsDropped:          prometheus.NewCounter(prometheus.CounterOpts{Name: "crypto_ticket_ws_events_dropped_total", Help: "Events dropped for slow public WebSocket clients."}),
+		wsWriteTotal:             prometheus.NewCounter(prometheus.CounterOpts{Name: "crypto_ticket_ws_write_total", Help: "Public WebSocket JSON writes by result."}),
+		wsWriteFailures:          prometheus.NewCounter(prometheus.CounterOpts{Name: "crypto_ticket_ws_write_failures_total", Help: "Public WebSocket JSON write failures."}),
+		httpConnectionsGauge:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "crypto_ticket_http_connections", Help: "Current HTTP server connections."}),
 		storageOperationTotal:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "crypto_ticket_storage_operations_total", Help: "Storage operations by result."}, []string{"operation", "result"}),
 		storageOperationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "crypto_ticket_storage_operation_duration_seconds", Help: "Storage operation latency.", Buckets: prometheus.DefBuckets}, []string{"operation"}),
 		mysqlPoolConnections:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "crypto_ticket_mysql_pool_connections", Help: "Current database/sql MySQL connection pool state."}, []string{"state"}),
@@ -233,10 +277,10 @@ func newRegistry(now func() time.Time) *Registry {
 	}
 	promRegistry.MustRegister(
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		r.collectorConnected, r.collectorLastMessage, r.collectorLastBar, r.collectorReconnects,
+		r.collectorConnected, r.collectorLastMessage, r.collectorLastBar, r.collectorReconnects, r.collectorConnectAttempts,
 		r.collectorParseErrors, r.collectorIngestErrors, r.klineReceived, r.klineLastPersisted,
 		r.klineLastPublished, r.guardianEventTotal, r.guardianQueueDrops, r.guardianAuditTotal,
-		r.httpRequestTotal, r.httpRequestDuration, r.wsConnections, r.wsEventsSent, r.wsEventsDropped,
+		r.httpRequestTotal, r.httpRequestDuration, r.wsConnections, r.wsEventsSent, r.wsEventsDropped, r.wsWriteTotal, r.wsWriteFailures, r.httpConnectionsGauge,
 		r.storageOperationTotal, r.storageOperationDuration, r.mysqlPoolConnections, r.integrityIssues, r.activeAlerts, r.resourceUsage,
 	)
 	return r
@@ -293,6 +337,23 @@ func (r *Registry) CollectorConnection(exchangeName string, marketType string, d
 	connected := state.Connected
 	r.mu.Unlock()
 	r.collectorConnected.WithLabelValues(key.Exchange, key.MarketType).Set(float64(connected))
+}
+
+func (r *Registry) CollectorConnectAttempt(exchangeName string, marketType string, success bool) {
+	key := normalizeRuntimeKey(exchangeName, marketType)
+	now := r.now()
+	r.mu.Lock()
+	state := r.runtimeLocked(key.Exchange, key.MarketType)
+	state.ConnectAttempts = append(state.ConnectAttempts, now)
+	if success {
+		state.ConnectSuccesses = append(state.ConnectSuccesses, now)
+	}
+	r.mu.Unlock()
+	result := "failure"
+	if success {
+		result = "success"
+	}
+	r.collectorConnectAttempts.WithLabelValues(key.Exchange, key.MarketType, result).Inc()
 }
 
 func (r *Registry) CollectorMessage(exchangeName string, marketType string) {
@@ -453,11 +514,53 @@ func (r *Registry) HTTPRequest(route string, method string, statusCode int, dura
 	r.httpRequestDuration.WithLabelValues(route, method).Observe(duration.Seconds())
 }
 
+func (r *Registry) HTTPConnectionState(_ net.Conn, state http.ConnState) {
+	r.mu.Lock()
+	switch state {
+	case http.StateNew:
+		r.httpConnections++
+	case http.StateClosed, http.StateHijacked:
+		if r.httpConnections > 0 {
+			r.httpConnections--
+		}
+	}
+	connections := r.httpConnections
+	r.mu.Unlock()
+	r.httpConnectionsGauge.Set(float64(connections))
+}
+
 func (r *Registry) WSConnection(delta int) {
+	r.mu.Lock()
+	r.wsConnectionsCurrent += delta
+	if r.wsConnectionsCurrent < 0 {
+		r.wsConnectionsCurrent = 0
+	}
+	r.mu.Unlock()
 	if delta > 0 {
 		r.wsConnections.Add(float64(delta))
 	} else if delta < 0 {
 		r.wsConnections.Sub(float64(-delta))
+	}
+}
+
+func (r *Registry) WSHandshake(success bool) {
+	r.mu.Lock()
+	r.wsHandshakes = append(r.wsHandshakes, wsHandshakeObservation{At: r.now(), Success: success})
+	r.mu.Unlock()
+}
+
+func (r *Registry) WSWrite(success bool) {
+	now := r.now()
+	r.mu.Lock()
+	r.wsWrites = append(r.wsWrites, wsWriteObservation{At: now, Success: success})
+	r.wsWritesTotal++
+	if !success {
+		r.wsWriteFailuresTotal++
+	}
+	r.mu.Unlock()
+	r.wsWriteTotal.Inc()
+	if !success {
+		r.wsWriteFailures.Inc()
 	}
 }
 
@@ -493,6 +596,24 @@ func (r *Registry) SetMySQLPoolStats(stats sql.DBStats) {
 	r.mysqlPoolConnections.WithLabelValues("open").Set(float64(stats.OpenConnections))
 	r.mysqlPoolConnections.WithLabelValues("in_use").Set(float64(stats.InUse))
 	r.mysqlPoolConnections.WithLabelValues("idle").Set(float64(stats.Idle))
+}
+
+func (r *Registry) SetMySQL(snapshot MySQLSnapshot) {
+	r.mu.Lock()
+	r.mysql = snapshot
+	r.mu.Unlock()
+	r.SetMySQLPoolStats(sql.DBStats{
+		MaxOpenConnections: snapshot.MaxOpenConnections,
+		OpenConnections:    snapshot.OpenConnections,
+		InUse:              snapshot.InUse,
+		Idle:               snapshot.Idle,
+	})
+}
+
+func (r *Registry) SetRedis(snapshot RedisSnapshot) {
+	r.mu.Lock()
+	r.redis = snapshot
+	r.mu.Unlock()
 }
 
 func (r *Registry) SetIntegrity(summary IntegritySummary) {
@@ -533,8 +654,10 @@ func (r *Registry) SetResources(resources ResourceSnapshot) {
 	r.resources = resources
 	r.mu.Unlock()
 	r.resourceUsage.WithLabelValues("cpu_ratio").Set(resources.CPURatio)
+	r.resourceUsage.WithLabelValues("host_cpu_ratio").Set(resources.HostCPURatio)
 	r.resourceUsage.WithLabelValues("rss_bytes").Set(float64(resources.RSSBytes))
 	r.resourceUsage.WithLabelValues("memory_ratio").Set(resources.MemoryRatio)
+	r.resourceUsage.WithLabelValues("host_memory_ratio").Set(resources.HostMemoryRatio)
 	r.resourceUsage.WithLabelValues("open_fds").Set(float64(resources.OpenFDs))
 	r.resourceUsage.WithLabelValues("fd_ratio").Set(resources.FDRatio)
 	r.resourceUsage.WithLabelValues("goroutines").Set(float64(resources.Goroutines))
@@ -550,6 +673,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	tenMinutes := now.Add(-10 * time.Minute)
 	for _, state := range r.runtimes {
 		state.Reconnects = pruneTimes(state.Reconnects, cutoff)
+		state.ConnectAttempts = pruneTimes(state.ConnectAttempts, cutoff)
+		state.ConnectSuccesses = pruneTimes(state.ConnectSuccesses, cutoff)
 		state.ParseErrors = pruneTimes(state.ParseErrors, cutoff)
 		state.IngestErrors = pruneTimes(state.IngestErrors, cutoff)
 	}
@@ -557,6 +682,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	r.httpRequests = pruneHTTP(r.httpRequests, cutoff)
 	r.storageOps = pruneStorage(r.storageOps, cutoff)
 	r.wsDrops = pruneTimes(r.wsDrops, cutoff)
+	r.wsHandshakes = pruneWSHandshakes(r.wsHandshakes, cutoff)
+	r.wsWrites = pruneWSWrites(r.wsWrites, cutoff)
 
 	snapshot := Snapshot{StartedAt: r.startedAt}
 	for key, state := range r.runtimes {
@@ -565,7 +692,9 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 			LastMessageMS: timeMS(state.LastMessageAt), LastBarMS: timeMS(state.LastBarAt), LastFinalMS: timeMS(state.LastFinalAt),
 			LastFinalStartMS: state.LastFinalStartMS, LastPersistedMS: timeMS(state.LastPersistedAt), LastPublishedMS: timeMS(state.LastPublishedAt),
 			Reconnects5m: countTimesSince(state.Reconnects, fiveMinutes), Reconnects10m: countTimesSince(state.Reconnects, tenMinutes),
-			ParseErrors5m: countTimesSince(state.ParseErrors, fiveMinutes), IngestErrors5m: countTimesSince(state.IngestErrors, fiveMinutes),
+			ConnectAttempts5m: countTimesSince(state.ConnectAttempts, fiveMinutes), ConnectSuccesses5m: countTimesSince(state.ConnectSuccesses, fiveMinutes),
+			ConnectFailures5m: countTimesSince(state.ConnectAttempts, fiveMinutes) - countTimesSince(state.ConnectSuccesses, fiveMinutes),
+			ParseErrors5m:     countTimesSince(state.ParseErrors, fiveMinutes), IngestErrors5m: countTimesSince(state.IngestErrors, fiveMinutes),
 			ReceivedTotal: state.ReceivedTotal, FinalIngestedTotal: state.FinalIngestedTotal,
 		})
 	}
@@ -595,6 +724,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 		GuardianSymbols5m: make(map[string]int),
 		GuardianTotals:    cloneUintMap(r.guardianTotals),
 		HTTPRequestsTotal: r.httpTotal, HTTP5xxTotal: r.http5xxTotal, WSDropsTotal: r.wsDropsTotal,
+		HTTPConnections: r.httpConnections, WSConnections: r.wsConnectionsCurrent,
+		WSWritesTotal: r.wsWritesTotal, WSWriteFailuresTotal: r.wsWriteFailuresTotal,
 		Integrity:     r.integrity,
 		GuardianAudit: r.guardianAudit,
 	}
@@ -611,6 +742,28 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	}
 	window.HTTPP95 = percentile95(httpDurations)
 	window.WSDrops5m = countTimesSince(r.wsDrops, fiveMinutes)
+	for _, item := range r.wsHandshakes {
+		if item.At.Before(fiveMinutes) {
+			continue
+		}
+		window.WSHandshakeAttempts5m++
+		if item.Success {
+			window.WSHandshakeSuccesses5m++
+		} else {
+			window.WSHandshakeFailures5m++
+		}
+	}
+	for _, item := range r.wsWrites {
+		if item.At.Before(fiveMinutes) {
+			continue
+		}
+		window.WSWriteAttempts5m++
+		if item.Success {
+			window.WSWriteSuccesses5m++
+		} else {
+			window.WSWriteFailures5m++
+		}
+	}
 	for _, event := range r.guardianEvents {
 		if !event.At.Before(now.Add(-guardianEventRetention)) {
 			window.GuardianEvents30m = append(window.GuardianEvents30m, event.Event)
@@ -635,6 +788,8 @@ func (r *Registry) Snapshot(now time.Time) Snapshot {
 	window.StorageP95 = percentile95(storageDurations)
 	snapshot.Window = window
 	snapshot.Resources = r.resources
+	snapshot.MySQL = r.mysql
+	snapshot.Redis = r.redis
 	return snapshot
 }
 
@@ -731,6 +886,22 @@ func pruneStorage(values []storageObservation, cutoff time.Time) []storageObserv
 		index++
 	}
 	return append([]storageObservation(nil), values[index:]...)
+}
+
+func pruneWSHandshakes(values []wsHandshakeObservation, cutoff time.Time) []wsHandshakeObservation {
+	index := 0
+	for index < len(values) && values[index].At.Before(cutoff) {
+		index++
+	}
+	return append([]wsHandshakeObservation(nil), values[index:]...)
+}
+
+func pruneWSWrites(values []wsWriteObservation, cutoff time.Time) []wsWriteObservation {
+	index := 0
+	for index < len(values) && values[index].At.Before(cutoff) {
+		index++
+	}
+	return append([]wsWriteObservation(nil), values[index:]...)
 }
 
 func countTimesSince(values []time.Time, cutoff time.Time) int {

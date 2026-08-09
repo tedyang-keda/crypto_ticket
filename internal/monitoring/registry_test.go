@@ -133,6 +133,8 @@ func TestMarketQualityReportIncludesConnectionsDelayAndGuardianRepairs(t *testin
 		{Exchange: "binance", Symbol: "ETHUSDT", MarketType: "um_futures"},
 	})
 	registry.CollectorConnection("binance", "um_futures", 1)
+	registry.CollectorConnectAttempt("binance", "um_futures", true)
+	registry.CollectorConnectAttempt("binance", "um_futures", false)
 	registry.CollectorMessage("binance", "um_futures")
 	registry.CollectorBarReceived("binance", "um_futures", market.Bar{
 		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1m", StartMS: now.Add(-time.Minute).UnixMilli(), IsFinal: true,
@@ -155,6 +157,7 @@ func TestMarketQualityReportIncludesConnectionsDelayAndGuardianRepairs(t *testin
 	report := service.formatMarketQualityReport(now, registry.Snapshot(now))
 	for _, expected := range []string{
 		"subscribed=2, connections=1, 在线但无消息",
+		"connect_5m=1/2 (50.00%), reconnect_5m=0",
 		"tracked=2, 2m~5m=1, >=5m=1",
 		"checked_symbols=1188, checked_bars=35000, failed_symbols=0",
 		"missing=1, mismatch=1, repair_failed=0, rest_error=0, affected=2",
@@ -163,6 +166,27 @@ func TestMarketQualityReportIncludesConnectionsDelayAndGuardianRepairs(t *testin
 	} {
 		if !strings.Contains(report, expected) {
 			t.Fatalf("quality report missing %q:\n%s", expected, report)
+		}
+	}
+}
+
+func TestFormatSystemQualityIncludesInfrastructureAndTraffic(t *testing.T) {
+	now := time.Date(2026, 8, 1, 1, 0, 0, 0, time.UTC)
+	message := formatSystemQuality(now, Snapshot{
+		StartedAt: now.Add(-10 * time.Minute),
+		Resources: ResourceSnapshot{
+			HostCPURatio: 0.42, HostMemoryUsedBytes: 2 * 1024 * 1024 * 1024, HostMemoryTotalBytes: 4 * 1024 * 1024 * 1024, HostMemoryRatio: 0.5,
+			CPURatio: 0.12, RSSBytes: 64 * 1024 * 1024, OpenFDs: 12, FDLimit: 100, FDRatio: 0.12, Goroutines: 33,
+			DiskUsedBytes: 3 * 1024 * 1024 * 1024, DiskTotalBytes: 10 * 1024 * 1024 * 1024, DiskRatio: 0.3,
+		},
+		MySQL:  MySQLSnapshot{Available: true, PingLatency: 4 * time.Millisecond, OpenConnections: 5, InUse: 2, Idle: 3, MaxOpenConnections: 20, ThreadsConnected: 4, ThreadsRunning: 1, QPS: 12.5},
+		Redis:  RedisSnapshot{Enabled: true, Available: true, PingLatency: 2 * time.Millisecond, Server: RedisServerStatus{ConnectedClients: 3, MaxClients: 1000, OpsPerSecond: 8}},
+		Window: WindowSnapshot{HTTPConnections: 2, HTTPRequests5m: 300, HTTP5xx5m: 3, HTTPP95: 120 * time.Millisecond, WSConnections: 1, WSHandshakeAttempts5m: 4, WSHandshakeSuccesses5m: 3, WSWriteAttempts5m: 10, WSWriteSuccesses5m: 9, WSDrops5m: 1},
+	})
+	joined := strings.Join(message, "\n")
+	for _, expected := range []string{"主机: CPU=42.00%", "MySQL: 在线", "Redis: 在线", "HTTP: connections=2, requests=300, QPS=1.00", "Public WebSocket: connections=1, handshake=3/4 (75.00%)"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("system report missing %q: %s", expected, joined)
 		}
 	}
 }

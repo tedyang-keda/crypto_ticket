@@ -64,20 +64,30 @@ func main() {
 	if candidate, ok := store.(monitoring.ActivityStore); ok {
 		activityStore = candidate
 	}
+	var monitorDependencies monitoring.Dependencies
+	if cfg.MonitorRedisEnabled {
+		redisMonitor, err := cache.NewRedisMonitor(cfg.RedisURL)
+		if err != nil {
+			log.Printf("Redis monitoring disabled: %v", err)
+		} else {
+			defer redisMonitor.Close()
+			monitorDependencies.Redis = redisMonitor
+		}
+	}
 	monitorService := monitoring.NewService(registry, pinger, activityStore, cfg.FeishuWebhookURL, monitoring.Config{
 		Enabled: cfg.EnableHealthMonitor, CollectorEnabled: cfg.EnableCollector, P1AlertsEnabled: cfg.MonitorP1AlertsEnabled,
 		EvaluationInterval:   time.Duration(cfg.MonitorEvaluationSeconds) * time.Second,
 		DailyReportHour:      cfg.MonitorDailyReportHour,
 		MarketReportInterval: time.Duration(cfg.MonitorMarketReportIntervalMinutes) * time.Minute,
 		DiskPath:             cfg.MonitorDiskPath,
-	})
+	}, monitorDependencies)
 	hub := realtime.NewHub(registry)
 	marketService := app.NewMarketService(store, hub, cfg.Timeframes, cfg.RecentCacheLimit, registry)
 	server := api.NewServer(marketService, hub, cfg.DashboardDir, monitorService)
 
 	errCh := make(chan error, 8)
 	startBackgroundWorkers(ctx, cfg, store, marketService, monitorService, registry, errCh)
-	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: server.Handler()}
+	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: server.Handler(), ConnState: registry.HTTPConnectionState}
 	go func() {
 		log.Printf("marketd listening on http://%s", cfg.HTTPAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
