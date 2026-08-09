@@ -93,6 +93,47 @@ func BuildDropExpiredTimeframePartitionsSQL(options TimeframePartitionOptions, n
 	return "ALTER TABLE `" + tableName + "` DROP PARTITION " + strings.Join(names, ", ") + ";\n"
 }
 
+// ExpiredTimeframePartitionNames filters the partitions that physically exist
+// instead of generating names for months that may already have been dropped.
+func ExpiredTimeframePartitionNames(existing []string, now time.Time) []string {
+	var expired []string
+	for _, name := range existing {
+		for _, tf := range timeframe.Order {
+			rule := retention.RuleFor(tf)
+			cutoffMS, ok := retention.CutoffMS(rule, now)
+			if !ok {
+				continue
+			}
+			prefix := "p_tf_" + partitionFrameName(tf) + "_"
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			monthStart, err := time.Parse("2006_01", strings.TrimPrefix(name, prefix))
+			if err != nil {
+				continue
+			}
+			if monthStart.AddDate(0, 1, 0).UnixMilli() <= cutoffMS {
+				expired = append(expired, name)
+			}
+			break
+		}
+	}
+	sort.Strings(expired)
+	return expired
+}
+
+func validTimeframePartitionName(name string) bool {
+	for _, tf := range timeframe.Order {
+		prefix := "p_tf_" + partitionFrameName(tf) + "_"
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		_, err := time.Parse("2006_01", strings.TrimPrefix(name, prefix))
+		return err == nil
+	}
+	return false
+}
+
 func normalizedPartitionMonths(start time.Time, months int) []time.Time {
 	if months <= 0 {
 		months = 36

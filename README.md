@@ -564,6 +564,14 @@ MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
 go run ./cmd/maintain_klines -mode=retention -dry-run=false -batch-size=10000
 ```
 
+生产每日维护应使用统一的 `maintenance` 模式：先 drop 已完全过期的整月分区，再对未完整过期月份和 `1D` 以上周期做行级 retention，最后删除 7 天前的 Guardian 审计事件：
+
+```bash
+USE_MEMORY_STORE=false \
+MYSQL_DSN='root:root123@tcp(127.0.0.1:3306)/crypto_ticket?parseTime=true' \
+go run ./cmd/maintain_klines -mode=maintenance -dry-run=false -batch-size=10000 -guardian-event-keep-days=7
+```
+
 `sql/schema.sql` 的 `bar_history` 使用 `PARTITION BY RANGE COLUMNS(timeframe, start_ms)`。按天数过期的周期使用 timeframe + month 分区；`1D` 及以上按每个品种的最新 300 根逐行清理，因此只使用 future 分区。生成迁移 SQL：
 
 ```bash

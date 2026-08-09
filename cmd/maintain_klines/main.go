@@ -18,15 +18,16 @@ import (
 )
 
 type options struct {
-	mode            string
-	timeframes      []string
-	dryRun          bool
-	batchSize       int
-	maxBatches      int
-	now             time.Time
-	tableName       string
-	partitionStart  time.Time
-	partitionMonths int
+	mode             string
+	timeframes       []string
+	dryRun           bool
+	batchSize        int
+	maxBatches       int
+	now              time.Time
+	tableName        string
+	partitionStart   time.Time
+	partitionMonths  int
+	guardianKeepDays int
 }
 
 func main() {
@@ -40,6 +41,10 @@ func main() {
 	defer stop()
 
 	switch opts.mode {
+	case "maintenance":
+		if err := runMaintenance(ctx, cfg, opts); err != nil {
+			log.Fatalf("maintenance: %v", err)
+		}
 	case "retention":
 		if err := runRetention(ctx, cfg, opts); err != nil {
 			log.Fatalf("retention: %v", err)
@@ -60,7 +65,7 @@ func parseOptions() (options, error) {
 	var timeframesRaw string
 	var nowRaw string
 	var partitionStartRaw string
-	flag.StringVar(&opts.mode, "mode", "retention", "retention, partition-create-sql, partition-add-sql, or partition-drop-sql")
+	flag.StringVar(&opts.mode, "mode", "retention", "maintenance, retention, partition-create-sql, partition-add-sql, or partition-drop-sql")
 	flag.StringVar(&timeframesRaw, "timeframes", strings.Join(timeframe.Order, ","), "comma-separated timeframes for retention")
 	flag.BoolVar(&opts.dryRun, "dry-run", true, "log/count only; set false to delete")
 	flag.IntVar(&opts.batchSize, "batch-size", 10_000, "delete batch size for retention")
@@ -69,6 +74,7 @@ func parseOptions() (options, error) {
 	flag.StringVar(&opts.tableName, "table", "bar_history", "bar history table name for partition SQL")
 	flag.StringVar(&partitionStartRaw, "partition-start", "2026-01", "first generated partition month, YYYY-MM")
 	flag.IntVar(&opts.partitionMonths, "partition-months", 12, "number of month partitions per expiring timeframe")
+	flag.IntVar(&opts.guardianKeepDays, "guardian-event-keep-days", 7, "days of kline guardian events to retain in maintenance mode")
 	flag.Parse()
 
 	opts.timeframes = normalizeTimeframes(timeframesRaw)
@@ -100,6 +106,37 @@ func runRetention(ctx context.Context, cfg config.Config, opts options) error {
 	if err := store.EnsureSchema(ctx); err != nil {
 		return err
 	}
+	return runBarRetention(ctx, store, opts)
+}
+
+func runMaintenance(ctx context.Context, cfg config.Config, opts options) error {
+	store, err := mysqlstore.New(cfg.MySQLDSN)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		return err
+	}
+	partitions, err := store.ListBarHistoryPartitions(ctx)
+	if err != nil {
+		return err
+	}
+	expired := mysqlstore.ExpiredTimeframePartitionNames(partitions, opts.now)
+	if opts.dryRun {
+		log.Printf("dry-run expired bar_history partitions count=%d names=%s", len(expired), strings.Join(expired, ","))
+	} else if err := store.DropBarHistoryPartitions(ctx, expired); err != nil {
+		return err
+	} else {
+		log.Printf("expired bar_history partitions dropped count=%d names=%s", len(expired), strings.Join(expired, ","))
+	}
+	if err := runBarRetention(ctx, store, opts); err != nil {
+		return err
+	}
+	return runGuardianEventRetention(ctx, store, opts)
+}
+
+func runBarRetention(ctx context.Context, store *mysqlstore.Store, opts options) error {
 
 	for _, tf := range opts.timeframes {
 		rule := retention.RuleFor(tf)
@@ -201,6 +238,35 @@ func runRetention(ctx context.Context, cfg config.Config, opts options) error {
 		}
 		log.Printf("retention complete timeframe=%s series=%d batches=%d deleted=%d cutoff_ms=%d", tf, len(series), batches, total, cutoffMS)
 	}
+	return nil
+}
+
+func runGuardianEventRetention(ctx context.Context, store *mysqlstore.Store, opts options) error {
+	keepDays := opts.guardianKeepDays
+	if keepDays <= 0 {
+		keepDays = 7
+	}
+	cutoffMS := opts.now.UTC().AddDate(0, 0, -keepDays).UnixMilli()
+	if opts.dryRun {
+		count, err := store.CountGuardianEventsBefore(ctx, cutoffMS)
+		if err != nil {
+			return err
+		}
+		log.Printf("dry-run guardian event retention keep_days=%d cutoff_ms=%d rows=%d", keepDays, cutoffMS, count)
+		return nil
+	}
+	var total int64
+	for {
+		deleted, err := store.DeleteGuardianEventsBefore(ctx, cutoffMS, opts.batchSize)
+		if err != nil {
+			return err
+		}
+		total += deleted
+		if deleted < int64(opts.batchSize) {
+			break
+		}
+	}
+	log.Printf("guardian event retention complete keep_days=%d cutoff_ms=%d deleted=%d", keepDays, cutoffMS, total)
 	return nil
 }
 

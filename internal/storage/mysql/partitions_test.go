@@ -42,6 +42,22 @@ func TestBuildDropExpiredTimeframePartitionsSQL(t *testing.T) {
 	}
 }
 
+func TestExpiredTimeframePartitionNamesOnlyReturnsExistingExpiredMonths(t *testing.T) {
+	names := ExpiredTimeframePartitionNames([]string{
+		"p_tf_1min_2026_06",
+		"p_tf_1min_2026_07",
+		"p_tf_1min_2026_08",
+		"p_tf_5min_2026_06",
+		"p_tf_5min_2026_07",
+		"p_tf_1d_future",
+		"not_a_partition",
+	}, time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC))
+	want := []string{"p_tf_1min_2026_06", "p_tf_1min_2026_07", "p_tf_5min_2026_06"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected %v, got %v", want, names)
+	}
+}
+
 func TestBuildAddTimeframePartitionsSQL(t *testing.T) {
 	sql := BuildAddTimeframePartitionsSQL(TimeframePartitionOptions{
 		TableName:  "bar_history",

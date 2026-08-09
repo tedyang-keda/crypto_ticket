@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -181,6 +182,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if err := s.ensureBarHistoryColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureGuardianEventIndexes(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -211,6 +215,55 @@ func (s *Store) ensureBarHistoryColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) ensureGuardianEventIndexes(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE kline_guardian_event
+		ADD KEY idx_guardian_event_created_ms (created_at_ms)`)
+	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ListBarHistoryPartitions(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT partition_name
+		FROM information_schema.partitions
+		WHERE table_schema = DATABASE() AND table_name = 'bar_history' AND partition_name IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, rows.Err()
+}
+
+func (s *Store) DropBarHistoryPartitions(ctx context.Context, names []string) error {
+	seen := make(map[string]bool, len(names))
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		if !validTimeframePartitionName(name) {
+			return fmt.Errorf("invalid bar_history partition name %q", name)
+		}
+		seen[name] = true
+		quoted = append(quoted, "`"+name+"`")
+	}
+	if len(quoted) == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE bar_history DROP PARTITION `+strings.Join(quoted, ", "))
+	return err
 }
 
 func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
@@ -550,6 +603,25 @@ func (s *Store) InsertKlineGuardianEvents(ctx context.Context, events []market.K
 		}
 	}
 	return nil
+}
+
+func (s *Store) CountGuardianEventsBefore(ctx context.Context, cutoffMS int64) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kline_guardian_event
+		WHERE created_at_ms < ?`, cutoffMS).Scan(&count)
+	return count, err
+}
+
+func (s *Store) DeleteGuardianEventsBefore(ctx context.Context, cutoffMS int64, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 10_000
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM kline_guardian_event
+		WHERE created_at_ms < ? LIMIT ?`, cutoffMS, limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func (s *Store) LoadCorporateActionJob(ctx context.Context, exchange string, symbol string, effectiveMS int64) (*market.CorporateActionJob, error) {

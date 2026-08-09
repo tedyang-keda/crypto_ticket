@@ -214,7 +214,8 @@ CREATE TABLE IF NOT EXISTS kline_guardian_event (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_guardian_event_market_time (exchange, symbol, timeframe, start_ms),
-  KEY idx_guardian_event_type (event_type, created_at)
+  KEY idx_guardian_event_type (event_type, created_at),
+  KEY idx_guardian_event_created_ms (created_at_ms)
 );
 
 CREATE TABLE IF NOT EXISTS corporate_action_job (
