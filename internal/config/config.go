@@ -73,16 +73,19 @@ func Load() Config {
 	}
 	enableCollector := envBool("ENABLE_COLLECTOR", false)
 	return Config{
-		HTTPAddr:                           env("HTTP_ADDR", "127.0.0.1:8088"),
-		RedisURL:                           env("REDIS_URL", "redis://127.0.0.1:6379/0"),
-		MySQLDSN:                           env("MYSQL_DSN", mysqlDSNFromEnv()),
-		UseMemory:                          envBool("USE_MEMORY_STORE", true),
-		RecentCacheLimit:                   envInt("RECENT_CACHE_LIMIT", 300),
-		Timeframes:                         outFrames,
-		DashboardDir:                       env("DASHBOARD_DIR", "./web/dist"),
-		EnableMockSymbols:                  envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
-		EnableCollector:                    enableCollector,
-		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", enableCollector),
+		HTTPAddr:          env("HTTP_ADDR", "127.0.0.1:8088"),
+		RedisURL:          env("REDIS_URL", "redis://127.0.0.1:6379/0"),
+		MySQLDSN:          env("MYSQL_DSN", mysqlDSNFromEnv()),
+		UseMemory:         envBool("USE_MEMORY_STORE", true),
+		RecentCacheLimit:  envInt("RECENT_CACHE_LIMIT", 300),
+		Timeframes:        outFrames,
+		DashboardDir:      env("DASHBOARD_DIR", "./web/dist"),
+		EnableMockSymbols: envBool("ENABLE_MOCK_SYMBOLS", !enableCollector),
+		EnableCollector:   enableCollector,
+		// Guardian is an optional repair/audit worker. Keep it opt-in so a
+		// collector deployment cannot silently add REST repair load and queue
+		// noise to the realtime ingestion path.
+		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", false),
 		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 120),
 		KlineGuardianWindowMinutes:         envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
 		KlineGuardianDelaySeconds:          envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),

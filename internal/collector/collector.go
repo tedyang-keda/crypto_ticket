@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -206,47 +207,97 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols []string, cfg Config) error {
 	chunks := chunkSymbols(symbols, cfg.SubscriptionChunkSize)
 	childCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	errCh := make(chan error, len(chunks))
+	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 	for index, chunk := range chunks {
 		index := index
 		chunk := append([]string(nil), chunk...)
+		wg.Add(1)
 		go func() {
-			errCh <- r.readStaticStream(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk))
+			defer wg.Done()
+			r.runStaticShard(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk), cfg)
 		}()
 	}
 	if cfg.SymbolRefreshInterval <= 0 {
-		return <-errCh
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	refreshTicker := time.NewTicker(cfg.SymbolRefreshInterval)
 	defer refreshTicker.Stop()
 	for {
 		select {
-		case err := <-errCh:
-			return err
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-refreshTicker.C:
 			next, err := r.refreshSymbols(ctx, adapter)
 			if err != nil {
-				return err
+				log.Printf("%s %s static subscription refresh failed; keeping existing shards: %v", adapter.Name(), adapter.MarketType(), err)
+				continue
 			}
 			if len(next) == 0 {
-				return errors.New("no active symbols")
+				log.Printf("%s %s static subscription refresh returned no active symbols; keeping existing shards", adapter.Name(), adapter.MarketType())
+				continue
 			}
 			if !sameSymbols(symbols, next) {
 				log.Printf("%s %s static subscriptions changed active=%d; reconnecting streams", adapter.Name(), adapter.MarketType(), len(next))
+				cancel()
 				return nil
 			}
 		}
 	}
 }
 
-func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) error {
+func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int, cfg Config) {
+	backoff := cfg.ReconnectBaseDelay
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	maxBackoff := cfg.ReconnectMaxDelay
+	if maxBackoff <= 0 {
+		maxBackoff = time.Minute
+	}
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		connected, err := r.readStaticStream(ctx, adapter, wsURL, index, symbolCount)
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			continue
+		}
+		log.Printf("%s %s shard=%d reconnect after error: %v", adapter.Name(), adapter.MarketType(), index, err)
+		if r.observer != nil {
+			r.observer.CollectorReconnect(adapter.Name(), adapter.MarketType())
+		}
+		if connected {
+			backoff = cfg.ReconnectBaseDelay
+			if backoff <= 0 {
+				backoff = time.Second
+			}
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		backoff = minDuration(backoff*2, maxBackoff)
+	}
+}
+
+func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) (bool, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if r.observer != nil {
 		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 	if r.observer != nil {
@@ -256,12 +307,12 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 	log.Printf("%s %s static kline stream connected chunk=%d symbols=%d", adapter.Name(), adapter.MarketType(), index, symbolCount)
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return true, ctx.Err()
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return true, err
 		}
 		if r.observer != nil {
 			r.observer.CollectorMessage(adapter.Name(), adapter.MarketType())
@@ -282,7 +333,7 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 				if r.observer != nil {
 					r.observer.CollectorIngestError(adapter.Name(), adapter.MarketType())
 				}
-				return err
+				return true, err
 			}
 			if r.observer != nil {
 				r.observer.CollectorIngested(adapter.Name(), adapter.MarketType(), bar)

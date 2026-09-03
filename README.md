@@ -102,7 +102,7 @@ go run ./cmd/marketd
 | `USE_MEMORY_STORE` | `true` | `true` 使用进程内 store；`false` 使用 MySQL |
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
-| `ENABLE_KLINE_GUARDIAN` | 跟随 `ENABLE_COLLECTOR` | 是否启动轻量 K 线守护者 |
+| `ENABLE_KLINE_GUARDIAN` | `false` | 是否启动轻量 K 线守护者；需要 REST 校验/修复时显式开启 |
 | `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` | `120` | 全市场近窗口 REST 校验周期 |
 | `KLINE_GUARDIAN_WINDOW_MINUTES` | `30` | 每次校验最近多少分钟的 final `1m` |
 | `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
