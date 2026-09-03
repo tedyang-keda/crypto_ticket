@@ -291,15 +291,11 @@ func (s *Service) conditions(now time.Time, snapshot Snapshot) []Condition {
 			Key: "publish_stale:" + prefix, Title: "实时行情发布停滞", Severity: SeverityCritical, Active: publishActive,
 			Message: fmt.Sprintf("**市场**: `%s`\n**最后发布**: `%s`\n**延迟**: `%s`", prefix, formatMS(runtime.LastPublishedMS), publishAge.Round(time.Second)),
 		})
-		reconnectSeverity := SeverityWarning
-		reconnectActive := runtime.Reconnects5m >= 3
-		if runtime.Reconnects10m >= 10 {
-			reconnectSeverity = SeverityCritical
-			reconnectActive = true
-		}
+		reconnectActive, reconnectSeverity, reconnectWarningThreshold, reconnectCriticalThreshold := reconnectStormCondition(runtime)
 		out = append(out, Condition{
 			Key: "reconnect_storm:" + prefix, Title: "Collector 频繁重连", Severity: reconnectSeverity, Active: reconnectActive,
-			Message: fmt.Sprintf("**市场**: `%s`\n**5 分钟**: `%d`\n**10 分钟**: `%d`", prefix, runtime.Reconnects5m, runtime.Reconnects10m),
+			Message: fmt.Sprintf("**市场**: `%s`\n**当前连接**: `%d`\n**5 分钟重连**: `%d` (阈值 `%d`)\n**10 分钟重连**: `%d` (critical 阈值 `%d`)\n**5 分钟连接失败**: `%d`",
+				prefix, runtime.Connected, runtime.Reconnects5m, reconnectWarningThreshold, runtime.Reconnects10m, reconnectCriticalThreshold, runtime.ConnectFailures5m),
 		})
 	}
 
@@ -344,6 +340,22 @@ func (s *Service) conditions(now time.Time, snapshot Snapshot) []Condition {
 
 	out = append(out, s.resourceConditions(now, snapshot.Resources)...)
 	return out
+}
+
+func reconnectStormCondition(runtime RuntimeSnapshot) (bool, Severity, int, int) {
+	connectionScale := runtime.Connected
+	if connectionScale < 1 {
+		connectionScale = 1
+	}
+	warningThreshold := max(6, (connectionScale+1)/2)
+	criticalThreshold := max(12, connectionScale)
+	active := runtime.ConnectFailures5m >= 3 || runtime.Reconnects5m >= warningThreshold
+	severity := SeverityWarning
+	if runtime.ConnectFailures5m >= 10 || runtime.Reconnects10m >= criticalThreshold {
+		active = true
+		severity = SeverityCritical
+	}
+	return active, severity, warningThreshold, criticalThreshold
 }
 
 func (s *Service) resourceConditions(now time.Time, resources ResourceSnapshot) []Condition {

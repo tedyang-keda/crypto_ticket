@@ -49,6 +49,8 @@ type Config struct {
 	SymbolRefreshIntervalSeconds       int
 	ReconnectBaseDelaySeconds          int
 	ReconnectMaxDelaySeconds           int
+	CollectorWSPingIntervalSeconds     int
+	CollectorWSPongWaitSeconds         int
 	Exchanges                          []ExchangeConfig
 }
 
@@ -116,6 +118,8 @@ func Load() Config {
 		SymbolRefreshIntervalSeconds:       envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
 		ReconnectBaseDelaySeconds:          envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
 		ReconnectMaxDelaySeconds:           envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
+		CollectorWSPingIntervalSeconds:     envInt("COLLECTOR_WS_PING_INTERVAL_SECONDS", 20),
+		CollectorWSPongWaitSeconds:         envInt("COLLECTOR_WS_PONG_WAIT_SECONDS", 60),
 		Exchanges:                          loadExchangeConfigs(),
 	}
 }

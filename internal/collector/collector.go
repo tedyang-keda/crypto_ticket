@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -23,6 +24,8 @@ type Config struct {
 	ReconnectBaseDelay    time.Duration
 	ReconnectMaxDelay     time.Duration
 	SubscriptionChunkSize int
+	WSPingInterval        time.Duration
+	WSPongWait            time.Duration
 }
 
 type KlinePublisher interface {
@@ -205,7 +208,7 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 }
 
 func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols []string, cfg Config) error {
-	chunks := chunkSymbols(symbols, cfg.SubscriptionChunkSize)
+	chunks := shardSymbols(symbols, cfg.SubscriptionChunkSize)
 	childCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer func() {
@@ -218,7 +221,7 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.runStaticShard(childCtx, adapter, staticAdapter.StaticStreamURL(chunk), index, len(chunk), cfg)
+			r.runStaticShard(childCtx, adapter, staticAdapter, chunk, index, cfg)
 		}()
 	}
 	if cfg.SymbolRefreshInterval <= 0 {
@@ -250,7 +253,7 @@ func (r *Runner) connectStaticStreams(ctx context.Context, adapter exchange.Adap
 	}
 }
 
-func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int, cfg Config) {
+func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, staticAdapter exchange.StaticStreamAdapter, symbols []string, index int, cfg Config) {
 	backoff := cfg.ReconnectBaseDelay
 	if backoff <= 0 {
 		backoff = time.Second
@@ -263,14 +266,15 @@ func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, w
 		if ctx.Err() != nil {
 			return
 		}
-		connected, err := r.readStaticStream(ctx, adapter, wsURL, index, symbolCount)
+		connected, err := r.readStaticStream(ctx, adapter, staticAdapter.StaticStreamURL(symbols), symbols, index, cfg)
 		if ctx.Err() != nil {
 			return
 		}
 		if err == nil {
 			continue
 		}
-		log.Printf("%s %s shard=%d reconnect after error: %v", adapter.Name(), adapter.MarketType(), index, err)
+		log.Printf("%s %s shard=%d symbols=%d range=%s reconnect after error: %v",
+			adapter.Name(), adapter.MarketType(), index, len(symbols), shardSymbolRange(symbols), err)
 		if r.observer != nil {
 			r.observer.CollectorReconnect(adapter.Name(), adapter.MarketType())
 		}
@@ -291,7 +295,7 @@ func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, w
 	}
 }
 
-func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, index int, symbolCount int) (bool, error) {
+func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, symbols []string, index int, cfg Config) (bool, error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if r.observer != nil {
 		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
@@ -300,18 +304,44 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 		return false, err
 	}
 	defer conn.Close()
+	pingInterval, pongWait := websocketHeartbeatDurations(cfg)
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return false, err
+	}
+	defaultPingHandler := conn.PingHandler()
+	conn.SetPingHandler(func(data string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			return err
+		}
+		return defaultPingHandler(data)
+	})
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+	heartbeatDone := make(chan struct{})
+	heartbeatErr := make(chan error, 1)
+	defer close(heartbeatDone)
+	go keepWebsocketAlive(ctx, conn, pingInterval, heartbeatDone, heartbeatErr)
 	if r.observer != nil {
 		r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), 1)
 		defer r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), -1)
 	}
-	log.Printf("%s %s static kline stream connected chunk=%d symbols=%d", adapter.Name(), adapter.MarketType(), index, symbolCount)
+	log.Printf("%s %s static kline stream connected shard=%d symbols=%d range=%s",
+		adapter.Name(), adapter.MarketType(), index, len(symbols), shardSymbolRange(symbols))
 	for {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			select {
+			case heartbeatError := <-heartbeatErr:
+				return true, fmt.Errorf("websocket heartbeat failed: %w", heartbeatError)
+			default:
+			}
 			return true, err
 		}
 		if r.observer != nil {
@@ -340,6 +370,48 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 			}
 		}
 	}
+}
+
+func keepWebsocketAlive(ctx context.Context, conn *websocket.Conn, interval time.Duration, done <-chan struct{}, errCh chan<- error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			deadline := time.Now().Add(minDuration(interval, 10*time.Second))
+			if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+}
+
+func websocketHeartbeatDurations(cfg Config) (time.Duration, time.Duration) {
+	pingInterval := cfg.WSPingInterval
+	if pingInterval <= 0 {
+		pingInterval = 20 * time.Second
+	}
+	pongWait := cfg.WSPongWait
+	if pongWait <= 0 {
+		pongWait = 60 * time.Second
+	}
+	if pingInterval >= pongWait {
+		pingInterval = pongWait / 2
+	}
+	if pingInterval <= 0 {
+		pingInterval = time.Second
+	}
+	return pingInterval, pongWait
 }
 
 func (r *Runner) refreshConnectionSubscriptions(
@@ -482,6 +554,36 @@ func chunkSymbols(symbols []string, chunkSize int) [][]string {
 		chunks = append(chunks, symbols[start:end])
 	}
 	return chunks
+}
+
+// shardSymbols distributes symbols round-robin across the minimum number of
+// shards needed to respect maxShardSize. Besides avoiding a tiny final shard,
+// this also prevents alphabetically adjacent low-activity symbols from sharing
+// one connection and looking disconnected simply because the market is quiet.
+func shardSymbols(symbols []string, maxShardSize int) [][]string {
+	if len(symbols) == 0 {
+		return nil
+	}
+	if maxShardSize <= 0 {
+		maxShardSize = 100
+	}
+	shardCount := (len(symbols) + maxShardSize - 1) / maxShardSize
+	shards := make([][]string, shardCount)
+	for index, symbol := range symbols {
+		shard := index % shardCount
+		shards[shard] = append(shards[shard], symbol)
+	}
+	return shards
+}
+
+func shardSymbolRange(symbols []string) string {
+	if len(symbols) == 0 {
+		return "-"
+	}
+	if len(symbols) == 1 {
+		return symbols[0]
+	}
+	return symbols[0] + ".." + symbols[len(symbols)-1]
 }
 
 func minDuration(a time.Duration, b time.Duration) time.Duration {

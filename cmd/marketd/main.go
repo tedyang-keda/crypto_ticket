@@ -272,6 +272,8 @@ func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) [
 				ReconnectBaseDelay:    time.Duration(cfg.ReconnectBaseDelaySeconds) * time.Second,
 				ReconnectMaxDelay:     time.Duration(cfg.ReconnectMaxDelaySeconds) * time.Second,
 				SubscriptionChunkSize: exchangeConfig.SubscriptionChunkSize,
+				WSPingInterval:        time.Duration(cfg.CollectorWSPingIntervalSeconds) * time.Second,
+				WSPongWait:            time.Duration(cfg.CollectorWSPongWaitSeconds) * time.Second,
 			},
 		})
 	}

@@ -103,6 +103,28 @@ func TestRegistryGuardianAndHTTPWindows(t *testing.T) {
 	}
 }
 
+func TestReconnectStormScalesWithIndependentShards(t *testing.T) {
+	active, severity, warningThreshold, criticalThreshold := reconnectStormCondition(RuntimeSnapshot{
+		Connected: 16, Reconnects5m: 4, Reconnects10m: 4,
+	})
+	if active || severity != SeverityWarning || warningThreshold != 8 || criticalThreshold != 16 {
+		t.Fatalf("short self-healing shard reconnects should not alert: active=%t severity=%s warning=%d critical=%d",
+			active, severity, warningThreshold, criticalThreshold)
+	}
+	active, severity, _, _ = reconnectStormCondition(RuntimeSnapshot{
+		Connected: 16, Reconnects5m: 8, Reconnects10m: 8,
+	})
+	if !active || severity != SeverityWarning {
+		t.Fatalf("expected scaled warning, active=%t severity=%s", active, severity)
+	}
+	active, severity, _, _ = reconnectStormCondition(RuntimeSnapshot{
+		Connected: 16, ConnectFailures5m: 10,
+	})
+	if !active || severity != SeverityCritical {
+		t.Fatalf("expected connection failure critical alert, active=%t severity=%s", active, severity)
+	}
+}
+
 func TestCollectorSubscriptionsReplaceRuntimeSymbols(t *testing.T) {
 	now := time.Date(2026, 7, 30, 6, 0, 0, 0, time.UTC)
 	registry := newRegistry(func() time.Time { return now })

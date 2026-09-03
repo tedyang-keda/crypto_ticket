@@ -139,6 +139,8 @@ go run ./cmd/marketd
 | `RECENT_CACHE_LIMIT` | `300` | 默认 HTTP K 线条数 |
 | `ENABLED_EXCHANGES` | `binance,okx` | 启用哪些交易所 |
 | `SYMBOL_REFRESH_INTERVAL_SECONDS` | `120` | 交易所 symbol 元数据刷新间隔；OKX 增量调整订阅，Binance 名单变化时重建 static streams |
+| `COLLECTOR_WS_PING_INTERVAL_SECONDS` | `20` | Binance static WebSocket 主动 ping 周期；用于区分冷门品种无成交与连接失活 |
+| `COLLECTOR_WS_PONG_WAIT_SECONDS` | `60` | Binance static WebSocket 等待 pong 的最长时间；超时后只重连对应 shard |
 | `BINANCE_UM_ENABLED` | `true` | 是否启用 Binance USDT-M futures |
 | `BINANCE_COIN_ENABLED` | `false` | 是否启用 Binance COIN-M futures；默认关闭，避免订阅当前及未来币本位合约 |
 | `OKX_ENABLED` | `true` | 是否启用 OKX |
@@ -169,14 +171,15 @@ go test ./...
 Binance 订阅：
 
 - Binance adapter 实现了 `StaticStreamURL`。
-- collector 会按 `BINANCE_SUBSCRIPTION_CHUNK_SIZE` / `BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE` 分 chunk，默认每个 chunk 50 个 symbol。
+- collector 会按 `BINANCE_SUBSCRIPTION_CHUNK_SIZE` / `BINANCE_COIN_SUBSCRIPTION_CHUNK_SIZE` 计算最少 shard 数，默认每个 shard 不超过 50 个 symbol，并使用轮询分配避免最后一个 shard 过小或聚集一批冷门品种。
 - 每个 chunk 打开一个 combined stream，例如：
 
 ```text
 wss://fstream.binance.com/market/stream?streams=btcusdt@kline_1m/ethusdt@kline_1m
 ```
 
-- Binance static stream 连接存活期间不做增量 subscribe/unsubscribe；symbols 会在重连时重新拉取。
+- 每个 Binance shard 独立连接、心跳和指数退避重连；单个 shard 失败不会取消其他 shard。只有 active symbol 集合变化时才整体重建 static streams。
+- static stream 每 20 秒主动发送 WebSocket ping，60 秒收不到 pong 才判断连接失活；不会再把冷门品种暂时无 K 线消息误判成断线。
 
 OKX 订阅：
 
