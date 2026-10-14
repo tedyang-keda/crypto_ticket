@@ -296,6 +296,60 @@ func TestRepairFinalBarsRebuildsContainingRollups(t *testing.T) {
 	}
 }
 
+func TestRepairOfficialDailyBarsWithoutHourlySourceRebuildsWeeklyBar(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1H", "1D", "1W"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1W")
+	var daily []market.Bar
+	for i := 0; i < 7; i++ {
+		start := base + int64(i)*timeframe.DurationMS("1D")
+		daily = append(daily, market.Bar{
+			Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D",
+			StartMS: start, EndMS: timeframe.EndMS(start, "1D"),
+			OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 105,
+			Volume: 2, QuoteVolume: 200, Source: "rest", IsFinal: true,
+		})
+	}
+	if err := service.RepairFinalBars(ctx, daily); err != nil {
+		t.Fatalf("repair official daily bars: %v", err)
+	}
+	for _, tf := range []string{"1m", "1H"} {
+		bars, err := service.store.BarsInRange(ctx, "binance", "BTCUSDT", tf, base, timeframe.EndMS(base, "1W"))
+		if err != nil || len(bars) != 0 {
+			t.Fatalf("daily repair must not fabricate source %s: bars=%v err=%v", tf, bars, err)
+		}
+	}
+	weekly, err := service.store.BarsInRange(ctx, "binance", "BTCUSDT", "1W", base, base)
+	if err != nil || len(weekly) != 1 || !weekly[0].IsFinal || weekly[0].Volume != 14 || weekly[0].ClosePrice != 105 {
+		t.Fatalf("expected complete weekly rollup from repaired official daily bars: bars=%v err=%v", weekly, err)
+	}
+}
+
+func TestHistoricalRepairPreservesCurrentLiveBar(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketService()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1m")
+	live := market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1m",
+		StartMS: base, EndMS: timeframe.EndMS(base, "1m"),
+		OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 108,
+	}
+	if err := service.IngestKline(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	historical := live
+	historical.StartMS -= timeframe.MinuteMS
+	historical.EndMS -= timeframe.MinuteMS
+	historical.ClosePrice = 101
+	if err := service.RepairFinalBars(ctx, []market.Bar{historical}); err != nil {
+		t.Fatal(err)
+	}
+	tick, err := service.LatestTick(ctx, "binance", "BTCUSDT")
+	if err != nil || tick == nil || tick.Price != live.ClosePrice {
+		t.Fatalf("historical repair discarded current snapshot: tick=%v err=%v", tick, err)
+	}
+}
+
 func newTestMarketService() *MarketService {
 	return newTestMarketServiceWithFrames([]string{"1m"})
 }

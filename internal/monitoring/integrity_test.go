@@ -66,8 +66,84 @@ func TestIntegrityAuditOnlyReportsMissingWhenSourceComplete(t *testing.T) {
 		t.Fatalf("expected clean timeframe counters to be retained, got %+v", summary.ByTimeframe)
 	}
 
-	if err := store.UpsertBars(ctx, source[:14]); err != nil {
-		t.Fatal(err)
+}
+
+func TestIntegrityAuditReportsIncompleteSources(t *testing.T) {
+	tests := []struct {
+		name       string
+		timeframe  string
+		now        time.Time
+		expected   int
+		missing    int
+		targetOnly bool
+	}{
+		{name: "empty minute source", timeframe: "15m", now: time.Date(2026, 7, 28, 1, 2, 0, 0, time.UTC), expected: 15, missing: -1},
+		{name: "interior minute gap", timeframe: "15m", now: time.Date(2026, 7, 28, 1, 2, 0, 0, time.UTC), expected: 15, missing: 7},
+		{name: "daily hour gap", timeframe: "1D", now: time.Date(2026, 7, 28, 0, 2, 0, 0, time.UTC), expected: 24, missing: 12},
+		{name: "existing daily target cannot be verified", timeframe: "1D", now: time.Date(2026, 7, 28, 0, 2, 0, 0, time.UTC), expected: 24, missing: -1, targetOnly: true},
+		{name: "leap month day gap", timeframe: "1M", now: time.Date(2024, 3, 1, 0, 2, 0, 0, time.UTC), expected: 29, missing: 20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := storage.NewMemoryHistoricalStore()
+			symbol := market.SymbolInfo{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true}
+			if err := store.UpsertSymbols(ctx, []market.SymbolInfo{symbol}); err != nil {
+				t.Fatal(err)
+			}
+			bucketStart := timeframe.PreviousStartMS(timeframe.FloorStartMS(tt.now.Add(-2*time.Minute).UnixMilli(), tt.timeframe), tt.timeframe)
+			bucketEnd := timeframe.EndMS(bucketStart, tt.timeframe)
+			sourceTF := aggregator.RollupSourceTimeframe(tt.timeframe)
+			var allSource []market.Bar
+			var storedSource []market.Bar
+			for start := bucketStart; start <= bucketEnd; start = timeframe.NextStartMS(start, sourceTF) {
+				bar := market.Bar{
+					Exchange: symbol.Exchange, Symbol: symbol.Symbol, Timeframe: sourceTF, StartMS: start, EndMS: timeframe.EndMS(start, sourceTF),
+					OpenPrice: 100, HighPrice: 101, LowPrice: 99, ClosePrice: 100, Volume: 1, IsFinal: true,
+				}
+				index := len(allSource)
+				allSource = append(allSource, bar)
+				if tt.missing >= 0 && index != tt.missing {
+					storedSource = append(storedSource, bar)
+				}
+			}
+			if err := store.UpsertBars(ctx, storedSource); err != nil {
+				t.Fatal(err)
+			}
+			if tt.targetOnly {
+				bar := aggregator.RollupBars(tt.timeframe, allSource, true, "test", tt.now.UnixMilli())
+				if err := store.UpsertBars(ctx, []market.Bar{*bar}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			registry := newRegistry(func() time.Time { return tt.now })
+			auditor := NewIntegrityAuditor(store, registry, IntegrityConfig{Enabled: true, Exchanges: []string{symbol.Exchange}, Timeframes: []string{tt.timeframe}, SymbolsPerRun: 1, Buckets: 1})
+			auditor.now = func() time.Time { return tt.now }
+			summary, err := auditor.AuditOnce(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.SourceIncomplete != 1 || summary.SourceIncompleteByTimeframe[tt.timeframe] != 1 || summary.Missing != 0 || summary.Mismatch != 0 || len(summary.Affected) != 1 {
+				t.Fatalf("expected incomplete source instead of a clean or mismatched audit: %+v", summary)
+			}
+			if len(summary.Issues) != 1 {
+				t.Fatalf("expected one source issue, got %+v", summary.Issues)
+			}
+			issue := summary.Issues[0]
+			if issue.Type != "source_incomplete" || issue.Timeframe != tt.timeframe || issue.StartMS != bucketStart || issue.SourceTimeframe != sourceTF || issue.ExpectedSourceBars != tt.expected || issue.ActualSourceBars != len(storedSource) {
+				t.Fatalf("unexpected source issue: %+v", issue)
+			}
+			if err := store.UpsertBars(ctx, allSource); err != nil {
+				t.Fatal(err)
+			}
+			summary, err = auditor.AuditOnce(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.SourceIncomplete != 0 || summary.SourceIncompleteByTimeframe[tt.timeframe] != 0 {
+				t.Fatalf("source status did not recover after filling the gap: %+v", summary)
+			}
+		})
 	}
 }
 

@@ -83,7 +83,10 @@ func (a *IntegrityAuditor) AuditOnce(ctx context.Context) (IntegritySummary, err
 	if err != nil {
 		return IntegritySummary{}, err
 	}
-	summary := IntegritySummary{CheckedAt: a.now(), ByTimeframe: make(map[string][3]int)}
+	summary := IntegritySummary{
+		CheckedAt: a.now(), ByTimeframe: make(map[string][3]int),
+		SourceIncompleteByTimeframe: make(map[string]int),
+	}
 	if len(targets) == 0 {
 		a.registry.SetIntegrity(summary)
 		return summary, nil
@@ -105,6 +108,7 @@ func (a *IntegrityAuditor) AuditOnce(ctx context.Context) (IntegritySummary, err
 				affected[target.Exchange+":"+target.Symbol] = true
 			}
 			byTimeframe := summary.ByTimeframe[tf]
+			sourceIncomplete := 0
 			for _, issue := range issues {
 				summary.Issues = append(summary.Issues, issue)
 				switch issue.Type {
@@ -117,9 +121,13 @@ func (a *IntegrityAuditor) AuditOnce(ctx context.Context) (IntegritySummary, err
 				case "invalid_ohlc":
 					summary.InvalidOHLC++
 					byTimeframe[2]++
+				case "source_incomplete":
+					summary.SourceIncomplete++
+					sourceIncomplete++
 				}
 			}
 			summary.ByTimeframe[tf] = byTimeframe
+			summary.SourceIncompleteByTimeframe[tf] += sourceIncomplete
 		}
 	}
 	a.cursor = (a.cursor + count) % len(targets)
@@ -185,6 +193,11 @@ func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.Symbol
 			return nil, queryErr
 		}
 		if !completeSource(sourceBars, sourceTF, bucketStart, bucketEnd) {
+			issue := newIntegrityIssue(target, tf, bucketStart, "source_incomplete")
+			issue.SourceTimeframe = sourceTF
+			issue.ExpectedSourceBars = expectedSourceBarCount(sourceTF, bucketStart, bucketEnd)
+			issue.ActualSourceBars = len(sourceBars)
+			issues = append(issues, issue)
 			continue
 		}
 		expected := aggregator.RollupBars(tf, sourceBars, true, "monitoring_integrity", a.now().UnixMilli())
@@ -222,6 +235,14 @@ func completeSource(bars []market.Bar, sourceTF string, targetStart int64, targe
 		expected = timeframe.NextStartMS(bar.StartMS, sourceTF)
 	}
 	return expected > targetEnd && sorted[len(sorted)-1].EndMS >= targetEnd
+}
+
+func expectedSourceBarCount(sourceTF string, targetStart int64, targetEnd int64) int {
+	count := 0
+	for start := targetStart; start <= targetEnd; start = timeframe.NextStartMS(start, sourceTF) {
+		count++
+	}
+	return count
 }
 
 func validOHLC(bar market.Bar) bool {

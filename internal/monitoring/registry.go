@@ -90,22 +90,27 @@ type wsWriteObservation struct {
 }
 
 type IntegritySummary struct {
-	CheckedAt      time.Time         `json:"checked_at"`
-	CheckedSymbols int               `json:"checked_symbols"`
-	Missing        int               `json:"missing"`
-	Mismatch       int               `json:"mismatch"`
-	InvalidOHLC    int               `json:"invalid_ohlc"`
-	Affected       []string          `json:"affected,omitempty"`
-	ByTimeframe    map[string][3]int `json:"by_timeframe,omitempty"`
-	Issues         []IntegrityIssue  `json:"issues,omitempty"`
+	CheckedAt                   time.Time         `json:"checked_at"`
+	CheckedSymbols              int               `json:"checked_symbols"`
+	Missing                     int               `json:"missing"`
+	Mismatch                    int               `json:"mismatch"`
+	InvalidOHLC                 int               `json:"invalid_ohlc"`
+	SourceIncomplete            int               `json:"source_incomplete"`
+	Affected                    []string          `json:"affected,omitempty"`
+	ByTimeframe                 map[string][3]int `json:"by_timeframe,omitempty"`
+	SourceIncompleteByTimeframe map[string]int    `json:"source_incomplete_by_timeframe,omitempty"`
+	Issues                      []IntegrityIssue  `json:"issues,omitempty"`
 }
 
 type IntegrityIssue struct {
-	Exchange  string `json:"exchange"`
-	Symbol    string `json:"symbol"`
-	Timeframe string `json:"timeframe"`
-	StartMS   int64  `json:"start_ms"`
-	Type      string `json:"type"`
+	Exchange           string `json:"exchange"`
+	Symbol             string `json:"symbol"`
+	Timeframe          string `json:"timeframe"`
+	StartMS            int64  `json:"start_ms"`
+	Type               string `json:"type"`
+	SourceTimeframe    string `json:"source_timeframe,omitempty"`
+	ExpectedSourceBars int    `json:"expected_source_bars,omitempty"`
+	ActualSourceBars   int    `json:"actual_source_bars"`
 }
 
 type RuntimeSnapshot struct {
@@ -624,6 +629,9 @@ func (r *Registry) SetIntegrity(summary IntegritySummary) {
 		r.integrityIssues.WithLabelValues(tf, "missing").Set(float64(values[0]))
 		r.integrityIssues.WithLabelValues(tf, "mismatch").Set(float64(values[1]))
 		r.integrityIssues.WithLabelValues(tf, "invalid_ohlc").Set(float64(values[2]))
+	}
+	for tf, count := range summary.SourceIncompleteByTimeframe {
+		r.integrityIssues.WithLabelValues(tf, "source_incomplete").Set(float64(count))
 	}
 }
 

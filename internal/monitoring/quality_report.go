@@ -83,6 +83,11 @@ func (s *Service) formatMarketQualityReport(now time.Time, snapshot Snapshot) st
 		lines = append(lines, "**最近一轮 Guardian**: 尚未完成")
 	}
 	lines = append(lines, formatGuardianQuality(now.In(s.cfg.DailyLocation), snapshot.Window.GuardianEvents30m)...)
+	if snapshot.Window.Integrity.CheckedAt.IsZero() {
+		lines = append(lines, "**最近一轮高周期完整性检查**: 尚未完成")
+	} else {
+		lines = append(lines, "**最近一轮高周期完整性检查**: "+formatIntegrity(snapshot.Window.Integrity))
+	}
 	return strings.Join(lines, "\n")
 }
 

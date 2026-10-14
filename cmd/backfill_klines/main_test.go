@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -16,6 +17,34 @@ import (
 type fallbackFetcher struct {
 	bars  []market.Bar
 	calls []exchange.KlineRequest
+}
+
+type backfillDerivedStore struct {
+	previous  []market.Bar
+	current   []market.Bar
+	lookupErr error
+	deleted   int
+	upserted  []market.Bar
+}
+
+func (s *backfillDerivedStore) BarsInRange(_ context.Context, exchange string, symbol string, tf string, startMS int64, endMS int64) ([]market.Bar, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
+	if len(s.previous) > 0 && endMS == startMS && startMS < s.current[0].StartMS {
+		return s.previous, nil
+	}
+	return s.current, nil
+}
+
+func (s *backfillDerivedStore) UpsertBars(_ context.Context, bars []market.Bar) error {
+	s.upserted = append(s.upserted, bars...)
+	return nil
+}
+
+func (s *backfillDerivedStore) DeleteBarsInRange(context.Context, string, string, string, int64, int64) (int64, error) {
+	s.deleted++
+	return 1, nil
 }
 
 func (f *fallbackFetcher) Name() string {
@@ -66,6 +95,63 @@ func TestFetchBackfillBarsRollsUpUnsupportedTarget(t *testing.T) {
 	}
 	if len(fetcher.calls) != 2 || fetcher.calls[1].Timeframe != "1D" || fetcher.calls[1].Adjustment != exchange.KlineAdjustmentAuto {
 		t.Fatalf("unexpected requests: %+v", fetcher.calls)
+	}
+}
+
+func TestApplyBackfillDerivedPreservesAndCalculatesFields(t *testing.T) {
+	start := timeframe.FloorStartMS(time.Now().UTC().AddDate(0, 0, -2).UnixMilli(), "1D")
+	store := &backfillDerivedStore{
+		previous: []market.Bar{{StartMS: start - timeframe.DayMS, ClosePrice: 90}},
+		current:  []market.Bar{{StartMS: start - timeframe.DayMS, ClosePrice: 90}},
+	}
+	bars := []market.Bar{
+		{Exchange: "okx", Symbol: "BTC-USDT-SWAP", Timeframe: "1D", StartMS: start, EndMS: timeframe.EndMS(start, "1D"), OpenPrice: 100, HighPrice: 110, LowPrice: 95, ClosePrice: 105},
+		{Exchange: "okx", Symbol: "BTC-USDT-SWAP", Timeframe: "1D", StartMS: timeframe.NextStartMS(start, "1D"), EndMS: timeframe.EndMS(timeframe.NextStartMS(start, "1D"), "1D"), OpenPrice: 105, HighPrice: 120, LowPrice: 100, ClosePrice: 110},
+	}
+	got, err := applyBackfillDerived(context.Background(), store, bars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].PrevClose != 90 || got[0].Chg != 16.666667 || got[0].Amp != 15.789474 {
+		t.Fatalf("unexpected first derived fields: %+v", got[0])
+	}
+	if got[1].PrevClose != 105 || got[1].Chg != 4.761905 || got[1].Amp != 20 {
+		t.Fatalf("unexpected second derived fields: %+v", got[1])
+	}
+}
+
+func TestApplyBackfillDerivedPreservesFirstFieldsWithoutAnchor(t *testing.T) {
+	start := timeframe.FloorStartMS(time.Now().UTC().AddDate(0, 0, -2).UnixMilli(), "1D")
+	store := &backfillDerivedStore{current: []market.Bar{{
+		StartMS: start, PrevClose: 88, Chg: 2.5, Amp: 8.5,
+	}}}
+	bars := []market.Bar{
+		{Exchange: "okx", Symbol: "BTC-USDT-SWAP", Timeframe: "1D", StartMS: start, EndMS: timeframe.EndMS(start, "1D"), OpenPrice: 100, HighPrice: 110, LowPrice: 95, ClosePrice: 105},
+		{Exchange: "okx", Symbol: "BTC-USDT-SWAP", Timeframe: "1D", StartMS: timeframe.NextStartMS(start, "1D"), EndMS: timeframe.EndMS(timeframe.NextStartMS(start, "1D"), "1D"), OpenPrice: 105, HighPrice: 120, LowPrice: 100, ClosePrice: 110},
+	}
+	got, err := applyBackfillDerived(context.Background(), store, bars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].PrevClose != 88 || got[0].Chg != 2.5 || got[0].Amp != 8.5 {
+		t.Fatalf("existing first fields were cleared: %+v", got[0])
+	}
+	if got[1].PrevClose != 105 || got[1].Chg != 4.761905 || got[1].Amp != 20 {
+		t.Fatalf("expected later bars to be derived from first close: %+v", got[1])
+	}
+}
+
+func TestBackfillDoesNotDeleteWhenDerivedLookupFails(t *testing.T) {
+	store := &backfillDerivedStore{lookupErr: errors.New("mysql unavailable")}
+	fetcher := &fallbackFetcher{bars: []market.Bar{{
+		Exchange: "okx", Symbol: "BTC-USDT-SWAP", Timeframe: "1D", StartMS: timeframe.FloorStartMS(time.Now().UTC().AddDate(0, 0, -2).UnixMilli(), "1D"),
+		EndMS: timeframe.EndMS(timeframe.FloorStartMS(time.Now().UTC().AddDate(0, 0, -2).UnixMilli(), "1D"), "1D"), OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 105,
+	}}}
+	_, err := backfillExchange(context.Background(), store, http.DefaultClient, fetcher, []string{"BTC-USDT-SWAP"}, runOptions{
+		timeframes: []string{"1D"}, limit: 1, batchSize: 10, adjustment: exchange.KlineAdjustmentRaw, replaceExisting: true,
+	})
+	if err == nil || store.deleted != 0 {
+		t.Fatalf("lookup failure must stop before delete: err=%v deleted=%d", err, store.deleted)
 	}
 }
 

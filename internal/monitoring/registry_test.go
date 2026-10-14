@@ -225,7 +225,7 @@ func TestFormatIntegrityIncludesIssueDetailsAndLimit(t *testing.T) {
 		CheckedSymbols: 50, Missing: 21, Affected: []string{"binance:BTCUSDT"}, Issues: issues,
 	})
 	for _, expected := range []string{
-		"checked=50, missing=21, mismatch=0, invalid_ohlc=0, affected=1",
+		"checked=50, missing=21, mismatch=0, invalid_ohlc=0, source_incomplete=0, affected=1",
 		"**异常明细**:",
 		"- `binance:BTCUSDT`, `15m`, `2026-07-29T12:15:00Z`, `missing`",
 		"- 其余 `1` 条异常已省略",
@@ -236,6 +236,45 @@ func TestFormatIntegrityIncludesIssueDetailsAndLimit(t *testing.T) {
 	}
 	if strings.Contains(message, "2026-07-29T12:35:00Z") {
 		t.Fatalf("formatted integrity message exceeded detail limit: %s", message)
+	}
+}
+
+func TestIntegritySourceIncompleteMetricsAndQualityReport(t *testing.T) {
+	now := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	registry := newRegistry(func() time.Time { return now })
+	summary := IntegritySummary{
+		CheckedAt: now, CheckedSymbols: 1, SourceIncomplete: 1,
+		Affected: []string{"binance:BTCUSDT"}, ByTimeframe: map[string][3]int{"1D": {}}, SourceIncompleteByTimeframe: map[string]int{"1D": 1},
+		Issues: []IntegrityIssue{{Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: now.Add(-25 * time.Hour).UnixMilli(), Type: "source_incomplete", SourceTimeframe: "1H", ExpectedSourceBars: 24, ActualSourceBars: 23}},
+	}
+	registry.SetIntegrity(summary)
+	response := httptest.NewRecorder()
+	registry.MetricsHandler().ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `crypto_ticket_integrity_issues{timeframe="1D",type="source_incomplete"} 1`) {
+		t.Fatalf("missing incomplete source metric: %s", response.Body.String())
+	}
+	service := NewService(registry, &fakePinger{}, nil, "", Config{Enabled: true, CollectorEnabled: true})
+	report := service.formatMarketQualityReport(now, registry.Snapshot(now))
+	for _, expected := range []string{"最近一轮高周期完整性检查", "source_incomplete=1", "`binance:BTCUSDT`", "`1D`", "`source_incomplete`，源 `1H`=23/24，无法校验"} {
+		if !strings.Contains(report, expected) {
+			t.Fatalf("quality report missing %q: %s", expected, report)
+		}
+	}
+	registry.SetIntegrity(IntegritySummary{CheckedAt: now, ByTimeframe: map[string][3]int{"1D": {}}, SourceIncompleteByTimeframe: map[string]int{"1D": 0}})
+	response = httptest.NewRecorder()
+	registry.MetricsHandler().ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `crypto_ticket_integrity_issues{timeframe="1D",type="source_incomplete"} 0`) {
+		t.Fatalf("incomplete source metric did not reset: %s", response.Body.String())
+	}
+}
+
+func TestMarketQualityReportDoesNotClaimIntegrityBeforeAudit(t *testing.T) {
+	now := time.Date(2026, 7, 28, 1, 0, 0, 0, time.UTC)
+	registry := newRegistry(func() time.Time { return now })
+	service := NewService(registry, &fakePinger{}, nil, "", Config{Enabled: true, CollectorEnabled: true})
+	report := service.formatMarketQualityReport(now, registry.Snapshot(now))
+	if !strings.Contains(report, "**最近一轮高周期完整性检查**: 尚未完成") {
+		t.Fatalf("report should distinguish unchecked integrity: %s", report)
 	}
 }
 

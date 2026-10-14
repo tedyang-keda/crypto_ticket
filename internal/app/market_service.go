@@ -144,7 +144,10 @@ func (s *MarketService) RepairFinalBars(ctx context.Context, bars []market.Bar) 
 			continue
 		}
 		s.mu.Lock()
-		delete(s.liveBars, barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe))
+		key := barKey(enriched.Exchange, enriched.Symbol, enriched.Timeframe)
+		if live, ok := s.liveBars[key]; ok && live.StartMS == enriched.StartMS {
+			delete(s.liveBars, key)
+		}
 		s.mu.Unlock()
 		if err := s.persistFinalBars(ctx, []market.Bar{enriched}, true); err != nil {
 			return err

@@ -19,6 +19,7 @@ type Config struct {
 	EnableMockSymbols                  bool
 	EnableCollector                    bool
 	EnableKlineGuardian                bool
+	KlineGuardianObserveFinalBars      bool
 	KlineGuardianAuditIntervalSeconds  int
 	KlineGuardianWindowMinutes         int
 	KlineGuardianDelaySeconds          int
@@ -27,6 +28,10 @@ type Config struct {
 	KlineGuardianBinanceRPS            int
 	KlineGuardianOKXRPS                int
 	KlineGuardianSymbolMaxAgeSeconds   int
+	KlineGuardianDailyAuditEnabled     bool
+	KlineGuardianDailyAuditSeconds     int
+	KlineGuardianDailyAuditDays        int
+	KlineGuardianDailyLookbackDays     int
 	EnableCorporateAction              bool
 	CorporateActionPollSeconds         int
 	CorporateActionMaxAttempts         int
@@ -88,6 +93,7 @@ func Load() Config {
 		// collector deployment cannot silently add REST repair load and queue
 		// noise to the realtime ingestion path.
 		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", false),
+		KlineGuardianObserveFinalBars:      envBool("KLINE_GUARDIAN_OBSERVE_FINAL_BARS", false),
 		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 120),
 		KlineGuardianWindowMinutes:         envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
 		KlineGuardianDelaySeconds:          envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
@@ -96,6 +102,10 @@ func Load() Config {
 		KlineGuardianBinanceRPS:            envInt("KLINE_GUARDIAN_BINANCE_RPS", 8),
 		KlineGuardianOKXRPS:                envInt("KLINE_GUARDIAN_OKX_RPS", 5),
 		KlineGuardianSymbolMaxAgeSeconds:   envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
+		KlineGuardianDailyAuditEnabled:     envBool("KLINE_GUARDIAN_DAILY_AUDIT_ENABLED", true),
+		KlineGuardianDailyAuditSeconds:     envInt("KLINE_GUARDIAN_DAILY_AUDIT_SECONDS", 3600),
+		KlineGuardianDailyAuditDays:        envInt("KLINE_GUARDIAN_DAILY_AUDIT_DAYS", 7),
+		KlineGuardianDailyLookbackDays:     envInt("KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS", 300),
 		EnableCorporateAction:              envBool("ENABLE_CORPORATE_ACTION", false),
 		CorporateActionPollSeconds:         envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
 		CorporateActionMaxAttempts:         envInt("CORPORATE_ACTION_MAX_ATTEMPTS", 5),

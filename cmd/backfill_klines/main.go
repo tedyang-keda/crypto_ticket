@@ -371,6 +371,7 @@ func backfillExchange(
 	store interface {
 		UpsertBars(context.Context, []market.Bar) error
 		DeleteBarsInRange(context.Context, string, string, string, int64, int64) (int64, error)
+		BarsInRange(context.Context, string, string, string, int64, int64) ([]market.Bar, error)
 	},
 	client *http.Client,
 	fetcher exchange.RESTKlineFetcher,
@@ -456,6 +457,13 @@ func backfillExchange(
 				}
 				return total, err
 			}
+			bars, err = applyBackfillDerived(ctx, store, bars)
+			if err != nil {
+				// Resolve the previous bucket before any replacement DELETE. A
+				// failed lookup therefore cannot leave a successfully fetched
+				// range empty.
+				return total, fmt.Errorf("derive fields exchange=%s symbol=%s timeframe=%s: %w", fetcher.Name(), symbol, tf, err)
+			}
 			deleted := int64(0)
 			if options.replaceExisting && !options.dryRun && len(bars) > 0 {
 				if err := flush(); err != nil {
@@ -503,6 +511,64 @@ func backfillExchange(
 		return total, err
 	}
 	return total, nil
+}
+
+// applyBackfillDerived fills the fields that are maintained by the realtime
+// ingestion path (previous close, change and amplitude). REST K-line payloads
+// do not carry these fields, but UpsertBars updates them on conflict; writing
+// zero values here would erase useful values already stored for the same bar.
+// The lookup happens before a caller can delete the replacement range.
+func applyBackfillDerived(
+	ctx context.Context,
+	store interface {
+		BarsInRange(context.Context, string, string, string, int64, int64) ([]market.Bar, error)
+	},
+	bars []market.Bar,
+) ([]market.Bar, error) {
+	if len(bars) == 0 {
+		return bars, nil
+	}
+	sort.SliceStable(bars, func(i, j int) bool { return bars[i].StartMS < bars[j].StartMS })
+	first := bars[0]
+	previousClose := float64(0)
+	previousStart := timeframe.PreviousStartMS(first.StartMS, first.Timeframe)
+	if previousStart > 0 {
+		previous, err := store.BarsInRange(ctx, first.Exchange, first.Symbol, first.Timeframe, previousStart, previousStart)
+		if err != nil {
+			return nil, err
+		}
+		if len(previous) > 0 {
+			previousClose = previous[len(previous)-1].ClosePrice
+		}
+	}
+	// If the fetched range starts without a stored predecessor, preserve
+	// derived values already present on the first bucket. This keeps a safe
+	// retry from replacing a valid previous-close calculation with zeros.
+	if previousClose <= 0 {
+		lastStart := bars[len(bars)-1].StartMS
+		existing, err := store.BarsInRange(ctx, first.Exchange, first.Symbol, first.Timeframe, first.StartMS, lastStart)
+		if err != nil {
+			return nil, err
+		}
+		byStart := make(map[int64]market.Bar, len(existing))
+		for _, bar := range existing {
+			byStart[bar.StartMS] = bar
+		}
+		for index := range bars {
+			if old, ok := byStart[bars[index].StartMS]; ok {
+				bars[index].PrevClose = old.PrevClose
+				bars[index].Chg = old.Chg
+				bars[index].Amp = old.Amp
+			}
+		}
+	}
+	for index := range bars {
+		if previousClose > 0 {
+			bars[index] = aggregator.ApplyDerived(bars[index], previousClose)
+		}
+		previousClose = bars[index].ClosePrice
+	}
+	return bars, nil
 }
 
 func retainedStartMS(tf string, requestedStartMS int64, now time.Time) int64 {

@@ -550,8 +550,8 @@ func formatMS(value int64) string {
 
 func formatIntegrity(summary IntegritySummary) string {
 	const maxDetails = 20
-	lines := []string{fmt.Sprintf("checked=%d, missing=%d, mismatch=%d, invalid_ohlc=%d, affected=%d",
-		summary.CheckedSymbols, summary.Missing, summary.Mismatch, summary.InvalidOHLC, len(summary.Affected))}
+	lines := []string{fmt.Sprintf("checked=%d, missing=%d, mismatch=%d, invalid_ohlc=%d, source_incomplete=%d, affected=%d",
+		summary.CheckedSymbols, summary.Missing, summary.Mismatch, summary.InvalidOHLC, summary.SourceIncomplete, len(summary.Affected))}
 	if len(summary.Issues) == 0 {
 		return lines[0]
 	}
@@ -561,8 +561,12 @@ func formatIntegrity(summary IntegritySummary) string {
 		displayCount = maxDetails
 	}
 	for _, issue := range summary.Issues[:displayCount] {
-		lines = append(lines, fmt.Sprintf("- `%s:%s`, `%s`, `%s`, `%s`",
-			issue.Exchange, issue.Symbol, issue.Timeframe, time.UnixMilli(issue.StartMS).UTC().Format(time.RFC3339), issue.Type))
+		detail := fmt.Sprintf("- `%s:%s`, `%s`, `%s`, `%s`",
+			issue.Exchange, issue.Symbol, issue.Timeframe, time.UnixMilli(issue.StartMS).UTC().Format(time.RFC3339), issue.Type)
+		if issue.Type == "source_incomplete" {
+			detail += fmt.Sprintf("，源 `%s`=%d/%d，无法校验", issue.SourceTimeframe, issue.ActualSourceBars, issue.ExpectedSourceBars)
+		}
+		lines = append(lines, detail)
 	}
 	if omitted := len(summary.Issues) - displayCount; omitted > 0 {
 		lines = append(lines, fmt.Sprintf("- 其余 `%d` 条异常已省略", omitted))

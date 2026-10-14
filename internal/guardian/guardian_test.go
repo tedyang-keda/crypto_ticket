@@ -10,6 +10,7 @@ import (
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/storage"
+	"crypto-ticket/internal/timeframe"
 )
 
 func TestHandleFinalBarDetectsWatermarkGapAndRepairs(t *testing.T) {
@@ -155,6 +156,88 @@ func TestGuardianUsesForwardAdjustmentForOKX(t *testing.T) {
 	}
 }
 
+func TestDailyRepairMissingMismatchAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1D")
+	official := dailyTestBar(base, 100, 110, 99, 105)
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{official}}
+	repairer := &storeRepairer{store: store}
+	g := New(store, repairer, []Fetcher{fetcher}, Config{Enabled: true})
+
+	result, err := g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true,
+	})
+	if err != nil || result.Repaired != 1 || len(repairer.bars) != 1 {
+		t.Fatalf("expected missing daily repair, result=%+v err=%v bars=%d", result, err, len(repairer.bars))
+	}
+	result, err = g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true,
+	})
+	if err != nil || result.Repaired != 0 || len(repairer.bars) != 1 {
+		t.Fatalf("expected idempotent daily repair, result=%+v err=%v bars=%d", result, err, len(repairer.bars))
+	}
+	bad := official
+	bad.ClosePrice = 106
+	fetcher.bars = []market.Bar{bad}
+	result, err = g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true,
+	})
+	if err != nil || result.Repaired != 1 {
+		t.Fatalf("expected daily mismatch repair, result=%+v err=%v", result, err)
+	}
+}
+
+func TestDailyRepairRejectsNonFinalAndEmptyExisting(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1D")
+	official := dailyTestBar(base, 100, 110, 99, 105)
+	official.IsFinal = false
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{official}}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{Enabled: true})
+	if _, err := g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true,
+	}); err == nil {
+		t.Fatal("expected non-final official response to fail")
+	}
+	if err := store.UpsertBars(ctx, []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}); err != nil {
+		t.Fatal(err)
+	}
+	fetcher.bars = nil
+	if _, err := g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test",
+	}); err == nil {
+		t.Fatal("expected empty response with local data to fail")
+	}
+}
+
+func TestDailyAuditRunsWithObserverDisabled(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	base := timeframe.FloorStartMS(now.Add(-24*time.Hour).UnixMilli(), "1D")
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base}}); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}}
+	repairer := &storeRepairer{store: store}
+	g := New(store, repairer, []Fetcher{fetcher}, Config{Enabled: true, DailyAuditEnabled: true, ObserveFinalBars: false, DailyAuditDays: 2})
+	g.now = func() time.Time { return now }
+	if err := g.DailyAuditOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(repairer.bars) == 0 || g.cfg.ObserveFinalBars {
+		t.Fatalf("expected daily repair with observer disabled, bars=%d cfg=%+v", len(repairer.bars), g.cfg)
+	}
+	if err := g.ObserveFinalBar(ctx, testBar(base, 100, 101, 99, 100, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(g.finalBars); got != 0 {
+		t.Fatalf("observer disabled should not enqueue final bar, got %d", got)
+	}
+}
+
 type fakeFetcher struct {
 	name        string
 	marketType  string
@@ -166,6 +249,25 @@ type countingFetcher struct {
 	name       string
 	marketType string
 	count      int
+}
+
+type timeframeFetcher struct {
+	name       string
+	marketType string
+	bars       []market.Bar
+}
+
+func (f *timeframeFetcher) Name() string       { return f.name }
+func (f *timeframeFetcher) MarketType() string { return f.marketType }
+func (f *timeframeFetcher) FetchKlines(_ context.Context, _ *http.Client, request exchange.KlineRequest) ([]market.Bar, error) {
+	var out []market.Bar
+	for _, bar := range f.bars {
+		if bar.Symbol != request.Symbol || bar.Timeframe != request.Timeframe || bar.StartMS < request.StartMS || bar.StartMS > request.EndMS {
+			continue
+		}
+		out = append(out, bar)
+	}
+	return out, nil
 }
 
 func (f *countingFetcher) Name() string       { return f.name }
@@ -240,5 +342,15 @@ func testBar(startMS int64, open float64, high float64, low float64, closePrice 
 		OpenPrice: open, HighPrice: high, LowPrice: low, ClosePrice: closePrice,
 		Volume: volume, QuoteVolume: volume * closePrice, TradeCount: int64(volume),
 		LastTickMS: startMS + 59_999, IsFinal: true, Source: "rest", Reason: "test",
+	})
+}
+
+func dailyTestBar(startMS int64, open float64, high float64, low float64, closePrice float64) market.Bar {
+	return market.DecorateBar(market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1D",
+		StartMS: startMS, EndMS: timeframe.EndMS(startMS, "1D"),
+		OpenPrice: open, HighPrice: high, LowPrice: low, ClosePrice: closePrice,
+		Volume: 1, QuoteVolume: closePrice, TradeCount: 1,
+		LastTickMS: timeframe.EndMS(startMS, "1D"), IsFinal: true, Source: "rest", Reason: "test",
 	})
 }

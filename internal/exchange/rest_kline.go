@@ -310,6 +310,7 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 			break
 		}
 		oldest := page[0].StartMS
+		accepted := 0
 		for _, item := range page {
 			if item.StartMS < oldest {
 				oldest = item.StartMS
@@ -323,10 +324,11 @@ func (a *OKXAdapter) FetchKlines(ctx context.Context, client *http.Client, reque
 			if !seen[item.StartMS] {
 				seen[item.StartMS] = true
 				all = append(all, item)
+				accepted++
 			}
 		}
 		if remaining > 0 {
-			remaining -= len(page)
+			remaining -= accepted
 			if remaining <= 0 {
 				break
 			}

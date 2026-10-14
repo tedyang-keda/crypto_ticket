@@ -23,6 +23,7 @@ type Config struct {
 	SymbolRefreshInterval time.Duration
 	ReconnectBaseDelay    time.Duration
 	ReconnectMaxDelay     time.Duration
+	ReconnectResetAfter   time.Duration
 	SubscriptionChunkSize int
 	WSPingInterval        time.Duration
 	WSPongWait            time.Duration
@@ -108,16 +109,20 @@ func (r *Runner) runExchange(ctx context.Context, runtime Runtime) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := r.connectOnce(ctx, runtime.Adapter, cfg)
+		stable, err := r.connectOnce(ctx, runtime.Adapter, cfg)
+		if stable {
+			backoff = cfg.ReconnectBaseDelay
+		}
 		if err == nil {
 			backoff = cfg.ReconnectBaseDelay
 			continue
 		}
-		if ctx.Err() == nil {
-			log.Printf("%s %s collector reconnect after error: %v", runtime.Adapter.Name(), runtime.Adapter.MarketType(), err)
-			if r.observer != nil {
-				r.observer.CollectorReconnect(runtime.Adapter.Name(), runtime.Adapter.MarketType())
-			}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("%s %s collector reconnect after error: %v", runtime.Adapter.Name(), runtime.Adapter.MarketType(), err)
+		if r.observer != nil {
+			r.observer.CollectorReconnect(runtime.Adapter.Name(), runtime.Adapter.MarketType())
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -130,16 +135,16 @@ func (r *Runner) runExchange(ctx context.Context, runtime Runtime) error {
 	}
 }
 
-func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg Config) error {
+func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg Config) (stable bool, err error) {
 	symbols, err := r.refreshSymbols(ctx, adapter)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(symbols) == 0 {
-		return errors.New("no active symbols")
+		return false, errors.New("no active symbols")
 	}
 	if staticAdapter, ok := adapter.(exchange.StaticStreamAdapter); ok {
-		return r.connectStaticStreams(ctx, adapter, staticAdapter, symbols, cfg)
+		return false, r.connectStaticStreams(ctx, adapter, staticAdapter, symbols, cfg)
 	}
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, adapter.WSURL(), nil)
@@ -147,14 +152,16 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
+	health := newReconnectHealth(cfg)
+	defer func() { stable = health.stable }()
 
 	requestID := time.Now().UnixNano() % math.MaxInt32
 	requestID, err = sendSubscriptions(conn, adapter, symbols, requestID, cfg.SubscriptionChunkSize)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if r.observer != nil {
 		r.observer.CollectorConnection(adapter.Name(), adapter.MarketType(), 1)
@@ -165,19 +172,19 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 	refreshAt := time.Now().Add(cfg.SymbolRefreshInterval)
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 		if cfg.SymbolRefreshInterval > 0 && !time.Now().Before(refreshAt) {
 			symbols, requestID, err = r.refreshConnectionSubscriptions(ctx, conn, adapter, symbols, requestID, cfg)
 			if err != nil {
-				return err
+				return false, err
 			}
 			refreshAt = time.Now().Add(cfg.SymbolRefreshInterval)
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return false, err
 		}
 		if r.observer != nil {
 			r.observer.CollectorMessage(adapter.Name(), adapter.MarketType())
@@ -190,6 +197,7 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 			}
 			continue
 		}
+		health.recordActivity()
 		for _, bar := range bars {
 			if r.observer != nil {
 				r.observer.CollectorBarReceived(adapter.Name(), adapter.MarketType(), bar)
@@ -198,7 +206,7 @@ func (r *Runner) connectOnce(ctx context.Context, adapter exchange.Adapter, cfg 
 				if r.observer != nil {
 					r.observer.CollectorIngestError(adapter.Name(), adapter.MarketType())
 				}
-				return err
+				return false, err
 			}
 			if r.observer != nil {
 				r.observer.CollectorIngested(adapter.Name(), adapter.MarketType(), bar)
@@ -266,7 +274,7 @@ func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, s
 		if ctx.Err() != nil {
 			return
 		}
-		connected, err := r.readStaticStream(ctx, adapter, staticAdapter.StaticStreamURL(symbols), symbols, index, cfg)
+		stable, err := r.readStaticStream(ctx, adapter, staticAdapter.StaticStreamURL(symbols), symbols, index, cfg)
 		if ctx.Err() != nil {
 			return
 		}
@@ -278,7 +286,7 @@ func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, s
 		if r.observer != nil {
 			r.observer.CollectorReconnect(adapter.Name(), adapter.MarketType())
 		}
-		if connected {
+		if stable {
 			backoff = cfg.ReconnectBaseDelay
 			if backoff <= 0 {
 				backoff = time.Second
@@ -295,7 +303,7 @@ func (r *Runner) runStaticShard(ctx context.Context, adapter exchange.Adapter, s
 	}
 }
 
-func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, symbols []string, index int, cfg Config) (bool, error) {
+func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter, wsURL string, symbols []string, index int, cfg Config) (stable bool, err error) {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if r.observer != nil {
 		r.observer.CollectorConnectAttempt(adapter.Name(), adapter.MarketType(), err == nil)
@@ -304,18 +312,22 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 		return false, err
 	}
 	defer conn.Close()
+	health := newReconnectHealth(cfg)
+	defer func() { stable = health.stable }()
 	pingInterval, pongWait := websocketHeartbeatDurations(cfg)
 	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 		return false, err
 	}
 	defaultPingHandler := conn.PingHandler()
 	conn.SetPingHandler(func(data string) error {
+		health.recordActivity()
 		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 			return err
 		}
 		return defaultPingHandler(data)
 	})
 	conn.SetPongHandler(func(string) error {
+		health.recordActivity()
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 	heartbeatDone := make(chan struct{})
@@ -330,19 +342,19 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 		adapter.Name(), adapter.MarketType(), index, len(symbols), shardSymbolRange(symbols))
 	for {
 		if ctx.Err() != nil {
-			return true, ctx.Err()
+			return false, ctx.Err()
 		}
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
-				return true, ctx.Err()
+				return false, ctx.Err()
 			}
 			select {
 			case heartbeatError := <-heartbeatErr:
-				return true, fmt.Errorf("websocket heartbeat failed: %w", heartbeatError)
+				return false, fmt.Errorf("websocket heartbeat failed: %w", heartbeatError)
 			default:
 			}
-			return true, err
+			return false, err
 		}
 		if r.observer != nil {
 			r.observer.CollectorMessage(adapter.Name(), adapter.MarketType())
@@ -355,6 +367,7 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 			}
 			continue
 		}
+		health.recordActivity()
 		for _, bar := range bars {
 			if r.observer != nil {
 				r.observer.CollectorBarReceived(adapter.Name(), adapter.MarketType(), bar)
@@ -363,12 +376,35 @@ func (r *Runner) readStaticStream(ctx context.Context, adapter exchange.Adapter,
 				if r.observer != nil {
 					r.observer.CollectorIngestError(adapter.Name(), adapter.MarketType())
 				}
-				return true, err
+				return false, err
 			}
 			if r.observer != nil {
 				r.observer.CollectorIngested(adapter.Name(), adapter.MarketType(), bar)
 			}
 		}
+	}
+}
+
+// A successful handshake alone must not erase repeated short connection
+// failures. Reset the retry delay only after an established session has stayed
+// responsive for the stability window, including heartbeat-only idle streams.
+type reconnectHealth struct {
+	connectedAt time.Time
+	resetAfter  time.Duration
+	stable      bool
+}
+
+func newReconnectHealth(cfg Config) *reconnectHealth {
+	resetAfter := cfg.ReconnectResetAfter
+	if resetAfter <= 0 {
+		resetAfter = 30 * time.Second
+	}
+	return &reconnectHealth{connectedAt: time.Now(), resetAfter: resetAfter}
+}
+
+func (h *reconnectHealth) recordActivity() {
+	if time.Since(h.connectedAt) >= h.resetAfter {
+		h.stable = true
 	}
 }
 

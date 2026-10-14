@@ -103,6 +103,7 @@ go run ./cmd/marketd
 | `MYSQL_DSN` | 从 `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_DATABASE` 拼出 | MySQL DSN |
 | `ENABLE_COLLECTOR` | `false` | 是否启动 Binance / OKX WebSocket collector |
 | `ENABLE_KLINE_GUARDIAN` | `false` | 是否启动轻量 K 线守护者；需要 REST 校验/修复时显式开启 |
+| `KLINE_GUARDIAN_OBSERVE_FINAL_BARS` | `false` | 是否启用逐根 final 水位队列；生产默认只做周期审计，避免实时队列积压 |
 | `KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS` | `120` | 全市场近窗口 REST 校验周期 |
 | `KLINE_GUARDIAN_WINDOW_MINUTES` | `30` | 每次校验最近多少分钟的 final `1m` |
 | `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
@@ -111,6 +112,10 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_BINANCE_RPS` | `8` | Binance Guardian REST 请求速率上限 |
 | `KLINE_GUARDIAN_OKX_RPS` | `5` | OKX Guardian REST 请求速率上限 |
 | `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` | `600` | 只审计最近被 collector 刷新过的 active symbol，避免旧脏 symbol 进入 REST 校验 |
+| `KLINE_GUARDIAN_DAILY_AUDIT_ENABLED` | `true` | Guardian 开启后独立校验、补齐官方 UTC 日线，不依赖本地小时线完整性 |
+| `KLINE_GUARDIAN_DAILY_AUDIT_SECONDS` | `3600` | 日线审计启动时执行一次，之后每小时执行 |
+| `KLINE_GUARDIAN_DAILY_AUDIT_DAYS` | `7` | 每轮检查最近已结束的 7 天，并额外滚动检查一个等长历史块 |
+| `KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS` | `300` | 日线历史滚动覆盖范围；失败范围保留并重试 |
 | `ENABLE_HEALTH_MONITOR` | 跟随 `ENABLE_COLLECTOR` | 启用进程内健康评估、Prometheus 指标、P0 告警和每日摘要 |
 | `MONITOR_P1_ALERTS_ENABLED` | `false` | P1 实时飞书告警开关；关闭时仍采集指标并在日报统计 would-fire |
 | `MONITOR_EVALUATION_SECONDS` | `15` | 健康评估周期；MySQL 连续失败 3 次后产生 P0 告警 |
@@ -226,10 +231,13 @@ final `1m`：
 
 `marketd` 内置轻量 K 线守护者，用来处理 WS 断流、进程重启、写入失败后可能造成的 final `1m` 缺口或字段不一致。
 
-守护者有两条路径：
+开启 `ENABLE_KLINE_GUARDIAN=true` 后，守护者有三条路径，默认只运行两个周期任务，不注册逐根 final 观察者：
 
-1. 实时水位检测：每次 final `1m` 成功入库后，检查 `(exchange, symbol, 1m)` 的上一根 final start。若新 final start 跳过了一个或多个分钟桶，则立即用交易所 REST official `1m` kline 拉取缺口区间并修复。
+1. 可选实时水位检测（`KLINE_GUARDIAN_OBSERVE_FINAL_BARS=true`）：每次 final `1m` 成功入库后检查上一根 final start，跳过分钟桶时用官方 REST 修复。默认关闭这条路径，不影响周期补洞。
 2. 近窗口 REST 校验：默认每两分钟检查全部 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。Binance 与 OKX 分组并行，分别受各自的 RPS 配置限制。
+3. 独立日线校验：启动后和每小时校验全量 active symbols 的最近 7 根已结束 UTC 日线，以及 300 天范围内轮转的历史块。直接比较官方 `1D`（OKX 为 `1Dutc`）与本地数据，缺失或不一致通过 `MarketService.RepairFinalBars` 补写并触发已具备完整源数据的周/月等上层聚合，不要求本地 `1m/1H` 完整。日线与分钟线共享交易所独立限速；官方或写入失败会重试，不中断实时采集，也不重新启用高级周期告警。
+
+两分钟是调度间隔，不是无条件的完成保证：实际覆盖耗时取决于品种数量、官方响应时间、限速和数据库延迟；长轮次不会重叠堆积。
 
 为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
 
@@ -670,6 +678,6 @@ livebar:{exchange}:{symbol}:{timeframe}
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
 - 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
-- Kline guardian 会修复近窗口 final `1m` 缺口；超过窗口的历史需要用 backfill 或单独维护命令修复。
+- Kline Guardian 会修复近窗口 final `1m` 缺口，并独立审计补齐官方 `1D`。超过分钟审计窗口的低周期历史仍需 backfill；一次性日线补写建议显式使用 `-replace-existing=false`，避免先删除数据后 REST/写入失败留下新缺口。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。
 - 如果没有先 backfill，HTTP 历史只包含服务启动后成功写入的 final bars。

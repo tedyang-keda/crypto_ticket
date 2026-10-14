@@ -159,26 +159,33 @@ func startBackgroundWorkers(
 			return
 		}
 		worker := guardian.New(guardianStore, marketService, fetchers, guardian.Config{
-			Enabled:       true,
-			AuditInterval: time.Duration(cfg.KlineGuardianAuditIntervalSeconds) * time.Second,
-			AuditWindow:   time.Duration(cfg.KlineGuardianWindowMinutes) * time.Minute,
-			AuditDelay:    time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
-			SymbolsPerRun: cfg.KlineGuardianSymbolsPerRun,
-			RequestDelay:  time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
+			Enabled:          true,
+			ObserveFinalBars: cfg.KlineGuardianObserveFinalBars,
+			AuditInterval:    time.Duration(cfg.KlineGuardianAuditIntervalSeconds) * time.Second,
+			AuditWindow:      time.Duration(cfg.KlineGuardianWindowMinutes) * time.Minute,
+			AuditDelay:       time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
+			SymbolsPerRun:    cfg.KlineGuardianSymbolsPerRun,
+			RequestDelay:     time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
 			RequestIntervals: map[string]time.Duration{
 				"binance": requestInterval(cfg.KlineGuardianBinanceRPS),
 				"okx":     requestInterval(cfg.KlineGuardianOKXRPS),
 			},
-			SymbolMaxAge: time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
-			Observer:     registry,
+			SymbolMaxAge:           time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
+			Observer:               registry,
+			DailyAuditEnabled:      cfg.KlineGuardianDailyAuditEnabled,
+			DailyAuditInterval:     time.Duration(cfg.KlineGuardianDailyAuditSeconds) * time.Second,
+			DailyAuditDays:         cfg.KlineGuardianDailyAuditDays,
+			DailyAuditLookbackDays: cfg.KlineGuardianDailyLookbackDays,
 		})
-		marketService.AddFinalBarObserver(worker)
+		if cfg.KlineGuardianObserveFinalBars {
+			marketService.AddFinalBarObserver(worker)
+		}
 		go func() {
 			if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
 				errCh <- err
 			}
 		}()
-		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds symbols_per_run=%d binance_rps=%d okx_rps=%d",
+		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds symbols_per_run=%d binance_rps=%d okx_rps=%d observe_finals=%t daily_audit=%t daily_interval=%ds daily_days=%d daily_lookback_days=%d",
 			len(fetchers),
 			cfg.KlineGuardianAuditIntervalSeconds,
 			cfg.KlineGuardianWindowMinutes,
@@ -186,6 +193,11 @@ func startBackgroundWorkers(
 			cfg.KlineGuardianSymbolsPerRun,
 			cfg.KlineGuardianBinanceRPS,
 			cfg.KlineGuardianOKXRPS,
+			cfg.KlineGuardianObserveFinalBars,
+			cfg.KlineGuardianDailyAuditEnabled,
+			cfg.KlineGuardianDailyAuditSeconds,
+			cfg.KlineGuardianDailyAuditDays,
+			cfg.KlineGuardianDailyLookbackDays,
 		)
 	}
 	if cfg.EnableCorporateAction {

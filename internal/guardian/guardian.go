@@ -20,28 +20,36 @@ import (
 )
 
 const (
-	defaultAuditInterval  = 2 * time.Minute
-	defaultAuditWindow    = 30 * time.Minute
-	defaultAuditDelay     = 2 * time.Minute
-	defaultHTTPTimeout    = 20 * time.Second
-	defaultQueueSize      = 4096
-	defaultSymbolMaxAge   = 10 * time.Minute
-	defaultFloatTolerance = 1e-8
+	defaultAuditInterval          = 2 * time.Minute
+	defaultAuditWindow            = 30 * time.Minute
+	defaultAuditDelay             = 2 * time.Minute
+	defaultHTTPTimeout            = 20 * time.Second
+	defaultQueueSize              = 4096
+	defaultSymbolMaxAge           = 10 * time.Minute
+	defaultFloatTolerance         = 1e-8
+	defaultDailyAuditInterval     = time.Hour
+	defaultDailyAuditDays         = 7
+	defaultDailyAuditLookbackDays = 300
 )
 
 type Config struct {
-	Enabled          bool
-	AuditInterval    time.Duration
-	AuditWindow      time.Duration
-	AuditDelay       time.Duration
-	RequestDelay     time.Duration
-	HTTPTimeout      time.Duration
-	QueueSize        int
-	SymbolsPerRun    int
-	SymbolMaxAge     time.Duration
-	FloatTolerance   float64
-	RequestIntervals map[string]time.Duration
-	Observer         Observer
+	Enabled                bool
+	ObserveFinalBars       bool
+	DailyAuditEnabled      bool
+	DailyAuditInterval     time.Duration
+	DailyAuditDays         int
+	DailyAuditLookbackDays int
+	AuditInterval          time.Duration
+	AuditWindow            time.Duration
+	AuditDelay             time.Duration
+	RequestDelay           time.Duration
+	HTTPTimeout            time.Duration
+	QueueSize              int
+	SymbolsPerRun          int
+	SymbolMaxAge           time.Duration
+	FloatTolerance         float64
+	RequestIntervals       map[string]time.Duration
+	Observer               Observer
 }
 
 type Observer interface {
@@ -84,13 +92,18 @@ type Guardian struct {
 	auditCursor        int
 	observer           Observer
 	requestPacers      map[string]*requestPacer
+	dailyAuditMu       sync.Mutex
+	dailyAuditCursor   int
+	dailyRetries       map[string]map[dailyAuditRange]bool
+	now                func() time.Time
 }
 
 type auditTarget struct {
-	Exchange   string
-	Symbol     string
-	MarketType string
-	Fetcher    Fetcher
+	Exchange      string
+	Symbol        string
+	MarketType    string
+	Fetcher       Fetcher
+	FirstSeenAtMS int64
 }
 
 type repairResult struct {
@@ -123,6 +136,8 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		fetchersByExchange: make(map[string][]Fetcher),
 		requestPacers:      make(map[string]*requestPacer),
 		observer:           cfg.Observer,
+		dailyRetries:       make(map[string]map[dailyAuditRange]bool),
+		now:                time.Now,
 	}
 	for _, fetcher := range fetchers {
 		if fetcher == nil {
@@ -146,6 +161,18 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 func normalizeConfig(cfg Config) Config {
 	if cfg.AuditInterval <= 0 {
 		cfg.AuditInterval = defaultAuditInterval
+	}
+	if cfg.DailyAuditInterval <= 0 {
+		cfg.DailyAuditInterval = defaultDailyAuditInterval
+	}
+	if cfg.DailyAuditDays <= 0 {
+		cfg.DailyAuditDays = defaultDailyAuditDays
+	}
+	if cfg.DailyAuditLookbackDays <= 0 {
+		cfg.DailyAuditLookbackDays = defaultDailyAuditLookbackDays
+	}
+	if cfg.DailyAuditDays > cfg.DailyAuditLookbackDays {
+		cfg.DailyAuditDays = cfg.DailyAuditLookbackDays
 	}
 	if cfg.AuditWindow <= 0 {
 		cfg.AuditWindow = defaultAuditWindow
@@ -179,7 +206,7 @@ func normalizeConfig(cfg Config) Config {
 }
 
 func (g *Guardian) ObserveFinalBar(_ context.Context, bar market.Bar) error {
-	if !g.cfg.Enabled || !bar.IsFinal || bar.Timeframe != aggregator.OneMinute {
+	if !g.cfg.Enabled || !g.cfg.ObserveFinalBars || !bar.IsFinal || bar.Timeframe != aggregator.OneMinute {
 		return nil
 	}
 	select {
@@ -197,10 +224,18 @@ func (g *Guardian) Run(ctx context.Context) error {
 	if !g.cfg.Enabled {
 		return nil
 	}
-	errCh := make(chan error, 2)
-	go func() { errCh <- g.runObservedFinals(ctx) }()
+	errCh := make(chan error, 3)
+	workers := 1
+	if g.cfg.ObserveFinalBars {
+		workers++
+		go func() { errCh <- g.runObservedFinals(ctx) }()
+	}
 	go func() { errCh <- g.runAudits(ctx) }()
-	for i := 0; i < 2; i++ {
+	if g.cfg.DailyAuditEnabled {
+		workers++
+		go func() { errCh <- g.runDailyAudits(ctx) }()
+	}
+	for i := 0; i < workers; i++ {
 		err := <-errCh
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
@@ -270,7 +305,7 @@ func (g *Guardian) handleFinalBar(ctx context.Context, bar market.Bar) error {
 		previousStart = baseline
 	}
 
-	now := market.NowMS()
+	now := g.now().UnixMilli()
 	nextExpected := int64(0)
 	var events []market.KlineGuardianEvent
 	reloadState := false
@@ -416,13 +451,14 @@ func (g *Guardian) auditTargetGroup(ctx context.Context, targets []auditTarget, 
 		if ctx.Err() != nil {
 			return summary
 		}
+		retry, retryErr := g.retryFailedRepair(ctx, target.Fetcher, target.Exchange, target.Symbol, aggregator.OneMinute)
 		result, err := g.repairRangeWithFetcher(ctx, target.Fetcher, target.Exchange, target.Symbol, startMS, endMS, "window_audit")
 		summary.CheckedSymbols++
-		summary.CheckedBars += result.Checked
-		if err != nil {
+		summary.CheckedBars += result.Checked + retry.Checked
+		if err != nil || retryErr != nil {
 			summary.FailedSymbols++
 			if ctx.Err() == nil {
-				log.Printf("kline guardian target audit failed exchange=%s symbol=%s err=%v", target.Exchange, target.Symbol, err)
+				log.Printf("kline guardian target audit failed exchange=%s symbol=%s err=%v retry_err=%v", target.Exchange, target.Symbol, err, retryErr)
 			}
 		}
 	}
@@ -430,13 +466,13 @@ func (g *Guardian) auditTargetGroup(ctx context.Context, targets []auditTarget, 
 }
 
 func (g *Guardian) auditEndStart() int64 {
-	eligibleEnd := market.NowMS() - int64(g.cfg.AuditDelay/time.Millisecond)
+	eligibleEnd := g.now().UnixMilli() - int64(g.cfg.AuditDelay/time.Millisecond)
 	return timeframe.FloorStartMS(eligibleEnd, aggregator.OneMinute) - timeframe.MinuteMS
 }
 
 func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 	activeOnly := true
-	now := market.NowMS()
+	now := g.now().UnixMilli()
 	var targets []auditTarget
 	for exchangeName := range g.fetchersByExchange {
 		symbols, err := g.store.ListSymbols(ctx, exchangeName, &activeOnly)
@@ -455,10 +491,11 @@ func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 				continue
 			}
 			targets = append(targets, auditTarget{
-				Exchange:   normalizeExchange(symbol.Exchange),
-				Symbol:     normalizeSymbol(symbol.Symbol),
-				MarketType: normalizeMarketType(symbol.MarketType),
-				Fetcher:    fetcher,
+				Exchange:      normalizeExchange(symbol.Exchange),
+				Symbol:        normalizeSymbol(symbol.Symbol),
+				MarketType:    normalizeMarketType(symbol.MarketType),
+				Fetcher:       fetcher,
+				FirstSeenAtMS: symbol.FirstSeenAtMS,
 			})
 		}
 	}
@@ -486,77 +523,10 @@ func (g *Guardian) repairRange(ctx context.Context, exchangeName string, symbol 
 }
 
 func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, exchangeName string, symbol string, startMS int64, endMS int64, reason string) (repairResult, error) {
-	exchangeName = normalizeExchange(exchangeName)
-	symbol = normalizeSymbol(symbol)
-	startMS = timeframe.FloorStartMS(startMS, aggregator.OneMinute)
-	endMS = timeframe.FloorStartMS(endMS, aggregator.OneMinute)
-	if endMS < startMS {
-		return repairResult{}, nil
-	}
-	limit := int((endMS-startMS)/timeframe.MinuteMS) + 1
-	if err := g.waitForRequest(ctx, exchangeName); err != nil {
-		return repairResult{}, err
-	}
-	official, err := fetcher.FetchKlines(ctx, g.client, exchange.KlineRequest{
-		Symbol: symbol, Timeframe: aggregator.OneMinute, StartMS: startMS, EndMS: endMS, Limit: limit,
-		Adjustment: guardianAdjustment(exchangeName),
+	return g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
+		StartMS: startMS, EndMS: endMS, Reason: reason,
 	})
-	if err != nil {
-		event := market.KlineGuardianEvent{
-			Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
-			StartMS: startMS, EndMS: endMS, EventType: "rest_error", NewValueJSON: quoteError(err), CreatedAtMS: market.NowMS(),
-		}
-		_ = g.insertEvents(ctx, []market.KlineGuardianEvent{event})
-		g.upsertAuditState(ctx, exchangeName, symbol, startMS, endMS, "rest_error")
-		return repairResult{}, err
-	}
-	official, err = g.applyCorporateActionFactors(ctx, exchangeName, symbol, official)
-	if err != nil {
-		return repairResult{}, err
-	}
-	local, err := g.store.BarsInRange(ctx, exchangeName, symbol, aggregator.OneMinute, startMS, endMS)
-	if err != nil {
-		return repairResult{}, err
-	}
-	result := g.diffOfficialBars(exchangeName, symbol, official, local, reason)
-	if result.Repaired > 0 {
-		toRepair := make([]market.Bar, 0, result.Repaired)
-		for _, event := range result.Events {
-			if event.EventType != "missing_repair" && event.EventType != "mismatch_repair" {
-				continue
-			}
-			for _, bar := range official {
-				if bar.StartMS == event.StartMS {
-					bar.Source = "rest"
-					bar.Reason = "guardian_" + reason
-					bar.IsFinal = true
-					bar.UpdatedAtMS = market.NowMS()
-					toRepair = append(toRepair, market.DecorateBar(bar))
-					break
-				}
-			}
-		}
-		if err := g.repairer.RepairFinalBars(ctx, toRepair); err != nil {
-			_ = g.insertEvents(ctx, []market.KlineGuardianEvent{{
-				Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
-				StartMS: startMS, EndMS: endMS, EventType: "repair_error", NewValueJSON: quoteError(err), CreatedAtMS: market.NowMS(),
-			}})
-			return result, err
-		}
-	}
-	if len(result.Events) > 0 {
-		if err := g.insertEvents(ctx, result.Events); err != nil {
-			return result, err
-		}
-	}
-	status := "ok"
-	if result.Repaired > 0 {
-		status = "repaired"
-	}
-	if err := g.upsertAuditState(ctx, exchangeName, symbol, startMS, endMS, status); err != nil {
-		return result, err
-	}
-	return result, nil
 }
 
 func (g *Guardian) waitForRequest(ctx context.Context, exchangeName string) error {
@@ -650,55 +620,11 @@ func (g *Guardian) applyCorporateActionFactors(ctx context.Context, exchangeName
 	return out, nil
 }
 
-func (g *Guardian) diffOfficialBars(exchangeName string, symbol string, official []market.Bar, local []market.Bar, reason string) repairResult {
-	now := market.NowMS()
-	localByStart := make(map[int64]market.Bar, len(local))
-	for _, bar := range local {
-		localByStart[bar.StartMS] = bar
-	}
-	var result repairResult
-	for _, officialBar := range official {
-		if !officialBar.IsFinal || officialBar.Timeframe != aggregator.OneMinute {
-			continue
-		}
-		result.Checked++
-		localBar, ok := localByStart[officialBar.StartMS]
-		if !ok {
-			result.Repaired++
-			result.Events = append(result.Events, market.KlineGuardianEvent{
-				Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
-				StartMS: officialBar.StartMS, EndMS: officialBar.EndMS, EventType: "missing_repair",
-				NewValueJSON: barJSON(officialBar), CreatedAtMS: now,
-			})
-			continue
-		}
-		if barsDiffer(localBar, officialBar, g.cfg.FloatTolerance) {
-			result.Repaired++
-			result.Events = append(result.Events, market.KlineGuardianEvent{
-				Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
-				StartMS: officialBar.StartMS, EndMS: officialBar.EndMS, EventType: "mismatch_repair",
-				OldValueJSON: barJSON(localBar), NewValueJSON: barJSON(officialBar), CreatedAtMS: now,
-			})
-		}
-	}
-	return result
-}
-
 func (g *Guardian) upsertAuditState(ctx context.Context, exchangeName string, symbol string, startMS int64, endMS int64, status string) error {
-	now := market.NowMS()
-	state, err := g.store.LoadKlineGuardianState(ctx, exchangeName, symbol, aggregator.OneMinute)
-	if err != nil {
-		return err
-	}
-	if state == nil {
-		state = &market.KlineGuardianState{Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute}
-	}
-	state.LastCheckedStartMS = startMS
-	state.LastCheckedEndMS = endMS
-	state.LastCheckedAtMS = now
-	state.Status = status
-	state.UpdatedAtMS = now
-	return g.store.UpsertKlineGuardianState(ctx, *state)
+	return g.upsertTimeframeAuditState(ctx, timeframeRepairRequest{
+		Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
+		StartMS: startMS, EndMS: endMS,
+	}, status)
 }
 
 func (g *Guardian) fetcherForSymbol(ctx context.Context, exchangeName string, symbol string) (Fetcher, error) {

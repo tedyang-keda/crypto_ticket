@@ -270,6 +270,32 @@ func TestOKXFetchKlinesContinuesAfterShortHistoryPage(t *testing.T) {
 	}
 }
 
+func TestOKXFetchKlinesLimitCountsOnlyRequestedWindow(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return jsonResponse(`{"code":"0","data":[["240000","10","10","10","10","1","1","10","1"],["180000","10","10","10","10","1","1","10","1"]]}`), nil
+		case 2:
+			if got := r.URL.Query().Get("limit"); got != "1" {
+				t.Fatalf("expected one remaining requested bar, got limit=%s", got)
+			}
+			return jsonResponse(`{"code":"0","data":[["120000","10","10","10","10","1","1","10","1"]]}`), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})}
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{
+		Symbol: "TEST-USDT-SWAP", Timeframe: "1m", StartMS: 120_000, EndMS: 180_000, Limit: 2,
+	})
+	if err != nil || len(bars) != 2 || requests != 2 {
+		t.Fatalf("end-filtered row consumed requested limit: bars=%v requests=%d err=%v", bars, requests, err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
