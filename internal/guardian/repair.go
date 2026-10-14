@@ -45,14 +45,11 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	if state != nil && state.Status == "repair_error" && request.StartMS <= state.LastCheckedEndMS && request.EndMS >= state.LastCheckedStartMS {
 		request.ForceReplay = true
 	}
-	if err := g.waitForRequest(ctx, request.Exchange); err != nil {
-		return repairResult{}, err
-	}
 	limit := 0
 	for start := request.StartMS; start <= request.EndMS; start = timeframe.NextStartMS(start, tf) {
 		limit++
 	}
-	official, err := fetcher.FetchKlines(ctx, g.client, exchange.KlineRequest{
+	official, err := g.fetchKlines(ctx, fetcher, exchange.KlineRequest{
 		Symbol: request.Symbol, Timeframe: tf, StartMS: request.StartMS, EndMS: request.EndMS, Limit: limit,
 		Adjustment: guardianAdjustment(request.Exchange),
 	})
@@ -255,8 +252,14 @@ func (g *Guardian) upsertTimeframeAuditState(ctx context.Context, request timefr
 		state = &market.KlineGuardianState{Exchange: request.Exchange, Symbol: request.Symbol, Timeframe: request.Timeframe}
 	}
 	// A successful unrelated range cannot erase a pending upper-rollup retry.
-	if state.Status == "repair_error" && status != "repair_error" &&
+	if isRetryableDailyStatus(state.Status) && !isRetryableDailyStatus(status) &&
 		(request.StartMS > state.LastCheckedStartMS || request.EndMS < state.LastCheckedEndMS) {
+		return nil
+	}
+	if isRetryableDailyStatus(state.Status) && isRetryableDailyStatus(status) &&
+		(request.StartMS > state.LastCheckedStartMS || request.EndMS < state.LastCheckedEndMS) {
+		// Keep the older persisted retry until its own range is revisited. Other
+		// failures remain in dailyRetries and will be retried each hourly pass.
 		return nil
 	}
 	state.LastCheckedStartMS = request.StartMS

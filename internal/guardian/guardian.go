@@ -30,6 +30,7 @@ const (
 	defaultDailyAuditInterval     = time.Hour
 	defaultDailyAuditDays         = 7
 	defaultDailyAuditLookbackDays = 300
+	defaultMaxInflightPerExchange = 8
 )
 
 type Config struct {
@@ -46,6 +47,7 @@ type Config struct {
 	HTTPTimeout            time.Duration
 	QueueSize              int
 	SymbolsPerRun          int
+	MaxInflightPerExchange int
 	SymbolMaxAge           time.Duration
 	FloatTolerance         float64
 	RequestIntervals       map[string]time.Duration
@@ -90,8 +92,11 @@ type Guardian struct {
 	fetchersByMarket   map[string]Fetcher
 	fetchersByExchange map[string][]Fetcher
 	auditCursor        int
+	auditRunMu         sync.Mutex
 	observer           Observer
 	requestPacers      map[string]*requestPacer
+	requestSlots       map[string]chan struct{}
+	dailyRunMu         sync.Mutex
 	dailyAuditMu       sync.Mutex
 	dailyAuditCursor   int
 	dailyRetries       map[string]map[dailyAuditRange]bool
@@ -130,11 +135,11 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		cfg:                cfg,
 		store:              store,
 		repairer:           repairer,
-		client:             &http.Client{Timeout: cfg.HTTPTimeout},
 		finalBars:          make(chan market.Bar, cfg.QueueSize),
 		fetchersByMarket:   make(map[string]Fetcher),
 		fetchersByExchange: make(map[string][]Fetcher),
 		requestPacers:      make(map[string]*requestPacer),
+		requestSlots:       make(map[string]chan struct{}),
 		observer:           cfg.Observer,
 		dailyRetries:       make(map[string]map[dailyAuditRange]bool),
 		now:                time.Now,
@@ -153,7 +158,12 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 				interval = configured
 			}
 			g.requestPacers[exchangeName] = &requestPacer{interval: interval}
+			g.requestSlots[exchangeName] = make(chan struct{}, cfg.MaxInflightPerExchange)
 		}
+	}
+	g.client = &http.Client{
+		Timeout:   cfg.HTTPTimeout,
+		Transport: requestPacingTransport{base: http.DefaultTransport, pacers: g.requestPacers},
 	}
 	return g
 }
@@ -188,6 +198,12 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.SymbolsPerRun < 0 {
 		cfg.SymbolsPerRun = 0
+	}
+	if cfg.MaxInflightPerExchange <= 0 {
+		cfg.MaxInflightPerExchange = defaultMaxInflightPerExchange
+	}
+	if cfg.MaxInflightPerExchange > 64 {
+		cfg.MaxInflightPerExchange = 64
 	}
 	if cfg.SymbolMaxAge <= 0 {
 		cfg.SymbolMaxAge = defaultSymbolMaxAge
@@ -387,6 +403,9 @@ func (g *Guardian) AuditOnce(ctx context.Context) error {
 }
 
 func (g *Guardian) auditOnce(ctx context.Context) (auditResult, error) {
+	g.auditRunMu.Lock()
+	defer g.auditRunMu.Unlock()
+
 	endStart := g.auditEndStart()
 	if endStart <= 0 {
 		return auditResult{}, nil
@@ -447,21 +466,23 @@ func (g *Guardian) auditOnce(ctx context.Context) (auditResult, error) {
 
 func (g *Guardian) auditTargetGroup(ctx context.Context, targets []auditTarget, startMS int64, endMS int64) auditResult {
 	var summary auditResult
-	for _, target := range targets {
-		if ctx.Err() != nil {
-			return summary
-		}
+	var summaryMu sync.Mutex
+	g.runTargetPool(ctx, targets, func(ctx context.Context, target auditTarget) {
 		retry, retryErr := g.retryFailedRepair(ctx, target.Fetcher, target.Exchange, target.Symbol, aggregator.OneMinute)
 		result, err := g.repairRangeWithFetcher(ctx, target.Fetcher, target.Exchange, target.Symbol, startMS, endMS, "window_audit")
+		summaryMu.Lock()
 		summary.CheckedSymbols++
 		summary.CheckedBars += result.Checked + retry.Checked
 		if err != nil || retryErr != nil {
 			summary.FailedSymbols++
+		}
+		summaryMu.Unlock()
+		if err != nil || retryErr != nil {
 			if ctx.Err() == nil {
 				log.Printf("kline guardian target audit failed exchange=%s symbol=%s err=%v retry_err=%v", target.Exchange, target.Symbol, err, retryErr)
 			}
 		}
-	}
+	})
 	return summary
 }
 
@@ -529,36 +550,53 @@ func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, 
 	})
 }
 
-func (g *Guardian) waitForRequest(ctx context.Context, exchangeName string) error {
-	pacer := g.requestPacers[normalizeExchange(exchangeName)]
-	if pacer == nil {
-		return nil
+func (g *Guardian) fetchKlines(ctx context.Context, fetcher Fetcher, request exchange.KlineRequest) ([]market.Bar, error) {
+	exchangeName := normalizeExchange(fetcher.Name())
+	var release func()
+	if slots := g.requestSlots[exchangeName]; slots != nil {
+		select {
+		case slots <- struct{}{}:
+			release = func() { <-slots }
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	return pacer.Wait(ctx)
+	if release != nil {
+		defer release()
+	}
+	requestCtx := context.WithValue(ctx, guardianExchangeContextKey{}, exchangeName)
+	return fetcher.FetchKlines(requestCtx, g.client, request)
 }
 
 func (p *requestPacer) Wait(ctx context.Context) error {
 	if p == nil || p.interval <= 0 {
 		return nil
 	}
-	p.mu.Lock()
-	now := time.Now()
-	startAt := now
-	if p.next.After(startAt) {
-		startAt = p.next
-	}
-	p.next = startAt.Add(p.interval)
-	p.mu.Unlock()
-	if !startAt.After(now) {
-		return nil
-	}
-	timer := time.NewTimer(startAt.Sub(now))
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	for {
+		p.mu.Lock()
+		now := time.Now()
+		if !p.next.After(now) {
+			p.next = now.Add(p.interval)
+			p.mu.Unlock()
+			return nil
+		}
+		wait := p.next.Sub(now)
+		p.mu.Unlock()
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+			// Another waiter may claim this slot first; recalculate so delayed
+			// goroutines cannot bunch up and exceed the configured RPS.
+		}
 	}
 }
 

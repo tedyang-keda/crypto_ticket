@@ -5,6 +5,7 @@ import "testing"
 func TestGuardianRepairDefaults(t *testing.T) {
 	for _, name := range []string{
 		"ENABLE_KLINE_GUARDIAN", "KLINE_GUARDIAN_OBSERVE_FINAL_BARS",
+		"KLINE_GUARDIAN_MAX_INFLIGHT_PER_EXCHANGE",
 		"KLINE_GUARDIAN_DAILY_AUDIT_ENABLED", "KLINE_GUARDIAN_DAILY_AUDIT_SECONDS",
 		"KLINE_GUARDIAN_DAILY_AUDIT_DAYS", "KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS",
 	} {
@@ -20,6 +21,9 @@ func TestGuardianRepairDefaults(t *testing.T) {
 			cfg.KlineGuardianDailyAuditEnabled, cfg.KlineGuardianDailyAuditSeconds,
 			cfg.KlineGuardianDailyAuditDays, cfg.KlineGuardianDailyLookbackDays)
 	}
+	if cfg.KlineGuardianMaxInflightPerExchange != 8 {
+		t.Fatalf("unexpected Guardian per-exchange concurrency default: %d", cfg.KlineGuardianMaxInflightPerExchange)
+	}
 }
 
 func TestGuardianRepairConfiguration(t *testing.T) {
@@ -29,10 +33,12 @@ func TestGuardianRepairConfiguration(t *testing.T) {
 	t.Setenv("KLINE_GUARDIAN_DAILY_AUDIT_SECONDS", "1800")
 	t.Setenv("KLINE_GUARDIAN_DAILY_AUDIT_DAYS", "14")
 	t.Setenv("KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS", "90")
+	t.Setenv("KLINE_GUARDIAN_MAX_INFLIGHT_PER_EXCHANGE", "8")
 	cfg := Load()
 	if !cfg.EnableKlineGuardian || cfg.KlineGuardianObserveFinalBars ||
 		!cfg.KlineGuardianDailyAuditEnabled || cfg.KlineGuardianDailyAuditSeconds != 1800 ||
-		cfg.KlineGuardianDailyAuditDays != 14 || cfg.KlineGuardianDailyLookbackDays != 90 {
+		cfg.KlineGuardianDailyAuditDays != 14 || cfg.KlineGuardianDailyLookbackDays != 90 ||
+		cfg.KlineGuardianMaxInflightPerExchange != 8 {
 		t.Fatal("Guardian repair configuration was not loaded")
 	}
 }

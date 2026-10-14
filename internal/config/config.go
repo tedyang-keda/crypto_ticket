@@ -9,54 +9,55 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                           string
-	RedisURL                           string
-	MySQLDSN                           string
-	UseMemory                          bool
-	RecentCacheLimit                   int
-	Timeframes                         []string
-	DashboardDir                       string
-	EnableMockSymbols                  bool
-	EnableCollector                    bool
-	EnableKlineGuardian                bool
-	KlineGuardianObserveFinalBars      bool
-	KlineGuardianAuditIntervalSeconds  int
-	KlineGuardianWindowMinutes         int
-	KlineGuardianDelaySeconds          int
-	KlineGuardianSymbolsPerRun         int
-	KlineGuardianRequestDelayMS        int
-	KlineGuardianBinanceRPS            int
-	KlineGuardianOKXRPS                int
-	KlineGuardianSymbolMaxAgeSeconds   int
-	KlineGuardianDailyAuditEnabled     bool
-	KlineGuardianDailyAuditSeconds     int
-	KlineGuardianDailyAuditDays        int
-	KlineGuardianDailyLookbackDays     int
-	EnableCorporateAction              bool
-	CorporateActionPollSeconds         int
-	CorporateActionMaxAttempts         int
-	CorporateActionRetryBaseSeconds    int
-	CorporateActionJobsPerRun          int
-	CorporateActionRequestDelayMS      int
-	CorporateActionAnchorSeconds       int
-	CorporateActionAnchorSymbolsPerRun int
-	FeishuWebhookURL                   string
-	EnableHealthMonitor                bool
-	MonitorP1AlertsEnabled             bool
-	MonitorEvaluationSeconds           int
-	MonitorDailyReportHour             int
-	MonitorMarketReportIntervalMinutes int
-	MonitorRedisEnabled                bool
-	MonitorIntegrityIntervalSeconds    int
-	MonitorIntegritySymbolsPerRun      int
-	MonitorIntegrityTimeframes         []string
-	MonitorDiskPath                    string
-	SymbolRefreshIntervalSeconds       int
-	ReconnectBaseDelaySeconds          int
-	ReconnectMaxDelaySeconds           int
-	CollectorWSPingIntervalSeconds     int
-	CollectorWSPongWaitSeconds         int
-	Exchanges                          []ExchangeConfig
+	HTTPAddr                            string
+	RedisURL                            string
+	MySQLDSN                            string
+	UseMemory                           bool
+	RecentCacheLimit                    int
+	Timeframes                          []string
+	DashboardDir                        string
+	EnableMockSymbols                   bool
+	EnableCollector                     bool
+	EnableKlineGuardian                 bool
+	KlineGuardianObserveFinalBars       bool
+	KlineGuardianAuditIntervalSeconds   int
+	KlineGuardianWindowMinutes          int
+	KlineGuardianDelaySeconds           int
+	KlineGuardianSymbolsPerRun          int
+	KlineGuardianMaxInflightPerExchange int
+	KlineGuardianRequestDelayMS         int
+	KlineGuardianBinanceRPS             int
+	KlineGuardianOKXRPS                 int
+	KlineGuardianSymbolMaxAgeSeconds    int
+	KlineGuardianDailyAuditEnabled      bool
+	KlineGuardianDailyAuditSeconds      int
+	KlineGuardianDailyAuditDays         int
+	KlineGuardianDailyLookbackDays      int
+	EnableCorporateAction               bool
+	CorporateActionPollSeconds          int
+	CorporateActionMaxAttempts          int
+	CorporateActionRetryBaseSeconds     int
+	CorporateActionJobsPerRun           int
+	CorporateActionRequestDelayMS       int
+	CorporateActionAnchorSeconds        int
+	CorporateActionAnchorSymbolsPerRun  int
+	FeishuWebhookURL                    string
+	EnableHealthMonitor                 bool
+	MonitorP1AlertsEnabled              bool
+	MonitorEvaluationSeconds            int
+	MonitorDailyReportHour              int
+	MonitorMarketReportIntervalMinutes  int
+	MonitorRedisEnabled                 bool
+	MonitorIntegrityIntervalSeconds     int
+	MonitorIntegritySymbolsPerRun       int
+	MonitorIntegrityTimeframes          []string
+	MonitorDiskPath                     string
+	SymbolRefreshIntervalSeconds        int
+	ReconnectBaseDelaySeconds           int
+	ReconnectMaxDelaySeconds            int
+	CollectorWSPingIntervalSeconds      int
+	CollectorWSPongWaitSeconds          int
+	Exchanges                           []ExchangeConfig
 }
 
 type ExchangeConfig struct {
@@ -92,45 +93,46 @@ func Load() Config {
 		// Guardian is an optional repair/audit worker. Keep it opt-in so a
 		// collector deployment cannot silently add REST repair load and queue
 		// noise to the realtime ingestion path.
-		EnableKlineGuardian:                envBool("ENABLE_KLINE_GUARDIAN", false),
-		KlineGuardianObserveFinalBars:      envBool("KLINE_GUARDIAN_OBSERVE_FINAL_BARS", false),
-		KlineGuardianAuditIntervalSeconds:  envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 120),
-		KlineGuardianWindowMinutes:         envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
-		KlineGuardianDelaySeconds:          envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
-		KlineGuardianSymbolsPerRun:         envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 0),
-		KlineGuardianRequestDelayMS:        envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
-		KlineGuardianBinanceRPS:            envInt("KLINE_GUARDIAN_BINANCE_RPS", 8),
-		KlineGuardianOKXRPS:                envInt("KLINE_GUARDIAN_OKX_RPS", 5),
-		KlineGuardianSymbolMaxAgeSeconds:   envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
-		KlineGuardianDailyAuditEnabled:     envBool("KLINE_GUARDIAN_DAILY_AUDIT_ENABLED", true),
-		KlineGuardianDailyAuditSeconds:     envInt("KLINE_GUARDIAN_DAILY_AUDIT_SECONDS", 3600),
-		KlineGuardianDailyAuditDays:        envInt("KLINE_GUARDIAN_DAILY_AUDIT_DAYS", 7),
-		KlineGuardianDailyLookbackDays:     envInt("KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS", 300),
-		EnableCorporateAction:              envBool("ENABLE_CORPORATE_ACTION", false),
-		CorporateActionPollSeconds:         envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
-		CorporateActionMaxAttempts:         envInt("CORPORATE_ACTION_MAX_ATTEMPTS", 5),
-		CorporateActionRetryBaseSeconds:    envInt("CORPORATE_ACTION_RETRY_BASE_SECONDS", 60),
-		CorporateActionJobsPerRun:          envInt("CORPORATE_ACTION_JOBS_PER_RUN", 1),
-		CorporateActionRequestDelayMS:      envInt("CORPORATE_ACTION_REQUEST_DELAY_MS", 100),
-		CorporateActionAnchorSeconds:       envInt("CORPORATE_ACTION_ANCHOR_SECONDS", 60),
-		CorporateActionAnchorSymbolsPerRun: envInt("CORPORATE_ACTION_ANCHOR_SYMBOLS_PER_RUN", 1),
-		FeishuWebhookURL:                   env("FEISHU_WEBHOOK_URL", ""),
-		EnableHealthMonitor:                envBool("ENABLE_HEALTH_MONITOR", enableCollector),
-		MonitorP1AlertsEnabled:             envBool("MONITOR_P1_ALERTS_ENABLED", false),
-		MonitorEvaluationSeconds:           envInt("MONITOR_EVALUATION_SECONDS", 15),
-		MonitorDailyReportHour:             envInt("MONITOR_DAILY_REPORT_HOUR", 9),
-		MonitorMarketReportIntervalMinutes: envInt("MONITOR_MARKET_REPORT_INTERVAL_MINUTES", 30),
-		MonitorRedisEnabled:                envBool("MONITOR_REDIS_ENABLED", true),
-		MonitorIntegrityIntervalSeconds:    envInt("MONITOR_INTEGRITY_INTERVAL_SECONDS", 600),
-		MonitorIntegritySymbolsPerRun:      envInt("MONITOR_INTEGRITY_SYMBOLS_PER_RUN", 50),
-		MonitorIntegrityTimeframes:         normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),
-		MonitorDiskPath:                    env("WATCHDOG_DISK_PATH", "."),
-		SymbolRefreshIntervalSeconds:       envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
-		ReconnectBaseDelaySeconds:          envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
-		ReconnectMaxDelaySeconds:           envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
-		CollectorWSPingIntervalSeconds:     envInt("COLLECTOR_WS_PING_INTERVAL_SECONDS", 20),
-		CollectorWSPongWaitSeconds:         envInt("COLLECTOR_WS_PONG_WAIT_SECONDS", 60),
-		Exchanges:                          loadExchangeConfigs(),
+		EnableKlineGuardian:                 envBool("ENABLE_KLINE_GUARDIAN", false),
+		KlineGuardianObserveFinalBars:       envBool("KLINE_GUARDIAN_OBSERVE_FINAL_BARS", false),
+		KlineGuardianAuditIntervalSeconds:   envInt("KLINE_GUARDIAN_AUDIT_INTERVAL_SECONDS", 120),
+		KlineGuardianWindowMinutes:          envInt("KLINE_GUARDIAN_WINDOW_MINUTES", 30),
+		KlineGuardianDelaySeconds:           envInt("KLINE_GUARDIAN_DELAY_SECONDS", 120),
+		KlineGuardianSymbolsPerRun:          envInt("KLINE_GUARDIAN_SYMBOLS_PER_RUN", 0),
+		KlineGuardianMaxInflightPerExchange: envInt("KLINE_GUARDIAN_MAX_INFLIGHT_PER_EXCHANGE", 8),
+		KlineGuardianRequestDelayMS:         envInt("KLINE_GUARDIAN_REQUEST_DELAY_MS", 100),
+		KlineGuardianBinanceRPS:             envInt("KLINE_GUARDIAN_BINANCE_RPS", 8),
+		KlineGuardianOKXRPS:                 envInt("KLINE_GUARDIAN_OKX_RPS", 5),
+		KlineGuardianSymbolMaxAgeSeconds:    envInt("KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS", 600),
+		KlineGuardianDailyAuditEnabled:      envBool("KLINE_GUARDIAN_DAILY_AUDIT_ENABLED", true),
+		KlineGuardianDailyAuditSeconds:      envInt("KLINE_GUARDIAN_DAILY_AUDIT_SECONDS", 3600),
+		KlineGuardianDailyAuditDays:         envInt("KLINE_GUARDIAN_DAILY_AUDIT_DAYS", 7),
+		KlineGuardianDailyLookbackDays:      envInt("KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS", 300),
+		EnableCorporateAction:               envBool("ENABLE_CORPORATE_ACTION", false),
+		CorporateActionPollSeconds:          envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
+		CorporateActionMaxAttempts:          envInt("CORPORATE_ACTION_MAX_ATTEMPTS", 5),
+		CorporateActionRetryBaseSeconds:     envInt("CORPORATE_ACTION_RETRY_BASE_SECONDS", 60),
+		CorporateActionJobsPerRun:           envInt("CORPORATE_ACTION_JOBS_PER_RUN", 1),
+		CorporateActionRequestDelayMS:       envInt("CORPORATE_ACTION_REQUEST_DELAY_MS", 100),
+		CorporateActionAnchorSeconds:        envInt("CORPORATE_ACTION_ANCHOR_SECONDS", 60),
+		CorporateActionAnchorSymbolsPerRun:  envInt("CORPORATE_ACTION_ANCHOR_SYMBOLS_PER_RUN", 1),
+		FeishuWebhookURL:                    env("FEISHU_WEBHOOK_URL", ""),
+		EnableHealthMonitor:                 envBool("ENABLE_HEALTH_MONITOR", enableCollector),
+		MonitorP1AlertsEnabled:              envBool("MONITOR_P1_ALERTS_ENABLED", false),
+		MonitorEvaluationSeconds:            envInt("MONITOR_EVALUATION_SECONDS", 15),
+		MonitorDailyReportHour:              envInt("MONITOR_DAILY_REPORT_HOUR", 9),
+		MonitorMarketReportIntervalMinutes:  envInt("MONITOR_MARKET_REPORT_INTERVAL_MINUTES", 30),
+		MonitorRedisEnabled:                 envBool("MONITOR_REDIS_ENABLED", true),
+		MonitorIntegrityIntervalSeconds:     envInt("MONITOR_INTEGRITY_INTERVAL_SECONDS", 600),
+		MonitorIntegritySymbolsPerRun:       envInt("MONITOR_INTEGRITY_SYMBOLS_PER_RUN", 50),
+		MonitorIntegrityTimeframes:          normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),
+		MonitorDiskPath:                     env("WATCHDOG_DISK_PATH", "."),
+		SymbolRefreshIntervalSeconds:        envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
+		ReconnectBaseDelaySeconds:           envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
+		ReconnectMaxDelaySeconds:            envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
+		CollectorWSPingIntervalSeconds:      envInt("COLLECTOR_WS_PING_INTERVAL_SECONDS", 20),
+		CollectorWSPongWaitSeconds:          envInt("COLLECTOR_WS_PONG_WAIT_SECONDS", 60),
+		Exchanges:                           loadExchangeConfigs(),
 	}
 }
 

@@ -176,6 +176,7 @@ func startBackgroundWorkers(
 			DailyAuditInterval:     time.Duration(cfg.KlineGuardianDailyAuditSeconds) * time.Second,
 			DailyAuditDays:         cfg.KlineGuardianDailyAuditDays,
 			DailyAuditLookbackDays: cfg.KlineGuardianDailyLookbackDays,
+			MaxInflightPerExchange: cfg.KlineGuardianMaxInflightPerExchange,
 		})
 		if cfg.KlineGuardianObserveFinalBars {
 			marketService.AddFinalBarObserver(worker)
@@ -185,12 +186,13 @@ func startBackgroundWorkers(
 				errCh <- err
 			}
 		}()
-		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds symbols_per_run=%d binance_rps=%d okx_rps=%d observe_finals=%t daily_audit=%t daily_interval=%ds daily_days=%d daily_lookback_days=%d",
+		log.Printf("kline guardian started fetchers=%d interval=%ds window=%dm delay=%ds symbols_per_run=%d max_inflight_per_exchange=%d binance_rps=%d okx_rps=%d observe_finals=%t daily_audit=%t daily_interval=%ds daily_days=%d daily_lookback_days=%d",
 			len(fetchers),
 			cfg.KlineGuardianAuditIntervalSeconds,
 			cfg.KlineGuardianWindowMinutes,
 			cfg.KlineGuardianDelaySeconds,
 			cfg.KlineGuardianSymbolsPerRun,
+			cfg.KlineGuardianMaxInflightPerExchange,
 			cfg.KlineGuardianBinanceRPS,
 			cfg.KlineGuardianOKXRPS,
 			cfg.KlineGuardianObserveFinalBars,

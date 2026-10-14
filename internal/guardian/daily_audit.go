@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sort"
+	"sync"
 	"time"
 
 	"crypto-ticket/internal/timeframe"
@@ -46,6 +47,9 @@ func (g *Guardian) DailyAuditOnce(ctx context.Context) error {
 }
 
 func (g *Guardian) dailyAuditOnce(ctx context.Context) error {
+	g.dailyRunMu.Lock()
+	defer g.dailyRunMu.Unlock()
+
 	targets, err := g.dailyAuditTargets(ctx)
 	if err != nil {
 		return err
@@ -79,40 +83,94 @@ func (g *Guardian) dailyAuditOnce(ctx context.Context) error {
 	}
 	g.dailyAuditCursor = int((block + 1) % blockCount)
 
-	var firstErr error
+	grouped := make(map[string][]auditTarget)
 	for _, target := range targets {
-		for _, r := range []dailyAuditRange{recent, historical} {
-			if r.EndMS < r.StartMS || ctx.Err() != nil {
-				continue
-			}
-			key := target.Exchange + ":" + target.Symbol
-			g.dailyAuditMu.Lock()
-			retry := g.dailyRetries[key] != nil && g.dailyRetries[key][r]
-			g.dailyAuditMu.Unlock()
-			result, err := g.repairTimeframeRange(ctx, target.Fetcher, timeframeRepairRequest{
-				Exchange: target.Exchange, Symbol: target.Symbol, Timeframe: "1D",
-				StartMS: r.StartMS, EndMS: r.EndMS, Reason: "daily_audit",
-				ExpectData:      target.FirstSeenAtMS > 0 && target.FirstSeenAtMS <= r.EndMS,
-				ExpectedStartMS: target.FirstSeenAtMS,
-				ForceReplay:     retry,
-			})
-			_ = result
-			g.dailyAuditMu.Lock()
-			if err != nil {
-				if g.dailyRetries[key] == nil {
-					g.dailyRetries[key] = make(map[dailyAuditRange]bool)
-				}
-				g.dailyRetries[key][r] = true
-				if firstErr == nil {
-					firstErr = err
-				}
-			} else if g.dailyRetries[key] != nil {
-				delete(g.dailyRetries[key], r)
-			}
-			g.dailyAuditMu.Unlock()
-		}
+		grouped[target.Exchange] = append(grouped[target.Exchange], target)
 	}
+	var firstErr error
+	var firstErrMu sync.Mutex
+	setFirstErr := func(err error) {
+		if err == nil {
+			return
+		}
+		firstErrMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		firstErrMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for _, exchangeTargets := range grouped {
+		exchangeTargets := append([]auditTarget(nil), exchangeTargets...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g.runTargetPool(ctx, exchangeTargets, func(ctx context.Context, target auditTarget) {
+				key := target.Exchange + ":" + target.Symbol
+				ranges := []dailyAuditRange{recent, historical}
+				force := map[dailyAuditRange]bool{}
+				g.dailyAuditMu.Lock()
+				for failedRange := range g.dailyRetries[key] {
+					ranges = append(ranges, failedRange)
+					force[failedRange] = true
+				}
+				g.dailyAuditMu.Unlock()
+
+				// Recover the last failed range after a process restart. The in-memory
+				// queue retains every failure; persisted state covers its latest range.
+				state, stateErr := g.store.LoadKlineGuardianState(ctx, target.Exchange, target.Symbol, "1D")
+				if stateErr != nil {
+					setFirstErr(stateErr)
+					return
+				}
+				if state != nil && isRetryableDailyStatus(state.Status) && state.LastCheckedEndMS >= state.LastCheckedStartMS {
+					failedRange := dailyAuditRange{StartMS: state.LastCheckedStartMS, EndMS: state.LastCheckedEndMS}
+					ranges = append(ranges, failedRange)
+					force[failedRange] = true
+				}
+				seen := make(map[dailyAuditRange]bool, len(ranges))
+				for _, r := range ranges {
+					if seen[r] {
+						continue
+					}
+					seen[r] = true
+					if r.EndMS < r.StartMS || ctx.Err() != nil {
+						continue
+					}
+					_, repairErr := g.repairTimeframeRange(ctx, target.Fetcher, timeframeRepairRequest{
+						Exchange: target.Exchange, Symbol: target.Symbol, Timeframe: "1D",
+						StartMS: r.StartMS, EndMS: r.EndMS, Reason: "daily_audit",
+						ExpectData:      target.FirstSeenAtMS > 0 && target.FirstSeenAtMS <= r.EndMS,
+						ExpectedStartMS: target.FirstSeenAtMS,
+						ForceReplay:     force[r],
+					})
+					g.dailyAuditMu.Lock()
+					if repairErr != nil {
+						if g.dailyRetries[key] == nil {
+							g.dailyRetries[key] = make(map[dailyAuditRange]bool)
+						}
+						g.dailyRetries[key][r] = true
+					} else if g.dailyRetries[key] != nil {
+						delete(g.dailyRetries[key], r)
+					}
+					g.dailyAuditMu.Unlock()
+					setFirstErr(repairErr)
+				}
+			})
+		}()
+	}
+	wg.Wait()
 	return firstErr
+}
+
+func isRetryableDailyStatus(status string) bool {
+	switch status {
+	case "repair_error", "rest_error", "empty_response", "incomplete_response":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *Guardian) dailyAuditTargets(ctx context.Context) ([]auditTarget, error) {

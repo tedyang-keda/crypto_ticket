@@ -108,6 +108,7 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_WINDOW_MINUTES` | `30` | 每次校验最近多少分钟的 final `1m` |
 | `KLINE_GUARDIAN_DELAY_SECONDS` | `120` | 只校验已结束并延迟足够久的 bar，避免刚 final 的边缘差异 |
 | `KLINE_GUARDIAN_SYMBOLS_PER_RUN` | `0` | 每轮最多校验多少个 active symbol；`0` 表示全量 |
+| `KLINE_GUARDIAN_MAX_INFLIGHT_PER_EXCHANGE` | `8` | 每个交易所同时执行的 Guardian 品种任务和 REST 请求上限；分钟、日线审计共用请求上限 |
 | `KLINE_GUARDIAN_REQUEST_DELAY_MS` | `100` | 未配置交易所专属速率时的 REST 请求节流 |
 | `KLINE_GUARDIAN_BINANCE_RPS` | `8` | Binance Guardian REST 请求速率上限 |
 | `KLINE_GUARDIAN_OKX_RPS` | `5` | OKX Guardian REST 请求速率上限 |
@@ -237,7 +238,7 @@ final `1m`：
 2. 近窗口 REST 校验：默认每两分钟检查全部 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。Binance 与 OKX 分组并行，分别受各自的 RPS 配置限制。
 3. 独立日线校验：启动后和每小时校验全量 active symbols 的最近 7 根已结束 UTC 日线，以及 300 天范围内轮转的历史块。直接比较官方 `1D`（OKX 为 `1Dutc`）与本地数据，缺失或不一致通过 `MarketService.RepairFinalBars` 补写并触发已具备完整源数据的周/月等上层聚合，不要求本地 `1m/1H` 完整。日线与分钟线共享交易所独立限速；官方或写入失败会重试，不中断实时采集，也不重新启用高级周期告警。
 
-两分钟是调度间隔，不是无条件的完成保证：实际覆盖耗时取决于品种数量、官方响应时间、限速和数据库延迟；长轮次不会重叠堆积。
+分钟和日线任务按交易所并行处理，每个交易所最多 8 个在途 REST 请求；实际请求启动仍受 Binance 8 RPS、OKX 5 RPS 的共享 pacer 限制，不会因为并发提高请求速率。两分钟是调度间隔，不是无条件的完成保证：实际覆盖耗时取决于品种数量、官方响应时间、限速和数据库延迟；同一类审计轮次不会重叠堆积。
 
 为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
 

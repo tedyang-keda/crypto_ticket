@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,8 +138,8 @@ func TestAuditOnceChecksAllTargetsWhenSymbolsPerRunIsZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.CheckedSymbols != len(symbols) || fetcher.count != len(symbols) {
-		t.Fatalf("expected full audit of %d symbols, result=%+v requests=%d", len(symbols), result, fetcher.count)
+	if result.CheckedSymbols != len(symbols) || fetcher.count.Load() != int64(len(symbols)) {
+		t.Fatalf("expected full audit of %d symbols, result=%+v requests=%d", len(symbols), result, fetcher.count.Load())
 	}
 }
 
@@ -212,6 +215,27 @@ func TestDailyRepairRejectsNonFinalAndEmptyExisting(t *testing.T) {
 	}
 }
 
+func TestDailyRepairRecordsRESTErrorAndRetries(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1D")
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", err: fmt.Errorf("temporary HTTP timeout")}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{Enabled: true})
+	request := timeframeRepairRequest{Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true}
+	if _, err := g.repairTimeframeRange(ctx, fetcher, request); err == nil {
+		t.Fatal("expected REST error")
+	}
+	state, err := store.LoadKlineGuardianState(ctx, "binance", "BTCUSDT", "1D")
+	if err != nil || state == nil || state.Status != "rest_error" {
+		t.Fatalf("expected persisted REST error state, state=%+v err=%v", state, err)
+	}
+	fetcher.err = nil
+	fetcher.bars = []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}
+	if _, err := g.repairTimeframeRange(ctx, fetcher, request); err != nil {
+		t.Fatalf("expected retry to repair daily bar: %v", err)
+	}
+}
+
 func TestDailyAuditRunsWithObserverDisabled(t *testing.T) {
 	ctx := context.Background()
 	store := storage.NewMemoryHistoricalStore()
@@ -238,6 +262,139 @@ func TestDailyAuditRunsWithObserverDisabled(t *testing.T) {
 	}
 }
 
+func TestDailyAuditWorkerRunsImmediatelyOnStartup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := storage.NewMemoryHistoricalStore()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	base := timeframe.FloorStartMS(now.Add(-24*time.Hour).UnixMilli(), "1D")
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base}}); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}, called: make(chan struct{}, 1)}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{
+		Enabled: true, DailyAuditEnabled: true, DailyAuditInterval: time.Hour,
+		DailyAuditDays: 1, DailyAuditLookbackDays: 1, ObserveFinalBars: false,
+	})
+	g.now = func() time.Time { return now }
+	runDone := make(chan error, 1)
+	go func() { runDone <- g.Run(ctx) }()
+	select {
+	case <-fetcher.called:
+	case <-time.After(time.Second):
+		t.Fatal("daily audit did not fetch bars during startup")
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("guardian workers did not stop after cancellation")
+	}
+	if len(g.finalBars) != 0 {
+		t.Fatal("final-bar worker must stay disabled when ObserveFinalBars is false")
+	}
+}
+
+func TestGuardianBoundsConcurrentAuditsPerExchange(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	symbols := make([]market.SymbolInfo, 10)
+	for i := range symbols {
+		symbols[i] = market.SymbolInfo{
+			Exchange: "binance", Symbol: fmt.Sprintf("S%02d", i), MarketType: "um_futures",
+			Status: "TRADING", IsActive: true, LastSeenAtMS: now.UnixMilli(),
+		}
+	}
+	if err := store.UpsertSymbols(ctx, symbols); err != nil {
+		t.Fatal(err)
+	}
+	fetcher := &inflightTrackingFetcher{delay: 20 * time.Millisecond}
+	g := New(store, &storeRepairer{store: store}, []Fetcher{fetcher}, Config{
+		Enabled: true, DailyAuditEnabled: true, DailyAuditDays: 1,
+		DailyAuditLookbackDays: 1, MaxInflightPerExchange: 3,
+	})
+	g.now = func() time.Time { return now }
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- g.AuditOnce(ctx) }()
+	go func() { errCh <- g.DailyAuditOnce(ctx) }()
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("parallel guardian audit failed: %v", err)
+		}
+	}
+	if got := fetcher.max.Load(); got > 3 {
+		t.Fatalf("exchange REST concurrency exceeded configured limit: got=%d limit=3", got)
+	}
+	if got := fetcher.max.Load(); got < 2 {
+		t.Fatalf("expected concurrent REST requests, observed max=%d", got)
+	}
+}
+
+func TestRequestPacerKeepsConcurrentRequestsSpaced(t *testing.T) {
+	const requestCount = 5
+	pacer := &requestPacer{interval: 20 * time.Millisecond}
+	starts := make(chan time.Time, requestCount)
+	var wg sync.WaitGroup
+	for range requestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := pacer.Wait(context.Background()); err != nil {
+				t.Errorf("wait for request slot: %v", err)
+				return
+			}
+			starts <- time.Now()
+		}()
+	}
+	wg.Wait()
+	close(starts)
+	var observed []time.Time
+	for started := range starts {
+		observed = append(observed, started)
+	}
+	sort.Slice(observed, func(i, j int) bool { return observed[i].Before(observed[j]) })
+	for i := 1; i < len(observed); i++ {
+		if gap := observed[i].Sub(observed[i-1]); gap < 15*time.Millisecond {
+			t.Fatalf("concurrent request starts were too close: delta=%s starts=%v", gap, observed)
+		}
+	}
+}
+
+func TestRequestPacingTransportLimitsEachHTTPAttempt(t *testing.T) {
+	const requestCount = 3
+	base := &recordingRoundTripper{starts: make(chan time.Time, requestCount)}
+	client := &http.Client{Transport: requestPacingTransport{
+		base: base,
+		pacers: map[string]*requestPacer{
+			"binance": {interval: 15 * time.Millisecond},
+		},
+	}}
+	ctx := context.WithValue(context.Background(), guardianExchangeContextKey{}, "binance")
+	for range requestCount {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+	}
+	close(base.starts)
+	var starts []time.Time
+	for started := range base.starts {
+		starts = append(starts, started)
+	}
+	for i := 1; i < len(starts); i++ {
+		if gap := starts[i].Sub(starts[i-1]); gap < 12*time.Millisecond {
+			t.Fatalf("physical HTTP attempts were not paced: delta=%s starts=%v", gap, starts)
+		}
+	}
+}
+
 type fakeFetcher struct {
 	name        string
 	marketType  string
@@ -248,18 +405,55 @@ type fakeFetcher struct {
 type countingFetcher struct {
 	name       string
 	marketType string
-	count      int
+	count      atomic.Int64
 }
 
 type timeframeFetcher struct {
 	name       string
 	marketType string
 	bars       []market.Bar
+	err        error
+	called     chan struct{}
+}
+
+type inflightTrackingFetcher struct {
+	active atomic.Int32
+	max    atomic.Int32
+	delay  time.Duration
+}
+
+type recordingRoundTripper struct {
+	starts chan time.Time
+}
+
+func (r *recordingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	r.starts <- time.Now()
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: request}, nil
+}
+
+func (f *inflightTrackingFetcher) Name() string       { return "binance" }
+func (f *inflightTrackingFetcher) MarketType() string { return "um_futures" }
+func (f *inflightTrackingFetcher) FetchKlines(_ context.Context, _ *http.Client, _ exchange.KlineRequest) ([]market.Bar, error) {
+	active := f.active.Add(1)
+	for current := f.max.Load(); active > current && !f.max.CompareAndSwap(current, active); current = f.max.Load() {
+	}
+	defer f.active.Add(-1)
+	time.Sleep(f.delay)
+	return nil, nil
 }
 
 func (f *timeframeFetcher) Name() string       { return f.name }
 func (f *timeframeFetcher) MarketType() string { return f.marketType }
 func (f *timeframeFetcher) FetchKlines(_ context.Context, _ *http.Client, request exchange.KlineRequest) ([]market.Bar, error) {
+	if f.called != nil {
+		select {
+		case f.called <- struct{}{}:
+		default:
+		}
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
 	var out []market.Bar
 	for _, bar := range f.bars {
 		if bar.Symbol != request.Symbol || bar.Timeframe != request.Timeframe || bar.StartMS < request.StartMS || bar.StartMS > request.EndMS {
@@ -273,7 +467,7 @@ func (f *timeframeFetcher) FetchKlines(_ context.Context, _ *http.Client, reques
 func (f *countingFetcher) Name() string       { return f.name }
 func (f *countingFetcher) MarketType() string { return f.marketType }
 func (f *countingFetcher) FetchKlines(_ context.Context, _ *http.Client, _ exchange.KlineRequest) ([]market.Bar, error) {
-	f.count++
+	f.count.Add(1)
 	return nil, nil
 }
 
