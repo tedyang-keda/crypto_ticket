@@ -454,6 +454,9 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 }
 
 func binanceKlineInterval(tf string) (string, error) {
+	if err := timeframe.ValidateForExchange("binance", tf); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrUnsupportedKlineInterval, err)
+	}
 	switch timeframe.MustNormalize(tf) {
 	case "1m":
 		return "1m", nil
@@ -475,8 +478,6 @@ func binanceKlineInterval(tf string) (string, error) {
 		return "12h", nil
 	case "1D":
 		return "1d", nil
-	case "3D":
-		return "3d", nil
 	case "1W":
 		return "1w", nil
 	case "1M":
@@ -487,6 +488,9 @@ func binanceKlineInterval(tf string) (string, error) {
 }
 
 func okxKlineBar(tf string) (string, error) {
+	if err := timeframe.ValidateForExchange("okx", tf); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrUnsupportedKlineInterval, err)
+	}
 	switch timeframe.MustNormalize(tf) {
 	case "1m":
 		return "1m", nil
@@ -510,8 +514,6 @@ func okxKlineBar(tf string) (string, error) {
 		return "1Dutc", nil
 	case "2D":
 		return "2Dutc", nil
-	case "3D":
-		return "3Dutc", nil
 	case "1W":
 		return "1Wutc", nil
 	case "1M":

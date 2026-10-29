@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -33,6 +34,10 @@ type Config struct {
 	KlineGuardianDailyAuditSeconds      int
 	KlineGuardianDailyAuditDays         int
 	KlineGuardianDailyLookbackDays      int
+	KlineGuardianMinuteDayAuditEnabled  bool
+	KlineGuardianMinuteDayOffsetMinutes int
+	KlineGuardianMinuteDayRequestRPS    int
+	KlineGuardianMinuteRetrySeconds     int
 	EnableCorporateAction               bool
 	CorporateActionPollSeconds          int
 	CorporateActionMaxAttempts          int
@@ -53,6 +58,8 @@ type Config struct {
 	MonitorIntegrityTimeframes          []string
 	MonitorDiskPath                     string
 	SymbolRefreshIntervalSeconds        int
+	EnableSymbolSnapshots               bool
+	SymbolSnapshotIntervalSeconds       int
 	ReconnectBaseDelaySeconds           int
 	ReconnectMaxDelaySeconds            int
 	CollectorWSPingIntervalSeconds      int
@@ -75,6 +82,9 @@ func Load() Config {
 	for _, frame := range frames {
 		frame = strings.TrimSpace(frame)
 		if frame == "" {
+			continue
+		}
+		if errors.Is(timeframe.ValidateForExchange("", frame), timeframe.ErrDisabledTimeframe) {
 			continue
 		}
 		outFrames = append(outFrames, timeframe.MustNormalize(frame))
@@ -108,6 +118,10 @@ func Load() Config {
 		KlineGuardianDailyAuditSeconds:      envInt("KLINE_GUARDIAN_DAILY_AUDIT_SECONDS", 3600),
 		KlineGuardianDailyAuditDays:         envInt("KLINE_GUARDIAN_DAILY_AUDIT_DAYS", 7),
 		KlineGuardianDailyLookbackDays:      envInt("KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS", 300),
+		KlineGuardianMinuteDayAuditEnabled:  envBool("KLINE_GUARDIAN_MINUTE_DAY_AUDIT_ENABLED", true),
+		KlineGuardianMinuteDayOffsetMinutes: envInt("KLINE_GUARDIAN_MINUTE_DAY_OFFSET_MINUTES", 30),
+		KlineGuardianMinuteDayRequestRPS:    envInt("KLINE_GUARDIAN_MINUTE_DAY_RPS", 1),
+		KlineGuardianMinuteRetrySeconds:     envInt("KLINE_GUARDIAN_MINUTE_RETRY_SECONDS", 15),
 		EnableCorporateAction:               envBool("ENABLE_CORPORATE_ACTION", false),
 		CorporateActionPollSeconds:          envInt("CORPORATE_ACTION_POLL_SECONDS", 15),
 		CorporateActionMaxAttempts:          envInt("CORPORATE_ACTION_MAX_ATTEMPTS", 5),
@@ -128,6 +142,8 @@ func Load() Config {
 		MonitorIntegrityTimeframes:          normalizedTimeframes(env("MONITOR_INTEGRITY_TIMEFRAMES", "15m,30m,1H,4H,1D,2D,1W")),
 		MonitorDiskPath:                     env("WATCHDOG_DISK_PATH", "."),
 		SymbolRefreshIntervalSeconds:        envInt("SYMBOL_REFRESH_INTERVAL_SECONDS", 120),
+		EnableSymbolSnapshots:               envBool("ENABLE_SYMBOL_SNAPSHOTS", enableCollector),
+		SymbolSnapshotIntervalSeconds:       envInt("SYMBOL_SNAPSHOT_INTERVAL_SECONDS", 120),
 		ReconnectBaseDelaySeconds:           envInt("RECONNECT_BASE_DELAY_SECONDS", 1),
 		ReconnectMaxDelaySeconds:            envInt("RECONNECT_MAX_DELAY_SECONDS", 60),
 		CollectorWSPingIntervalSeconds:      envInt("COLLECTOR_WS_PING_INTERVAL_SECONDS", 20),
@@ -142,6 +158,9 @@ func normalizedTimeframes(raw string) []string {
 	for _, item := range strings.Split(raw, ",") {
 		item = strings.TrimSpace(item)
 		if item == "" {
+			continue
+		}
+		if errors.Is(timeframe.ValidateForExchange("", item), timeframe.ErrDisabledTimeframe) {
 			continue
 		}
 		normalized := timeframe.MustNormalize(item)

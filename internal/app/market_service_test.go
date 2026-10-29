@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"crypto-ticket/internal/aggregator"
 	"crypto-ticket/internal/market"
 	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
@@ -325,6 +326,147 @@ func TestRepairOfficialDailyBarsWithoutHourlySourceRebuildsWeeklyBar(t *testing.
 	}
 }
 
+func TestRepairRollupsRebuildsMissingTwoDayBarFromCompleteDailySources(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1D", "2D"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "2D")
+	daily := []market.Bar{
+		{
+			Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1D",
+			StartMS: base, EndMS: timeframe.EndMS(base, "1D"),
+			OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 105,
+			Volume: 2, QuoteVolume: 210, IsFinal: true,
+		},
+		{
+			Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1D",
+			StartMS: timeframe.NextStartMS(base, "1D"), EndMS: timeframe.EndMS(timeframe.NextStartMS(base, "1D"), "1D"),
+			OpenPrice: 105, HighPrice: 120, LowPrice: 100, ClosePrice: 115,
+			Volume: 3, QuoteVolume: 345, IsFinal: true,
+		},
+	}
+	if err := service.store.UpsertBars(ctx, daily); err != nil {
+		t.Fatalf("upsert daily sources: %v", err)
+	}
+
+	if err := service.RepairRollups(ctx, daily); err != nil {
+		t.Fatalf("repair rollups: %v", err)
+	}
+	bars, err := service.store.BarsInRange(ctx, "binance", "BTCUSDT", "2D", base, base)
+	if err != nil || len(bars) != 1 {
+		t.Fatalf("expected missing 2D bar to be rebuilt, bars=%+v err=%v", bars, err)
+	}
+	bar := bars[0]
+	if !bar.IsFinal || bar.OpenPrice != 100 || bar.HighPrice != 120 || bar.LowPrice != 90 || bar.ClosePrice != 115 || bar.Volume != 5 || bar.QuoteVolume != 555 {
+		t.Fatalf("unexpected rebuilt 2D bar: %+v", bar)
+	}
+}
+
+func TestRepairRollupsSkipsIncompleteTwoDaySourceBucket(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1D", "2D"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "2D")
+	daily := market.Bar{
+		Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1D",
+		StartMS: base, EndMS: timeframe.EndMS(base, "1D"),
+		OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 105,
+		Volume: 2, QuoteVolume: 210, IsFinal: true,
+	}
+	if err := service.store.UpsertBars(ctx, []market.Bar{daily}); err != nil {
+		t.Fatalf("upsert incomplete daily source: %v", err)
+	}
+
+	if err := service.RepairRollups(ctx, []market.Bar{daily}); err != nil {
+		t.Fatalf("repair rollups: %v", err)
+	}
+	bars, err := service.store.BarsInRange(ctx, "binance", "BTCUSDT", "2D", base, base)
+	if err != nil || len(bars) != 0 {
+		t.Fatalf("incomplete 2D source bucket must not be fabricated, bars=%+v err=%v", bars, err)
+	}
+}
+
+func TestRepairRollupsUsesEarlierRebuiltCloseForDerivedFields(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1D", "2D"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "2D")
+	var daily []market.Bar
+	for i := 0; i < 4; i++ {
+		start := base
+		for j := 0; j < i; j++ {
+			start = timeframe.NextStartMS(start, "1D")
+		}
+		closePrice := float64(100 + (i+1)*10)
+		daily = append(daily, market.Bar{
+			Exchange: "binance", Symbol: "BTCUSDT", MarginType: "umargin", Timeframe: "1D",
+			StartMS: start, EndMS: timeframe.EndMS(start, "1D"),
+			OpenPrice: closePrice - 5, HighPrice: closePrice + 5, LowPrice: closePrice - 10, ClosePrice: closePrice,
+			Volume: 1, QuoteVolume: closePrice, IsFinal: true,
+		})
+	}
+	if err := service.store.UpsertBars(ctx, daily); err != nil {
+		t.Fatalf("upsert daily sources: %v", err)
+	}
+
+	if err := service.RepairRollups(ctx, daily); err != nil {
+		t.Fatalf("repair rollups: %v", err)
+	}
+	bars, err := service.store.BarsInRange(ctx, "binance", "BTCUSDT", "2D", base, timeframe.NextStartMS(base, "2D"))
+	if err != nil || len(bars) != 2 {
+		t.Fatalf("expected two consecutive 2D rollups, bars=%+v err=%v", bars, err)
+	}
+	if bars[1].PrevClose != bars[0].ClosePrice || bars[1].Chg != 16.666667 {
+		t.Fatalf("later 2D rollup should derive from earlier rebuilt close, bars=%+v", bars)
+	}
+}
+
+func TestRepairRollupsRepairsStaleLastTickButSkipsCorrectTarget(t *testing.T) {
+	ctx := context.Background()
+	service := newTestMarketServiceWithFrames([]string{"1m", "1D", "2D"})
+	base := timeframe.FloorStartMS(1_710_000_000_000, "2D")
+	daily := []market.Bar{
+		{
+			Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D",
+			StartMS: base, EndMS: timeframe.EndMS(base, "1D"),
+			OpenPrice: 100, HighPrice: 110, LowPrice: 90, ClosePrice: 105,
+			Volume: 2, QuoteVolume: 210, LastTickMS: timeframe.EndMS(base, "1D") - 100, IsFinal: true,
+		},
+		{
+			Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D",
+			StartMS: timeframe.NextStartMS(base, "1D"), EndMS: timeframe.EndMS(timeframe.NextStartMS(base, "1D"), "1D"),
+			OpenPrice: 105, HighPrice: 120, LowPrice: 100, ClosePrice: 115,
+			Volume: 3, QuoteVolume: 345, LastTickMS: timeframe.EndMS(timeframe.NextStartMS(base, "1D"), "1D") - 50, IsFinal: true,
+		},
+	}
+	if err := service.store.UpsertBars(ctx, daily); err != nil {
+		t.Fatalf("upsert daily sources: %v", err)
+	}
+	expected := aggregator.RollupBars("2D", daily, true, "rollup_repair", market.NowMS())
+	if expected == nil {
+		t.Fatal("expected rollup from complete daily sources")
+	}
+	stale := *expected
+	stale.LastTickMS = base
+	if err := service.store.UpsertBars(ctx, []market.Bar{stale}); err != nil {
+		t.Fatalf("upsert stale target: %v", err)
+	}
+
+	telemetry := &marketServiceTestTelemetry{}
+	service.telemetry = telemetry
+	if err := service.RepairRollups(ctx, daily); err != nil {
+		t.Fatalf("repair stale rollup: %v", err)
+	}
+	if len(telemetry.persisted) != 1 || telemetry.persisted[0].LastTickMS != expected.LastTickMS {
+		t.Fatalf("expected stale last tick to be repaired, persisted=%+v expected=%+v", telemetry.persisted, expected)
+	}
+
+	telemetry.persisted = nil
+	if err := service.RepairRollups(ctx, daily); err != nil {
+		t.Fatalf("repeat repair: %v", err)
+	}
+	if len(telemetry.persisted) != 0 {
+		t.Fatalf("correct target should not be rewritten, persisted=%+v", telemetry.persisted)
+	}
+}
+
 func TestHistoricalRepairPreservesCurrentLiveBar(t *testing.T) {
 	ctx := context.Background()
 	service := newTestMarketService()
@@ -362,6 +504,18 @@ func newTestMarketServiceWithFrames(frames []string) *MarketService {
 		300,
 	)
 }
+
+type marketServiceTestTelemetry struct {
+	persisted []market.Bar
+}
+
+func (m *marketServiceTestTelemetry) BarPersisted(bar market.Bar) {
+	m.persisted = append(m.persisted, bar)
+}
+
+func (*marketServiceTestTelemetry) BarPublished(market.Bar) {}
+
+func (*marketServiceTestTelemetry) StorageOperation(string, time.Duration, error) {}
 
 func nextTestEvent(t *testing.T, sub *realtime.Subscriber) market.Event {
 	t.Helper()

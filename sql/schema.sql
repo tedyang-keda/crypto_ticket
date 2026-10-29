@@ -1,3 +1,31 @@
+-- Latest successful official inventory; local selection is distinct from live
+-- WebSocket connectivity. Refresh failures update only instrument_snapshot_sync.
+CREATE TABLE IF NOT EXISTS instrument_snapshot (
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  market_type VARCHAR(16) NOT NULL,
+  official_status VARCHAR(32) NOT NULL DEFAULT '',
+  official_active TINYINT(1) NOT NULL DEFAULT 0,
+  presence VARCHAR(16) NOT NULL,
+  subscribed TINYINT(1) NOT NULL DEFAULT 0,
+  captured_at_ms BIGINT NOT NULL,
+  snapshot_json JSON NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (exchange, symbol),
+  KEY idx_instrument_snapshot_scope (exchange, market_type, presence, subscribed)
+);
+
+CREATE TABLE IF NOT EXISTS instrument_snapshot_sync (
+  exchange VARCHAR(16) NOT NULL,
+  market_type VARCHAR(16) NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  last_attempt_ms BIGINT NOT NULL DEFAULT 0,
+  last_success_ms BIGINT NOT NULL DEFAULT 0,
+  symbol_count INT NOT NULL DEFAULT 0,
+  last_error VARCHAR(512) NOT NULL DEFAULT '',
+  PRIMARY KEY (exchange, market_type)
+);
+
 CREATE TABLE IF NOT EXISTS symbol_registry (
   exchange VARCHAR(16) NOT NULL,
   symbol VARCHAR(64) NOT NULL,
@@ -51,6 +79,7 @@ CREATE TABLE IF NOT EXISTS bar_history (
   is_final TINYINT(1) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  verified_at_ms BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (exchange, symbol, timeframe, start_ms)
 )
 PARTITION BY RANGE COLUMNS(timeframe, start_ms) (
@@ -242,6 +271,44 @@ CREATE TABLE IF NOT EXISTS corporate_action_job (
   PRIMARY KEY (id),
   UNIQUE KEY uk_corporate_action_event (exchange, symbol, effective_ms),
   KEY idx_corporate_action_due (status, next_retry_ms, id)
+);
+
+-- Durable one-minute audit work; completed rolling tasks are removed while
+-- daily completion evidence is retained for seven days by the task repository.
+CREATE TABLE IF NOT EXISTS kline_minute_audit_task (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  market_type VARCHAR(32) NOT NULL DEFAULT '',
+  kind VARCHAR(16) NOT NULL,
+  start_ms BIGINT NOT NULL,
+  end_ms BIGINT NOT NULL,
+  expected_start_ms BIGINT NOT NULL DEFAULT 0,
+  expect_data TINYINT(1) NOT NULL DEFAULT 0,
+  status VARCHAR(16) NOT NULL DEFAULT 'pending',
+  attempts INT NOT NULL DEFAULT 0,
+  next_attempt_ms BIGINT NOT NULL DEFAULT 0,
+  lease_until_ms BIGINT NOT NULL DEFAULT 0,
+  lease_token VARCHAR(64) NOT NULL DEFAULT '',
+  force_replay TINYINT(1) NOT NULL DEFAULT 0,
+  last_error VARCHAR(1024) NOT NULL DEFAULT '',
+  created_at_ms BIGINT NOT NULL,
+  updated_at_ms BIGINT NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_minute_audit_range (exchange, symbol, kind, start_ms, end_ms),
+  KEY idx_minute_audit_due (exchange, status, next_attempt_ms, id),
+  KEY idx_minute_audit_kind_due (exchange, kind, status, next_attempt_ms, id),
+  KEY idx_minute_audit_lease (exchange, status, lease_until_ms, id),
+  KEY idx_minute_audit_gc (status, updated_at_ms, id)
+);
+
+CREATE TABLE IF NOT EXISTS kline_minute_audit_cursor (
+  exchange VARCHAR(16) NOT NULL,
+  symbol VARCHAR(64) NOT NULL,
+  kind VARCHAR(16) NOT NULL,
+  through_ms BIGINT NOT NULL DEFAULT 0,
+  updated_at_ms BIGINT NOT NULL,
+  PRIMARY KEY (exchange, symbol, kind)
 );
 
 CREATE TABLE IF NOT EXISTS archive_manifest (

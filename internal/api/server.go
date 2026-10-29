@@ -115,7 +115,7 @@ func (s *Server) klines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tf := strings.TrimSpace(r.URL.Query().Get("timeframe"))
-	if _, err := timeframe.Normalize(tf); err != nil {
+	if err := timeframe.ValidateForExchange(exchange, tf); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -211,20 +211,34 @@ func (s *Server) websocket(w http.ResponseWriter, r *http.Request) {
 			if message.Op != "subscribe" {
 				continue
 			}
+			accepted := make([]wsChannel, 0, len(message.Channels))
 			for _, channel := range message.Channels {
-				exchange := strings.ToLower(channel.Exchange)
-				symbol := strings.ToUpper(channel.Symbol)
+				exchange := strings.ToLower(strings.TrimSpace(channel.Exchange))
+				symbol := strings.ToUpper(strings.TrimSpace(channel.Symbol))
+				channel.Exchange, channel.Symbol = exchange, symbol
 				switch channel.Type {
 				case "ticker":
 					sub.Add(realtime.TickerChannel(exchange, symbol))
 				case "kline":
-					if _, err := timeframe.Normalize(channel.Timeframe); err == nil {
-						sub.Add(realtime.KlineChannel(exchange, symbol, channel.Timeframe))
+					if err := timeframe.ValidateForExchange(exchange, channel.Timeframe); err != nil {
+						if err := writeJSON(map[string]any{"op": "error", "req_id": message.ReqID, "error": err.Error(), "channel": channel}); err != nil {
+							return
+						}
+						continue
 					}
+					sub.Add(realtime.KlineChannel(exchange, symbol, channel.Timeframe))
+				default:
+					if err := writeJSON(map[string]any{"op": "error", "req_id": message.ReqID, "error": "unsupported channel type", "channel": channel}); err != nil {
+						return
+					}
+					continue
 				}
+				accepted = append(accepted, channel)
 			}
-			if err := writeJSON(map[string]any{"op": "subscribed", "req_id": message.ReqID, "channels": message.Channels}); err != nil {
-				return
+			if len(accepted) > 0 {
+				if err := writeJSON(map[string]any{"op": "subscribed", "req_id": message.ReqID, "channels": accepted}); err != nil {
+					return
+				}
 			}
 		}
 	}()

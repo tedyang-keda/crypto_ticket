@@ -223,5 +223,6 @@ func barHistoryColumnsDDL() string {
   is_final TINYINT(1) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  verified_at_ms BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (exchange, symbol, timeframe, start_ms)`
 }

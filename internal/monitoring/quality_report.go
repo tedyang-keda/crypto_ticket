@@ -26,7 +26,34 @@ type delayedSymbol struct {
 func (s *Service) sendMarketQualityReport(ctx context.Context) error {
 	now := s.registry.now()
 	body := s.formatMarketQualityReport(now, s.registry.Snapshot(now))
+	if reader, ok := s.activityStore.(interface {
+		MinuteAuditSummary(context.Context, int64) (market.MinuteAuditSummary, error)
+	}); ok {
+		queryCtx, cancel := context.WithTimeout(ctx, s.cfg.DatabaseTimeout)
+		summary, err := reader.MinuteAuditSummary(queryCtx, now.UnixMilli())
+		cancel()
+		if err != nil {
+			body += "\n**分钟校准待办**: 状态读取失败，当前覆盖情况未知"
+		} else {
+			body += "\n" + formatMinuteAuditSummary(summary, now.In(s.cfg.DailyLocation))
+		}
+	}
 	return s.alerts.SendMarketQuality(ctx, body)
+}
+
+func formatMinuteAuditSummary(summary market.MinuteAuditSummary, now time.Time) string {
+	line := fmt.Sprintf("**分钟校准待办**: pending=%d, running=%d, blocked=%d, expired=%d, excluded=%d",
+		summary.Pending, summary.Running, summary.Blocked, summary.Expired, summary.Excluded)
+	if summary.OldestStartMS > 0 {
+		line += ", oldest=" + formatEventTime(now, summary.OldestStartMS)
+	}
+	if summary.DailyDayStartMS > 0 {
+		line += fmt.Sprintf("\n**隔日分钟逐根核验**: UTC %s, completed=%d/%d",
+			time.UnixMilli(summary.DailyDayStartMS).UTC().Format("2006-01-02"), summary.DailyCompleted, summary.DailyTotal)
+	} else {
+		line += "\n**隔日分钟逐根核验**: 尚未登记完成日"
+	}
+	return line
 }
 
 func (s *Service) formatMarketQualityReport(now time.Time, snapshot Snapshot) string {
@@ -122,7 +149,7 @@ func formatGuardianQuality(now time.Time, events []market.KlineGuardianEvent) []
 	relevant := make([]market.KlineGuardianEvent, 0, len(events))
 	for _, event := range events {
 		switch event.EventType {
-		case "missing_repair", "mismatch_repair", "repair_error", "rest_error":
+		case "missing_repair", "mismatch_repair", "repair_error", "rest_error", "empty_response", "incomplete_response", "ws_final_conflict":
 			counts[event.EventType]++
 			relevant = append(relevant, event)
 			if event.Symbol != "" {
@@ -135,6 +162,10 @@ func formatGuardianQuality(now time.Time, events []market.KlineGuardianEvent) []
 		"**近30分钟质量**: missing=%d, mismatch=%d, repair_failed=%d, rest_error=%d, affected=%d",
 		counts["missing_repair"], counts["mismatch_repair"], counts["repair_error"], counts["rest_error"], len(affected),
 	)}
+	if counts["empty_response"]+counts["incomplete_response"]+counts["ws_final_conflict"] > 0 {
+		lines = append(lines, fmt.Sprintf("- 待核验原因: empty_response=%d, incomplete_response=%d, ws_final_conflict=%d",
+			counts["empty_response"], counts["incomplete_response"], counts["ws_final_conflict"]))
+	}
 	if len(relevant) == 0 {
 		return append(lines, "- 无异常")
 	}
@@ -151,6 +182,12 @@ func formatGuardianQuality(now time.Time, events []market.KlineGuardianEvent) []
 
 func guardianEventDescription(event market.KlineGuardianEvent) string {
 	switch event.EventType {
+	case "empty_response":
+		return "官方 REST 返回空数据，尚未完成核验"
+	case "incomplete_response":
+		return "官方 REST 返回不完整，尚未完成核验"
+	case "ws_final_conflict":
+		return "已拦截与核验值冲突的 WS final，等待官方核验"
 	case "missing_repair":
 		return "缺失，已修复"
 	case "mismatch_repair":

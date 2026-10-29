@@ -17,10 +17,16 @@ type BinanceFuturesAdapter struct {
 }
 
 type binanceExchangeInfoSymbol struct {
-	Symbol         string `json:"symbol"`
-	Status         string `json:"status"`
-	ContractStatus string `json:"contractStatus"`
-	ContractType   string `json:"contractType"`
+	Symbol         string          `json:"symbol"`
+	Status         string          `json:"status"`
+	ContractStatus string          `json:"contractStatus"`
+	ContractType   string          `json:"contractType"`
+	BaseAsset      string          `json:"baseAsset"`
+	QuoteAsset     string          `json:"quoteAsset"`
+	MarginAsset    string          `json:"marginAsset"`
+	OnboardDate    int64           `json:"onboardDate"`
+	DeliveryDate   int64           `json:"deliveryDate"`
+	Raw            json.RawMessage `json:"-"`
 }
 
 func NewBinanceFuturesAdapter(marketType string, restURL string, wsURL string) *BinanceFuturesAdapter {
@@ -62,15 +68,24 @@ func (a *BinanceFuturesAdapter) FetchSymbols(ctx context.Context, client *http.C
 		status := strings.ToUpper(stringValue(firstNonEmpty(item.Status, item.ContractStatus)))
 		contractType := strings.ToUpper(strings.TrimSpace(item.ContractType))
 		isPerpetual := contractType == "PERPETUAL" || contractType == "TRADIFI_PERPETUAL"
+		expiryMS := item.DeliveryDate
+		// Binance uses 2100-12-25 as a perpetual "no delivery" sentinel.
+		if isPerpetual && expiryMS >= 4_102_444_800_000 {
+			expiryMS = 0
+		}
 		symbols = append(symbols, market.SymbolInfo{
-			Exchange:      a.Name(),
-			Symbol:        symbol,
-			MarketType:    a.marketType,
-			Status:        status,
-			IsActive:      status == "TRADING" && isPerpetual,
-			FirstSeenAtMS: now,
-			LastSeenAtMS:  now,
-			UpdatedAtMS:   now,
+			Exchange:       a.Name(),
+			Symbol:         symbol,
+			MarketType:     a.marketType,
+			Status:         status,
+			IsActive:       status == "TRADING" && isPerpetual,
+			FirstSeenAtMS:  now,
+			LastSeenAtMS:   now,
+			UpdatedAtMS:    now,
+			OfficialActive: status == "TRADING",
+			ContractType:   contractType, BaseCurrency: item.BaseAsset,
+			QuoteCurrency: item.QuoteAsset, SettleCurrency: item.MarginAsset,
+			ListedAtMS: item.OnboardDate, ExpiryAtMS: expiryMS, OfficialRaw: item.Raw,
 		})
 	}
 	return symbols, nil
@@ -113,12 +128,27 @@ func (a *BinanceFuturesAdapter) fetchExchangeInfo(ctx context.Context, client *h
 		return nil, fmt.Errorf("binance exchangeInfo status %s", resp.Status)
 	}
 	var payload struct {
-		Symbols []binanceExchangeInfoSymbol `json:"symbols"`
+		Symbols []json.RawMessage `json:"symbols"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return nil, err
 	}
-	return payload.Symbols, nil
+	if len(payload.Symbols) == 0 {
+		return nil, fmt.Errorf("binance exchangeInfo returned no instruments")
+	}
+	symbols := make([]binanceExchangeInfoSymbol, 0, len(payload.Symbols))
+	for _, raw := range payload.Symbols {
+		var symbol binanceExchangeInfoSymbol
+		if err := json.Unmarshal(raw, &symbol); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(symbol.Symbol) == "" || strings.TrimSpace(stringValue(firstNonEmpty(symbol.Status, symbol.ContractStatus))) == "" {
+			return nil, fmt.Errorf("binance exchangeInfo has incomplete instrument")
+		}
+		symbol.Raw = raw
+		symbols = append(symbols, symbol)
+	}
+	return symbols, nil
 }
 
 func (a *BinanceFuturesAdapter) BuildSubscribePayload(symbols []string, requestID int64) ([]byte, error) {

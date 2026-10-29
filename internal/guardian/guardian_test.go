@@ -191,6 +191,50 @@ func TestDailyRepairMissingMismatchAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestDailyRepairChecksDerivedRollupsWhenOfficialBarMatches(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1D")
+	official := dailyTestBar(base, 100, 110, 99, 105)
+	if err := store.UpsertBars(ctx, []market.Bar{official}); err != nil {
+		t.Fatalf("upsert matching daily bar: %v", err)
+	}
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{official}}
+	repairer := &dailyRollupRepairSpy{storeRepairer: &storeRepairer{store: store}}
+	g := New(store, repairer, []Fetcher{fetcher}, Config{Enabled: true})
+
+	result, err := g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base, EndMS: base, Reason: "daily_test", ExpectData: true,
+	})
+	if err != nil || result.Repaired != 0 {
+		t.Fatalf("expected matching daily bar to require no direct repair, result=%+v err=%v", result, err)
+	}
+	if repairer.calls != 1 || len(repairer.sourceBars) != 1 || repairer.sourceBars[0].StartMS != base {
+		t.Fatalf("expected verified daily bar to trigger derived rollup repair, calls=%d sourceBars=%+v", repairer.calls, repairer.sourceBars)
+	}
+}
+
+func TestDailyRepairDoesNotCheckDerivedRollupsForIncompleteOfficialRange(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	base := timeframe.FloorStartMS(1_710_000_000_000, "1D")
+	official := dailyTestBar(base, 100, 110, 99, 105)
+	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{official}}
+	repairer := &dailyRollupRepairSpy{storeRepairer: &storeRepairer{store: store}}
+	g := New(store, repairer, []Fetcher{fetcher}, Config{Enabled: true})
+
+	_, err := g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
+		Exchange: "binance", Symbol: "BTCUSDT", Timeframe: "1D", StartMS: base,
+		EndMS: timeframe.NextStartMS(base, "1D"), Reason: "daily_test", ExpectData: true,
+	})
+	if err == nil {
+		t.Fatal("expected incomplete official daily range to fail")
+	}
+	if repairer.calls != 0 {
+		t.Fatalf("incomplete official data must not trigger derived rollup repair, calls=%d", repairer.calls)
+	}
+}
+
 func TestDailyRepairRejectsNonFinalAndEmptyExisting(t *testing.T) {
 	ctx := context.Background()
 	store := storage.NewMemoryHistoricalStore()
@@ -518,6 +562,18 @@ type storeRepairer struct {
 func (r *storeRepairer) RepairFinalBars(ctx context.Context, bars []market.Bar) error {
 	r.bars = append(r.bars, bars...)
 	return r.store.UpsertBars(ctx, bars)
+}
+
+type dailyRollupRepairSpy struct {
+	*storeRepairer
+	calls      int
+	sourceBars []market.Bar
+}
+
+func (r *dailyRollupRepairSpy) RepairRollups(_ context.Context, sourceBars []market.Bar) error {
+	r.calls++
+	r.sourceBars = append(r.sourceBars, sourceBars...)
+	return nil
 }
 
 func upsertActiveSymbol(t *testing.T, store *storage.MemoryHistoricalStore) {

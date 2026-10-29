@@ -22,3 +22,12 @@ type CorporateActionStore interface {
 	UpdateCorporateActionJob(ctx context.Context, job market.CorporateActionJob) error
 	ListCorporateActionFactors(ctx context.Context, exchange string, symbol string) ([]market.CorporateActionJob, error)
 }
+
+// SymbolSnapshotStore keeps successful official inventory and refresh health
+// separately, so a timeout can never replace the inventory with an empty one.
+type SymbolSnapshotStore interface {
+	SaveSymbolSnapshot(ctx context.Context, batch market.SymbolSnapshotBatch) error
+	RecordSymbolSnapshotFailure(ctx context.Context, state market.SymbolSnapshotSync) error
+	ListSymbolSnapshots(ctx context.Context, exchange string) ([]market.SymbolSnapshot, error)
+	ListSymbolSnapshotSyncs(ctx context.Context) ([]market.SymbolSnapshotSync, error)
+}

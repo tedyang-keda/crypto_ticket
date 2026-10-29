@@ -12,20 +12,29 @@ import (
 )
 
 type MemoryHistoricalStore struct {
-	mu             sync.RWMutex
-	bars           map[string]map[int64]market.Bar
-	symbols        map[string]market.SymbolInfo
-	guardianStates map[string]market.KlineGuardianState
-	guardianEvents []market.KlineGuardianEvent
-	corporateJobs  map[string]market.CorporateActionJob
+	mu                  sync.RWMutex
+	bars                map[string]map[int64]market.Bar
+	symbols             map[string]market.SymbolInfo
+	guardianStates      map[string]market.KlineGuardianState
+	guardianEvents      []market.KlineGuardianEvent
+	minuteAuditTasks    map[int64]market.MinuteAuditTask
+	minuteAuditCursors  map[string]market.MinuteAuditCursor
+	minuteAuditNextID   int64
+	minuteVerifiedAt    map[string]map[int64]int64
+	corporateJobs       map[string]market.CorporateActionJob
+	symbolSnapshots     map[string]market.SymbolSnapshot
+	symbolSnapshotSyncs map[string]market.SymbolSnapshotSync
 }
 
 func NewMemoryHistoricalStore() *MemoryHistoricalStore {
 	return &MemoryHistoricalStore{
-		bars:           make(map[string]map[int64]market.Bar),
-		symbols:        make(map[string]market.SymbolInfo),
-		guardianStates: make(map[string]market.KlineGuardianState),
-		corporateJobs:  make(map[string]market.CorporateActionJob),
+		bars:                make(map[string]map[int64]market.Bar),
+		symbols:             make(map[string]market.SymbolInfo),
+		guardianStates:      make(map[string]market.KlineGuardianState),
+		minuteVerifiedAt:    make(map[string]map[int64]int64),
+		corporateJobs:       make(map[string]market.CorporateActionJob),
+		symbolSnapshots:     make(map[string]market.SymbolSnapshot),
+		symbolSnapshotSyncs: make(map[string]market.SymbolSnapshotSync),
 	}
 }
 
@@ -73,6 +82,9 @@ func (m *MemoryHistoricalStore) UpsertBars(_ context.Context, bars []market.Bar)
 	defer m.mu.Unlock()
 	for _, bar := range bars {
 		key := strings.ToLower(bar.Exchange) + ":" + strings.ToUpper(bar.Symbol) + ":" + bar.Timeframe
+		if bar.Timeframe == "1m" && m.minuteVerifiedAt[key][bar.StartMS] > 0 {
+			continue
+		}
 		if m.bars[key] == nil {
 			m.bars[key] = make(map[int64]market.Bar)
 		}
@@ -140,6 +152,7 @@ func (m *MemoryHistoricalStore) DeleteBarsInRange(_ context.Context, exchange st
 	for start := range rows {
 		if start >= startMS && start <= endMS {
 			delete(rows, start)
+			delete(m.minuteVerifiedAt[key], start)
 			deleted++
 		}
 	}

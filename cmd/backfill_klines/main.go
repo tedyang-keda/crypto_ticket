@@ -217,6 +217,12 @@ func parseOptions(cfg config.Config) (runOptions, error) {
 	flag.BoolVar(&options.dryRun, "dry-run", false, "fetch and log only; do not write MySQL or delete Redis keys")
 	flag.Int64Var(&options.redisScanCount, "redis-scan-count", 500, "Redis SCAN count for cache cleanup")
 	flag.Parse()
+	explicitTimeframes := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "timeframes" {
+			explicitTimeframes = true
+		}
+	})
 
 	exchanges := normalizeCSV(exchangesRaw)
 	if len(exchanges) == 0 {
@@ -235,7 +241,16 @@ func parseOptions(cfg config.Config) (runOptions, error) {
 		if err != nil {
 			return options, err
 		}
+		if err := timeframe.ValidateForExchange(strings.Join(options.exchanges, ","), normalized); err != nil {
+			if !explicitTimeframes && errors.Is(err, timeframe.ErrDisabledTimeframe) {
+				continue
+			}
+			return options, err
+		}
 		options.timeframes = append(options.timeframes, normalized)
+	}
+	if len(options.timeframes) == 0 {
+		return options, errors.New("at least one enabled timeframe is required")
 	}
 	options.adjustment, err = exchange.ParseKlineAdjustment(adjustmentRaw)
 	if err != nil {
@@ -378,6 +393,11 @@ func backfillExchange(
 	symbols []string,
 	options runOptions,
 ) (int, error) {
+	for _, tf := range options.timeframes {
+		if err := timeframe.ValidateForExchange(fetcher.Name(), tf); err != nil {
+			return 0, err
+		}
+	}
 	var total int
 	forwardSymbols := map[string]bool(nil)
 	if options.adjustment != exchange.KlineAdjustmentRaw {
@@ -990,6 +1010,9 @@ func fetchBackfillBars(
 	fetcher exchange.RESTKlineFetcher,
 	request exchange.KlineRequest,
 ) ([]market.Bar, string, error) {
+	if err := timeframe.ValidateForExchange(fetcher.Name(), request.Timeframe); err != nil {
+		return nil, "", err
+	}
 	bars, err := fetcher.FetchKlines(ctx, client, request)
 	if err == nil {
 		return bars, "official", nil
@@ -1033,6 +1056,9 @@ func fetchBackfillBars(
 func deriveBackfillBars(request exchange.KlineRequest, sourceBars []market.Bar) []market.Bar {
 	groups := make(map[int64][]market.Bar)
 	for _, bar := range sourceBars {
+		if timeframe.ValidateForExchange(bar.Exchange, request.Timeframe) != nil {
+			continue
+		}
 		if !bar.IsFinal {
 			continue
 		}

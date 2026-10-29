@@ -8,6 +8,7 @@ from .timeframes import (
     TIMEFRAME_ORDER,
     bucket_end_ms,
     floor_bucket_start_ms,
+    is_supported_timeframe,
     next_bucket_start_ms,
     normalize_timeframe,
     timeframe_index,
@@ -46,6 +47,10 @@ class MultiTimeframeAggregator:
         return asdict(state) if state else None
 
     def restore_state(self, payload: dict[str, Any]) -> None:
+        # Retired periods may still have historical checkpoints. Do not revive
+        # them as active aggregation state after a service restart.
+        if not is_supported_timeframe(payload["timeframe"]):
+            return
         key = self.state_key(payload["exchange"], payload["symbol"], payload["timeframe"])
         self.states[key] = RollingBarState(**payload)
 

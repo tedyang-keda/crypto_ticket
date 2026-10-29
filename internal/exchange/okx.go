@@ -74,7 +74,24 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 		return nil, fmt.Errorf("okx instruments status %s", resp.Status)
 	}
 	var payload struct {
-		Data []struct {
+		Code string            `json:"code"`
+		Msg  string            `json:"msg"`
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.Code != "0" {
+		return nil, fmt.Errorf("okx instruments code %s: %s", payload.Code, payload.Msg)
+	}
+	if len(payload.Data) == 0 {
+		return nil, fmt.Errorf("okx instruments returned no instruments")
+	}
+	now := market.NowMS()
+	symbols := make([]market.SymbolInfo, 0, len(payload.Data))
+	specs := make(map[string]okxInstrumentSpec, len(payload.Data))
+	for _, raw := range payload.Data {
+		var item struct {
 			InstID    string `json:"instId"`
 			State     string `json:"state"`
 			CtType    string `json:"ctType"`
@@ -83,18 +100,18 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 			SettleCcy string `json:"settleCcy"`
 			CtVal     string `json:"ctVal"`
 			CtValCcy  string `json:"ctValCcy"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	now := market.NowMS()
-	symbols := make([]market.SymbolInfo, 0, len(payload.Data))
-	specs := make(map[string]okxInstrumentSpec, len(payload.Data))
-	for _, item := range payload.Data {
+			ListTime  string `json:"listTime"`
+			ExpTime   string `json:"expTime"`
+		}
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, err
+		}
 		symbol := strings.ToUpper(strings.TrimSpace(item.InstID))
 		if symbol == "" {
-			continue
+			return nil, fmt.Errorf("okx instruments has empty instrument id")
+		}
+		if strings.TrimSpace(item.State) == "" {
+			return nil, fmt.Errorf("okx instruments has empty state for %s", symbol)
 		}
 		baseCcy := strings.ToUpper(strings.TrimSpace(item.BaseCcy))
 		quoteCcy := strings.ToUpper(strings.TrimSpace(item.QuoteCcy))
@@ -111,14 +128,17 @@ func (a *OKXAdapter) FetchSymbols(ctx context.Context, client *http.Client) ([]m
 		status := strings.ToLower(item.State)
 		contractType := strings.ToLower(strings.TrimSpace(item.CtType))
 		symbols = append(symbols, market.SymbolInfo{
-			Exchange:      a.Name(),
-			Symbol:        symbol,
-			MarketType:    a.instType,
-			Status:        status,
-			IsActive:      status == "live" && contractType != "inverse",
-			FirstSeenAtMS: now,
-			LastSeenAtMS:  now,
-			UpdatedAtMS:   now,
+			Exchange:       a.Name(),
+			Symbol:         symbol,
+			MarketType:     a.instType,
+			Status:         status,
+			IsActive:       status == "live" && contractType != "inverse",
+			FirstSeenAtMS:  now,
+			LastSeenAtMS:   now,
+			UpdatedAtMS:    now,
+			OfficialActive: status == "live", ContractType: contractType,
+			BaseCurrency: baseCcy, QuoteCurrency: quoteCcy, SettleCurrency: strings.ToUpper(item.SettleCcy),
+			ListedAtMS: parseInt(item.ListTime), ExpiryAtMS: parseInt(item.ExpTime), OfficialRaw: raw,
 		})
 	}
 	a.replaceInstrumentSpecs(specs)

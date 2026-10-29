@@ -147,7 +147,15 @@ func New(store Store, fetchers []Fetcher, notifier Notifier, cache CacheClearer,
 
 func normalizeConfig(cfg Config) Config {
 	if len(cfg.Timeframes) == 0 {
-		cfg.Timeframes = append([]string(nil), timeframe.Order...)
+		cfg.Timeframes = timeframe.SupportedForExchange("")
+	} else {
+		frames := make([]string, 0, len(cfg.Timeframes))
+		for _, tf := range cfg.Timeframes {
+			if timeframe.ValidateForExchange("", tf) == nil {
+				frames = append(frames, tf)
+			}
+		}
+		cfg.Timeframes = frames
 	}
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 1024
@@ -446,6 +454,11 @@ func (w *Worker) retryDelay(attempt int) time.Duration {
 }
 
 func (w *Worker) backfill(ctx context.Context, job market.CorporateActionJob) ([]FrameReport, int, error) {
+	for _, tf := range w.cfg.Timeframes {
+		if err := timeframe.ValidateForExchange(job.Exchange, tf); err != nil {
+			return nil, 0, err
+		}
+	}
 	fetcher := w.fetcherFor(job.Exchange, job.MarketType)
 	if fetcher == nil {
 		return nil, 0, fmt.Errorf("missing fetcher for %s %s", job.Exchange, job.MarketType)
@@ -535,6 +548,9 @@ func (w *Worker) fetchAdjustedBars(ctx context.Context, fetcher Fetcher, job mar
 }
 
 func fetchWithRollup(ctx context.Context, client *http.Client, fetcher Fetcher, request exchange.KlineRequest, transform func([]market.Bar) []market.Bar) ([]market.Bar, string, error) {
+	if err := timeframe.ValidateForExchange(fetcher.Name(), request.Timeframe); err != nil {
+		return nil, "disabled", err
+	}
 	bars, err := fetcher.FetchKlines(ctx, client, request)
 	if err == nil {
 		return bars, "official", nil
@@ -577,6 +593,9 @@ func fetchWithRollup(ctx context.Context, client *http.Client, fetcher Fetcher, 
 }
 
 func deriveBars(request exchange.KlineRequest, source []market.Bar) []market.Bar {
+	if timeframe.ValidateForExchange("", request.Timeframe) != nil {
+		return nil
+	}
 	groups := make(map[int64][]market.Bar)
 	for _, bar := range source {
 		if bar.IsFinal {

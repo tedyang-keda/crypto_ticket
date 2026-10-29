@@ -99,6 +99,10 @@ func (s *Store) ContinuousOneMinuteSeries(ctx context.Context, startMS int64, en
 
 func (s *Store) EnsureSchema(ctx context.Context) error {
 	statements := []string{
+		createMinuteAuditTaskTable,
+		createMinuteAuditCursorTable,
+		createSymbolSnapshotTable,
+		createSymbolSnapshotSyncTable,
 		`CREATE TABLE IF NOT EXISTS symbol_registry (
 			exchange VARCHAR(16) NOT NULL,
 			symbol VARCHAR(64) NOT NULL,
@@ -183,6 +187,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 		return err
 	}
 	if err := s.ensureGuardianEventIndexes(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureMinuteVerificationColumn(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -276,17 +283,7 @@ func (s *Store) UpsertBars(ctx context.Context, bars []market.Bar) error {
 	}
 	defer tx.Rollback()
 
-	historySQL := `INSERT INTO bar_history
-		(exchange, symbol, margin_type, timeframe, start_ms, end_ms, open_price, high_price, low_price, close_price,
-		 volume, volume_unit, quote_volume, quote_unit, contract_volume, trade_count, prev_close, chg, amp, last_tick_ms, is_final)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-		 margin_type=VALUES(margin_type), end_ms=VALUES(end_ms), open_price=VALUES(open_price), high_price=VALUES(high_price),
-		 low_price=VALUES(low_price), close_price=VALUES(close_price), volume=VALUES(volume),
-		 volume_unit=VALUES(volume_unit), quote_volume=VALUES(quote_volume), quote_unit=VALUES(quote_unit),
-		 contract_volume=VALUES(contract_volume), trade_count=VALUES(trade_count),
-		 prev_close=VALUES(prev_close), chg=VALUES(chg), amp=VALUES(amp), last_tick_ms=VALUES(last_tick_ms),
-		 is_final=VALUES(is_final)`
+	historySQL := barUpsertSQL(false)
 	for _, bar := range bars {
 		args := barArgs(bar)
 		if _, err := tx.ExecContext(ctx, historySQL, args...); err != nil {

@@ -152,7 +152,7 @@ func TestOKXFetchSymbolsExcludesInverseContracts(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Status:     "200 OK",
-			Body: io.NopCloser(strings.NewReader(`{"data":[
+			Body: io.NopCloser(strings.NewReader(`{"code":"0","data":[
 				{"instId":"BTC-USDT-SWAP","state":"live","ctType":"linear","settleCcy":"USDT"},
 				{"instId":"BTC-USD-SWAP","state":"live","ctType":"inverse","settleCcy":"BTC"},
 				{"instId":"OLD-USDT-SWAP","state":"suspend","ctType":"linear","settleCcy":"USDT"}

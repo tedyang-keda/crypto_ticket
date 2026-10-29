@@ -30,7 +30,6 @@ FIXED_MINUTE_FRAMES: dict[str, int] = {
 DAY_FRAMES: dict[str, int] = {
     "1D": 1,
     "2D": 2,
-    "3D": 3,
     "5D": 5,
 }
 
@@ -56,7 +55,6 @@ TIMEFRAME_ORDER = (
     "12H",
     "1D",
     "2D",
-    "3D",
     "5D",
     "1W",
     "2W",

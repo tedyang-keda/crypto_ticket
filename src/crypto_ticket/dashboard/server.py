@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ..config import AppConfig
 from ..storage.mysql import MySQLHotStore
-from ..timeframes import TIMEFRAME_ORDER
+from ..timeframes import TIMEFRAME_ORDER, normalize_timeframe
 from .history import load_archive_bars
 
 
@@ -47,6 +47,7 @@ class DashboardRepository:
         return self.mysql.list_symbols(exchange, active_only=active_only)
 
     def get_snapshot(self, exchange: str, symbol: str, timeframe: str) -> dict[str, Any]:
+        timeframe = normalize_timeframe(timeframe)
         symbol_row = self.mysql.get_symbol_registry(exchange, symbol) if self.mysql else None
         checkpoint = self.mysql.get_bar_checkpoint(exchange, symbol, timeframe) if self.mysql else None
         return {
@@ -58,6 +59,7 @@ class DashboardRepository:
         }
 
     def load_bars(self, exchange: str, symbol: str, timeframe: str, *, limit: int = 400) -> list[dict[str, Any]]:
+        timeframe = normalize_timeframe(timeframe)
         if self.mysql:
             try:
                 bars = self.mysql.list_recent_bars(exchange, symbol, timeframe, limit=limit)

@@ -33,6 +33,16 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		return repairResult{}, err
 	}
 	request.Timeframe = tf
+	if tf == "1m" {
+		if heldKey, _ := ctx.Value(minuteLockContextKey{}).(string); heldKey != minuteSymbolKey(request.Exchange, request.Symbol) {
+			lock := g.minuteLock(request.Exchange, request.Symbol)
+			lock.Lock()
+			defer lock.Unlock()
+		}
+		if err := ctx.Err(); err != nil {
+			return repairResult{}, err
+		}
+	}
 	request.StartMS = timeframe.FloorStartMS(request.StartMS, tf)
 	request.EndMS = timeframe.FloorStartMS(request.EndMS, tf)
 	if request.EndMS < request.StartMS {
@@ -49,6 +59,7 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	for start := request.StartMS; start <= request.EndMS; start = timeframe.NextStartMS(start, tf) {
 		limit++
 	}
+	verifiedAtMS := g.now().UnixMilli()
 	official, err := g.fetchKlines(ctx, fetcher, exchange.KlineRequest{
 		Symbol: request.Symbol, Timeframe: tf, StartMS: request.StartMS, EndMS: request.EndMS, Limit: limit,
 		Adjustment: guardianAdjustment(request.Exchange),
@@ -81,7 +92,13 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		}
 		// Before listing and on non-trading days an empty official range can be
 		// legitimate, but it is not evidence that local market data is healthy.
-		return repairResult{}, g.upsertTimeframeAuditState(ctx, request, "no_data")
+		if err := g.upsertTimeframeAuditState(ctx, request, "no_data"); err != nil {
+			return repairResult{}, err
+		}
+		if tf == "1m" {
+			return repairResult{}, fmt.Errorf("unchecked official 1m range for %s:%s: empty response without a confirmed non-trading interval", request.Exchange, request.Symbol)
+		}
+		return repairResult{}, nil
 	}
 	if request.ExpectData {
 		expectedStart := request.StartMS
@@ -138,16 +155,31 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	for _, event := range result.Events {
 		changed[event.StartMS] = true
 	}
-	for _, bar := range validOfficial {
-		if !changed[bar.StartMS] && !request.ForceReplay {
-			continue
-		}
+	for i, bar := range validOfficial {
 		bar.Source = "rest"
 		bar.Reason = "guardian_" + request.Reason
 		bar.UpdatedAtMS = g.now().UnixMilli()
-		toRepair = append(toRepair, market.DecorateBar(bar))
+		bar = market.DecorateBar(bar)
+		validOfficial[i] = bar
+		if !changed[bar.StartMS] && !request.ForceReplay {
+			continue
+		}
+		toRepair = append(toRepair, bar)
 	}
-	if len(toRepair) > 0 {
+	if verifier, ok := g.repairer.(VerifiedMinuteRepairer); tf == "1m" && ok {
+		if err := verifier.VerifyFinalBars(ctx, validOfficial, verifiedAtMS); err != nil {
+			g.recordRepairFailure(ctx, request, "repair_error", err)
+			return result, err
+		}
+		if request.ForceReplay {
+			if rollupRepairer, ok := g.repairer.(DerivedRollupRepairer); ok {
+				if err := rollupRepairer.RepairRollups(ctx, validOfficial); err != nil {
+					g.recordRepairFailure(ctx, request, "repair_error", err)
+					return result, err
+				}
+			}
+		}
+	} else if len(toRepair) > 0 {
 		if err := g.repairer.RepairFinalBars(ctx, toRepair); err != nil {
 			g.recordRepairFailure(ctx, request, "repair_error", err)
 			return result, err
@@ -160,6 +192,14 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		g.recordRepairFailure(ctx, request, "incomplete_response", responseErr)
 		return result, responseErr
 	}
+	if request.Timeframe == "1D" {
+		if rollupRepairer, ok := g.repairer.(DerivedRollupRepairer); ok {
+			if err := rollupRepairer.RepairRollups(ctx, validOfficial); err != nil {
+				g.recordRepairFailure(ctx, request, "repair_error", err)
+				return result, err
+			}
+		}
+	}
 	status := "ok"
 	if result.Repaired > 0 || request.ForceReplay {
 		status = "repaired"
@@ -167,7 +207,13 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	if unchecked {
 		status = "unchecked"
 	}
-	return result, g.upsertTimeframeAuditState(ctx, request, status)
+	if err := g.upsertTimeframeAuditState(ctx, request, status); err != nil {
+		return result, err
+	}
+	if unchecked {
+		return result, fmt.Errorf("unchecked official %s range for %s:%s: missing minute keys without a confirmed listing or non-trading boundary", tf, request.Exchange, request.Symbol)
+	}
+	return result, nil
 }
 
 func filterOfficialBars(bars []market.Bar, request timeframeRepairRequest, nowMS int64) ([]market.Bar, int) {
@@ -271,6 +317,11 @@ func (g *Guardian) upsertTimeframeAuditState(ctx context.Context, request timefr
 }
 
 func (g *Guardian) retryFailedRepair(ctx context.Context, fetcher Fetcher, exchangeName string, symbol string, tf string) (repairResult, error) {
+	if tf == "1m" && g.minuteTaskStore() != nil {
+		// The task ledger retains all minute ranges, unlike the single summary
+		// state. Its worker owns retries and survives unrelated successful audits.
+		return repairResult{}, nil
+	}
 	state, err := g.store.LoadKlineGuardianState(ctx, exchangeName, symbol, tf)
 	if err != nil || state == nil || state.Status != "repair_error" {
 		return repairResult{}, err

@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 )
 
 type fallbackFetcher struct {
+	name  string
 	bars  []market.Bar
 	calls []exchange.KlineRequest
 }
@@ -48,6 +52,9 @@ func (s *backfillDerivedStore) DeleteBarsInRange(context.Context, string, string
 }
 
 func (f *fallbackFetcher) Name() string {
+	if f.name != "" {
+		return f.name
+	}
 	return "test"
 }
 
@@ -57,6 +64,91 @@ func (f *fallbackFetcher) FetchKlines(_ context.Context, _ *http.Client, request
 		return nil, fmt.Errorf("%w: test timeframe", exchange.ErrUnsupportedKlineInterval)
 	}
 	return f.bars, nil
+}
+
+func TestParseOptionsRejectsExplicitThreeDayInterval(t *testing.T) {
+	for _, exchanges := range []string{"binance", "okx", "binance,okx"} {
+		for _, frames := range []string{"3D", "1D,3D,1W"} {
+			t.Run(exchanges+"/"+frames, func(t *testing.T) {
+				options, err := parseBackfillTestOptions(t, "-exchanges", exchanges, "-timeframes", frames)
+				if !errors.Is(err, timeframe.ErrDisabledTimeframe) {
+					t.Fatalf("expected explicit 3D selection to fail, got options=%+v err=%v", options, err)
+				}
+			})
+		}
+	}
+}
+
+func TestParseOptionsSkipsDisabledDefaultInterval(t *testing.T) {
+	options, err := parseBackfillTestOptions(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(options.timeframes, []string{"1D", "1W"}) {
+		t.Fatalf("default timeframes should omit disabled 3D, got %v", options.timeframes)
+	}
+}
+
+func parseBackfillTestOptions(t *testing.T, args ...string) (runOptions, error) {
+	t.Helper()
+	previousFlags, previousArgs := flag.CommandLine, os.Args
+	flag.CommandLine = flag.NewFlagSet("backfill-test", flag.ContinueOnError)
+	os.Args = append([]string{"backfill-test"}, args...)
+	t.Cleanup(func() {
+		flag.CommandLine, os.Args = previousFlags, previousArgs
+	})
+	return parseOptions(config.Config{
+		RecentCacheLimit: 10,
+		Timeframes:       []string{"1D", "3D", "1W"},
+		Exchanges: []config.ExchangeConfig{
+			{Name: "binance", Enabled: true},
+			{Name: "okx", Enabled: true},
+		},
+	})
+}
+
+func TestFetchBackfillBarsRejectsThreeDayBeforeFetchOrFallback(t *testing.T) {
+	for _, name := range []string{"binance", "okx", "binance-continuous"} {
+		t.Run(name, func(t *testing.T) {
+			fetcher := &fallbackFetcher{name: name}
+			_, _, err := fetchBackfillBars(context.Background(), http.DefaultClient, fetcher, exchange.KlineRequest{
+				Symbol: "TEST", Timeframe: "3D", Limit: 1,
+			})
+			if !errors.Is(err, timeframe.ErrDisabledTimeframe) || len(fetcher.calls) != 0 {
+				t.Fatalf("disabled interval must not fetch or roll up daily bars: err=%v calls=%+v", err, fetcher.calls)
+			}
+		})
+	}
+}
+
+func TestBackfillRejectsThreeDayBeforeAnyWork(t *testing.T) {
+	store := &backfillDerivedStore{}
+	fetcher := &fallbackFetcher{name: "okx"}
+	_, err := backfillExchange(context.Background(), store, http.DefaultClient, fetcher, []string{"BTC-USDT-SWAP"}, runOptions{
+		timeframes: []string{"1D", "3D"}, limit: 1, batchSize: 10, adjustment: exchange.KlineAdjustmentRaw, replaceExisting: true,
+	})
+	if !errors.Is(err, timeframe.ErrDisabledTimeframe) || len(fetcher.calls) != 0 || store.deleted != 0 || len(store.upserted) != 0 {
+		t.Fatalf("disabled interval must be rejected before fetch or write: err=%v fetches=%d deletes=%d upserts=%d", err, len(fetcher.calls), store.deleted, len(store.upserted))
+	}
+}
+
+func TestDeriveBackfillBarsCannotSynthesizeDisabledThreeDay(t *testing.T) {
+	start := timeframe.FloorStartMS(time.Now().AddDate(0, 0, -10).UnixMilli(), "3D")
+	for _, name := range []string{"binance", "okx"} {
+		t.Run(name, func(t *testing.T) {
+			daily := make([]market.Bar, 0, 3)
+			for i := 0; i < 3; i++ {
+				barStart := start + int64(i)*timeframe.DayMS
+				daily = append(daily, market.Bar{
+					Exchange: name, Symbol: "TEST", Timeframe: "1D", StartMS: barStart, EndMS: timeframe.EndMS(barStart, "1D"),
+					OpenPrice: 10, HighPrice: 11, LowPrice: 9, ClosePrice: 10, IsFinal: true,
+				})
+			}
+			if bars := deriveBackfillBars(exchange.KlineRequest{Symbol: "TEST", Timeframe: "3D"}, daily); len(bars) != 0 {
+				t.Fatalf("disabled 3D synthesized from daily bars: %+v", bars)
+			}
+		})
+	}
 }
 
 func TestFetchBackfillBarsRollsUpUnsupportedTarget(t *testing.T) {

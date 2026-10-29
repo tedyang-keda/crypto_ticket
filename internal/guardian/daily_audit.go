@@ -166,7 +166,7 @@ func (g *Guardian) dailyAuditOnce(ctx context.Context) error {
 
 func isRetryableDailyStatus(status string) bool {
 	switch status {
-	case "repair_error", "rest_error", "empty_response", "incomplete_response":
+	case "repair_error", "rest_error", "empty_response", "incomplete_response", "unchecked":
 		return true
 	default:
 		return false
@@ -182,8 +182,15 @@ func (g *Guardian) dailyAuditTargets(ctx context.Context) ([]auditTarget, error)
 		if err != nil {
 			return nil, err
 		}
+		eligibility, err := g.loadRepairEligibility(ctx, exchangeName)
+		if err != nil {
+			return nil, err
+		}
 		for _, symbol := range symbols {
 			if !symbol.IsActive {
+				continue
+			}
+			if !eligibility.permits(symbol) {
 				continue
 			}
 			fetcher := g.fetcherFor(symbol.Exchange, symbol.MarketType)

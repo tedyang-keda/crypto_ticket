@@ -34,24 +34,31 @@ const (
 )
 
 type Config struct {
-	Enabled                bool
-	ObserveFinalBars       bool
-	DailyAuditEnabled      bool
-	DailyAuditInterval     time.Duration
-	DailyAuditDays         int
-	DailyAuditLookbackDays int
-	AuditInterval          time.Duration
-	AuditWindow            time.Duration
-	AuditDelay             time.Duration
-	RequestDelay           time.Duration
-	HTTPTimeout            time.Duration
-	QueueSize              int
-	SymbolsPerRun          int
-	MaxInflightPerExchange int
-	SymbolMaxAge           time.Duration
-	FloatTolerance         float64
-	RequestIntervals       map[string]time.Duration
-	Observer               Observer
+	Enabled                  bool
+	RequireSymbolSnapshots   bool
+	RequireMinuteTaskStore   bool
+	MinuteDayAuditEnabled    bool
+	MinuteDayAuditOffset     time.Duration
+	MinuteRetention          time.Duration
+	MinuteRetryInterval      time.Duration
+	MinuteDayRequestInterval time.Duration
+	ObserveFinalBars         bool
+	DailyAuditEnabled        bool
+	DailyAuditInterval       time.Duration
+	DailyAuditDays           int
+	DailyAuditLookbackDays   int
+	AuditInterval            time.Duration
+	AuditWindow              time.Duration
+	AuditDelay               time.Duration
+	RequestDelay             time.Duration
+	HTTPTimeout              time.Duration
+	QueueSize                int
+	SymbolsPerRun            int
+	MaxInflightPerExchange   int
+	SymbolMaxAge             time.Duration
+	FloatTolerance           float64
+	RequestIntervals         map[string]time.Duration
+	Observer                 Observer
 }
 
 type Observer interface {
@@ -70,6 +77,19 @@ type Store interface {
 
 type Repairer interface {
 	RepairFinalBars(ctx context.Context, bars []market.Bar) error
+}
+
+// VerifiedMinuteRepairer records every successfully compared official minute,
+// including unchanged values, while only changed values require a cascade.
+type VerifiedMinuteRepairer interface {
+	VerifyFinalBars(ctx context.Context, bars []market.Bar, verifiedAtMS int64) error
+}
+
+// DerivedRollupRepairer rebuilds larger timeframes from already-verified
+// source bars. It is optional so Guardian can still be used with repairers
+// that only support direct bar writes.
+type DerivedRollupRepairer interface {
+	RepairRollups(ctx context.Context, sourceBars []market.Bar) error
 }
 
 type corporateActionFactorStore interface {
@@ -100,6 +120,9 @@ type Guardian struct {
 	dailyAuditMu       sync.Mutex
 	dailyAuditCursor   int
 	dailyRetries       map[string]map[dailyAuditRange]bool
+	minuteLocks        [128]sync.Mutex
+	minuteDayPacers    map[string]*requestPacer
+	minuteDayRunMu     sync.Mutex
 	now                func() time.Time
 }
 
@@ -109,6 +132,7 @@ type auditTarget struct {
 	MarketType    string
 	Fetcher       Fetcher
 	FirstSeenAtMS int64
+	ListedAtMS    int64
 }
 
 type repairResult struct {
@@ -140,6 +164,7 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 		fetchersByExchange: make(map[string][]Fetcher),
 		requestPacers:      make(map[string]*requestPacer),
 		requestSlots:       make(map[string]chan struct{}),
+		minuteDayPacers:    make(map[string]*requestPacer),
 		observer:           cfg.Observer,
 		dailyRetries:       make(map[string]map[dailyAuditRange]bool),
 		now:                time.Now,
@@ -159,16 +184,29 @@ func New(store Store, repairer Repairer, fetchers []Fetcher, cfg Config) *Guardi
 			}
 			g.requestPacers[exchangeName] = &requestPacer{interval: interval}
 			g.requestSlots[exchangeName] = make(chan struct{}, cfg.MaxInflightPerExchange)
+			g.minuteDayPacers[exchangeName] = &requestPacer{interval: cfg.MinuteDayRequestInterval}
 		}
 	}
 	g.client = &http.Client{
 		Timeout:   cfg.HTTPTimeout,
-		Transport: requestPacingTransport{base: http.DefaultTransport, pacers: g.requestPacers},
+		Transport: requestPacingTransport{base: http.DefaultTransport, pacers: g.requestPacers, minuteDayPacers: g.minuteDayPacers},
 	}
 	return g
 }
 
 func normalizeConfig(cfg Config) Config {
+	if cfg.MinuteDayAuditOffset <= 0 {
+		cfg.MinuteDayAuditOffset = 30 * time.Minute
+	}
+	if cfg.MinuteRetention <= 0 {
+		cfg.MinuteRetention = 7 * 24 * time.Hour
+	}
+	if cfg.MinuteRetryInterval <= 0 {
+		cfg.MinuteRetryInterval = 15 * time.Second
+	}
+	if cfg.MinuteDayRequestInterval < time.Second {
+		cfg.MinuteDayRequestInterval = time.Second
+	}
 	if cfg.AuditInterval <= 0 {
 		cfg.AuditInterval = defaultAuditInterval
 	}
@@ -240,13 +278,24 @@ func (g *Guardian) Run(ctx context.Context) error {
 	if !g.cfg.Enabled {
 		return nil
 	}
-	errCh := make(chan error, 3)
+	if g.cfg.RequireMinuteTaskStore && g.minuteTaskStore() == nil {
+		return fmt.Errorf("guardian requires a durable minute audit task store")
+	}
+	errCh := make(chan error, 5)
 	workers := 1
 	if g.cfg.ObserveFinalBars {
 		workers++
 		go func() { errCh <- g.runObservedFinals(ctx) }()
 	}
 	go func() { errCh <- g.runAudits(ctx) }()
+	if g.minuteTaskStore() != nil {
+		workers++
+		go func() { errCh <- g.runMinuteRetries(ctx) }()
+	}
+	if g.cfg.MinuteDayAuditEnabled {
+		workers++
+		go func() { errCh <- g.runMinuteDayAudits(ctx) }()
+	}
 	if g.cfg.DailyAuditEnabled {
 		workers++
 		go func() { errCh <- g.runDailyAudits(ctx) }()
@@ -469,7 +518,7 @@ func (g *Guardian) auditTargetGroup(ctx context.Context, targets []auditTarget, 
 	var summaryMu sync.Mutex
 	g.runTargetPool(ctx, targets, func(ctx context.Context, target auditTarget) {
 		retry, retryErr := g.retryFailedRepair(ctx, target.Fetcher, target.Exchange, target.Symbol, aggregator.OneMinute)
-		result, err := g.repairRangeWithFetcher(ctx, target.Fetcher, target.Exchange, target.Symbol, startMS, endMS, "window_audit")
+		result, err := g.auditMinuteWindow(ctx, target, startMS, endMS)
 		summaryMu.Lock()
 		summary.CheckedSymbols++
 		summary.CheckedBars += result.Checked + retry.Checked
@@ -500,8 +549,15 @@ func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 		if err != nil {
 			return nil, err
 		}
+		eligibility, err := g.loadRepairEligibility(ctx, exchangeName)
+		if err != nil {
+			return nil, err
+		}
 		for _, symbol := range symbols {
 			if !symbol.IsActive {
+				continue
+			}
+			if !eligibility.permits(symbol) {
 				continue
 			}
 			if symbol.LastSeenAtMS <= 0 || now-symbol.LastSeenAtMS > int64(g.cfg.SymbolMaxAge/time.Millisecond) {
@@ -517,6 +573,7 @@ func (g *Guardian) auditTargets(ctx context.Context) ([]auditTarget, error) {
 				MarketType:    normalizeMarketType(symbol.MarketType),
 				Fetcher:       fetcher,
 				FirstSeenAtMS: symbol.FirstSeenAtMS,
+				ListedAtMS:    eligibility.listedAt(symbol),
 			})
 		}
 	}
@@ -544,6 +601,12 @@ func (g *Guardian) repairRange(ctx context.Context, exchangeName string, symbol 
 }
 
 func (g *Guardian) repairRangeWithFetcher(ctx context.Context, fetcher Fetcher, exchangeName string, symbol string, startMS int64, endMS int64, reason string) (repairResult, error) {
+	if g.minuteTaskStore() != nil {
+		return g.repairDurableMinuteRange(ctx, fetcher, exchangeName, symbol, startMS, endMS, reason)
+	}
+	if g.cfg.RequireMinuteTaskStore {
+		return repairResult{}, fmt.Errorf("guardian requires a durable minute audit task store")
+	}
 	return g.repairTimeframeRange(ctx, fetcher, timeframeRepairRequest{
 		Exchange: exchangeName, Symbol: symbol, Timeframe: aggregator.OneMinute,
 		StartMS: startMS, EndMS: endMS, Reason: reason,
@@ -711,7 +774,7 @@ func barsDiffer(local market.Bar, official market.Bar, tolerance float64) bool {
 		floatDiffers(local.ContractVolume, official.ContractVolume, tolerance) {
 		return true
 	}
-	if official.TradeCount > 0 && local.TradeCount != official.TradeCount {
+	if market.OfficialTradeCountAvailable(official) && local.TradeCount != official.TradeCount {
 		return true
 	}
 	return false

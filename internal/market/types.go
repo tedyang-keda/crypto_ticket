@@ -62,6 +62,17 @@ type SymbolInfo struct {
 	FirstSeenAtMS int64  `json:"first_seen_at_ms"`
 	LastSeenAtMS  int64  `json:"last_seen_at_ms"`
 	UpdatedAtMS   int64  `json:"updated_at_ms"`
+	// Official metadata is independent of IsActive, which is the local
+	// subscription policy (for example inverse and delivery contracts are off).
+	OfficialActive bool            `json:"official_active"`
+	ContractType   string          `json:"contract_type,omitempty"`
+	BaseCurrency   string          `json:"base_currency,omitempty"`
+	QuoteCurrency  string          `json:"quote_currency,omitempty"`
+	SettleCurrency string          `json:"settle_currency,omitempty"`
+	ListedAtMS     int64           `json:"listed_at_ms,omitempty"`
+	DelistAtMS     int64           `json:"delist_at_ms,omitempty"`
+	ExpiryAtMS     int64           `json:"expiry_at_ms,omitempty"`
+	OfficialRaw    json.RawMessage `json:"official_raw,omitempty"`
 }
 
 type MarketSeries struct {

@@ -3,11 +3,58 @@ package exchange
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+
+	"crypto-ticket/internal/timeframe"
 )
+
+func TestBinanceThreeDayKlinesDisabledBeforeHTTP(t *testing.T) {
+	for _, marketType := range []string{"um_futures", "coin_futures", "spot"} {
+		for _, continuous := range []bool{false, true} {
+			t.Run(marketType+"/continuous="+fmt.Sprint(continuous), func(t *testing.T) {
+				requests := 0
+				client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					requests++
+					return jsonResponse(`[]`), nil
+				})}
+				adapter := NewBinanceFuturesAdapter(marketType, "https://binance.test", "wss://example")
+				request := KlineRequest{Symbol: "BTCUSDT", Timeframe: "3D", Limit: 1}
+				var err error
+				if continuous {
+					_, err = adapter.FetchContinuousKlines(context.Background(), client, request)
+				} else {
+					_, err = adapter.FetchKlines(context.Background(), client, request)
+				}
+				if !errors.Is(err, timeframe.ErrDisabledTimeframe) || !errors.Is(err, ErrUnsupportedKlineInterval) {
+					t.Fatalf("expected disabled interval error, got %v", err)
+				}
+				if requests != 0 {
+					t.Fatalf("disabled interval issued %d HTTP requests", requests)
+				}
+			})
+		}
+	}
+}
+
+func TestOKXThreeDayKlinesDisabledBeforeHTTP(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return jsonResponse(`{"code":"0","data":[]}`), nil
+	})}
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	_, err := adapter.FetchKlines(context.Background(), client, KlineRequest{Symbol: "BTC-USDT-SWAP", Timeframe: "3D", Limit: 1})
+	if !errors.Is(err, timeframe.ErrDisabledTimeframe) || !errors.Is(err, ErrUnsupportedKlineInterval) {
+		t.Fatalf("expected disabled interval error, got %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("disabled interval issued %d HTTP requests", requests)
+	}
+}
 
 func TestBinanceFetchKlinesUsesOfficialVolumeFields(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {

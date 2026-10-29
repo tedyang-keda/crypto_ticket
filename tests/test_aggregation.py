@@ -2,6 +2,16 @@ from crypto_ticket.aggregation import MinuteBarRollupAggregator, MultiTimeframeA
 from crypto_ticket.models import BarEvent, TickEvent
 
 
+def test_retired_3d_is_not_generated_or_restored():
+    agg = MultiTimeframeAggregator()
+    minute_rollup = MinuteBarRollupAggregator()
+    assert "3D" not in agg.timeframes
+    assert "3D" not in minute_rollup.timeframes
+    assert "5D" in agg.timeframes
+    agg.restore_state({"exchange": "binance", "symbol": "BTCUSDT", "timeframe": "3D"})
+    assert not agg.states
+
+
 def test_aggregator_emits_1m_bars_and_rolls_up():
     agg = MultiTimeframeAggregator()
     ticks = [

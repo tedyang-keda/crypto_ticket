@@ -26,7 +26,7 @@ export const useMarketStore = create<MarketState>((set) => ({
   connection: "idle",
   setExchange: (exchange) => set({ exchange, symbol: exchange === "okx" ? "BTC-USDT-SWAP" : "BTCUSDT", latestTick: null, bars: [] }),
   setSymbol: (symbol) => set({ symbol, latestTick: null, bars: [] }),
-  setTimeframe: (timeframe) => set({ timeframe, bars: [] }),
+  setTimeframe: (timeframe) => set({ timeframe: timeframe === "3D" ? "1D" : timeframe, bars: [] }),
   setLatestTick: (latestTick) =>
     set((state) => {
       if (!latestTick) return { latestTick };

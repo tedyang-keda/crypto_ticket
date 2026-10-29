@@ -48,17 +48,19 @@ HTTP /api/v1/klines?include_live=true
 运行时 timeframe 支持：
 
 ```text
-1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 2D 3D 5D 1W 2W 1M 3M
+1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 2D 5D 1W 2W 1M 3M
 ```
 
 时间桶按 UTC 计算。`1W` / `2W` 以 UTC Monday 为周起点，`1M` / `3M` 以 UTC 月初为起点。
+
+`3D` 已在 Binance、OKX 停用：不再聚合、补写、提供 HTTP 查询或 WS 订阅，页面也不再显示。已有历史数据不删除。Go 中保留旧时间桶算法，仅用于历史数据及保留策略兼容，不代表运行时仍支持该周期。
 
 HTTP 和 WS 参数是大小写敏感的，必须使用上面的规范值，例如 `1H`，不是 `1h`。
 
 REST backfill 使用交易所官方历史 K 线接口，支持范围受交易所限制：
 
-- Binance REST: `1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 3D 1W 1M`
-- OKX REST: `1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 2D 3D 1W 1M 3M`
+- Binance REST: `1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 1W 1M`
+- OKX REST: `1m 5m 15m 30m 1H 2H 4H 6H 12H 1D 2D 1W 1M 3M`
 - 运行时 rollup 可以基于 final `1m` 合成完整的本地支持周期。
 
 ## 启动和配置
@@ -117,6 +119,10 @@ go run ./cmd/marketd
 | `KLINE_GUARDIAN_DAILY_AUDIT_SECONDS` | `3600` | 日线审计启动时执行一次，之后每小时执行 |
 | `KLINE_GUARDIAN_DAILY_AUDIT_DAYS` | `7` | 每轮检查最近已结束的 7 天，并额外滚动检查一个等长历史块 |
 | `KLINE_GUARDIAN_DAILY_LOOKBACK_DAYS` | `300` | 日线历史滚动覆盖范围；失败范围保留并重试 |
+| `KLINE_GUARDIAN_MINUTE_DAY_AUDIT_ENABLED` | `true` | Guardian 开启后，低优先级逐根校准上一 UTC 日的 `1m`；任务跨重启保留 |
+| `KLINE_GUARDIAN_MINUTE_DAY_OFFSET_MINUTES` | `30` | UTC 日结束后等待多少分钟再登记隔日分钟核验 |
+| `KLINE_GUARDIAN_MINUTE_DAY_RPS` | `1` | 后台分钟核验每交易所的 HTTP 请求上限，同时服从全局 Guardian 速率与并发上限 |
+| `KLINE_GUARDIAN_MINUTE_RETRY_SECONDS` | `15` | 持久分钟待办的后台调度间隔；失败使用退避 |
 | `ENABLE_HEALTH_MONITOR` | 跟随 `ENABLE_COLLECTOR` | 启用进程内健康评估、Prometheus 指标、P0 告警和每日摘要 |
 | `MONITOR_P1_ALERTS_ENABLED` | `false` | P1 实时飞书告警开关；关闭时仍采集指标并在日报统计 would-fire |
 | `MONITOR_EVALUATION_SECONDS` | `15` | 健康评估周期；MySQL 连续失败 3 次后产生 P0 告警 |
@@ -232,17 +238,24 @@ final `1m`：
 
 `marketd` 内置轻量 K 线守护者，用来处理 WS 断流、进程重启、写入失败后可能造成的 final `1m` 缺口或字段不一致。
 
-开启 `ENABLE_KLINE_GUARDIAN=true` 后，守护者有三条路径，默认只运行两个周期任务，不注册逐根 final 观察者：
+开启 `ENABLE_KLINE_GUARDIAN=true` 后，默认运行近窗口、官方日线和隔日分钟校验，不注册逐根 final 观察者：
 
 1. 可选实时水位检测（`KLINE_GUARDIAN_OBSERVE_FINAL_BARS=true`）：每次 final `1m` 成功入库后检查上一根 final start，跳过分钟桶时用官方 REST 修复。默认关闭这条路径，不影响周期补洞。
 2. 近窗口 REST 校验：默认每两分钟检查全部 active symbols，只检查 `now - KLINE_GUARDIAN_WINDOW_MINUTES` 到 `now - KLINE_GUARDIAN_DELAY_SECONDS` 之间的 final `1m`，比较本地 MySQL 与官方 REST 的 OHLCV。Binance 与 OKX 分组并行，分别受各自的 RPS 配置限制。
 3. 独立日线校验：启动后和每小时校验全量 active symbols 的最近 7 根已结束 UTC 日线，以及 300 天范围内轮转的历史块。直接比较官方 `1D`（OKX 为 `1Dutc`）与本地数据，缺失或不一致通过 `MarketService.RepairFinalBars` 补写并触发已具备完整源数据的周/月等上层聚合，不要求本地 `1m/1H` 完整。日线与分钟线共享交易所独立限速；官方或写入失败会重试，不中断实时采集，也不重新启用高级周期告警。
+4. 隔日分钟校准：每天 UTC 00:30 后登记上一 UTC 日全量 active symbols 的 `1m` 任务；逐根比较官方数据，只修改有差异的分钟并级联重建。每交易所后台请求最多 1 RPS，同时占用原有共享限速与并发预算；不全量抓取所有高周期。
+
+分钟范围在请求前写入持久待办，只有官方响应完整、修复与级联成功、核验标记保存后才能完成。REST 失败、响应缺根或写入失败都会保留待办并退避重试，不因移出 30 分钟窗口而遗忘；重启按持久游标登记停机期间范围。超过 7 天分钟保留期的任务标为过期，停订阅或下架品种标为排除，均不冒充修复成功。
+
+已通过官方核验的 final `1m` 保存 `verified_at_ms`。迟到 WS 如内容相同则跳过，内容冲突则拒绝覆盖并登记官方重查待办；更新的官方修订仍允许通过显式校准路径修复。按品种串行化写入和聚合，防止旧聚合结果覆盖新结果。分钟核验与高周期级联不是跨表事务，进程中断由持久待办重新执行级联；即使日线内容没有变化，日线校验也会重新检查并构建已满足源数据条件的上层周期。
 
 分钟和日线任务按交易所并行处理，每个交易所最多 8 个在途 REST 请求；实际请求启动仍受 Binance 8 RPS、OKX 5 RPS 的共享 pacer 限制，不会因为并发提高请求速率。两分钟是调度间隔，不是无条件的完成保证：实际覆盖耗时取决于品种数量、官方响应时间、限速和数据库延迟；同一类审计轮次不会重叠堆积。
 
 为避免历史测试数据或旧脏 symbol 触发无效 REST 请求，近窗口校验只会选择最近 `KLINE_GUARDIAN_SYMBOL_MAX_AGE_SECONDS` 内被 collector 刷新过的 active symbol。实时水位检测不受这个限制，因为它来自真实 WS final bar。
 
 监控服务默认每 30 分钟发送一份“行情接入与质量报告”，内容包括：实际订阅品种和交易所 WS 连接状态；服务器整体 CPU、内存和磁盘；`marketd` 进程 CPU、RSS、FD 和 goroutine；MySQL 可用性、连接池、服务端连接和 QPS；Redis 可用性、客户端连接、内存、ops/s 和连接池；近 5 分钟 HTTP 当前连接、QPS、非 5xx 成功率和 P95；公共 WebSocket 当前连接、握手成功率、写入成功率和慢消费者丢弃；连续行情延迟品种；以及近 30 分钟 Guardian 的缺失、不一致、REST 失败和修复失败明细。`missing_repair` 与 `mismatch_repair` 表示修复写入成功，不额外执行二次 REST 复核。
+
+报告还显示持久分钟待办数量、最早未完成时间、阻塞/过期/排除状态，以及最近 UTC 日分钟校准的完成进度；读取待办失败会明确显示未知，不显示为零异常。
 
 校验字段：
 
@@ -268,7 +281,7 @@ final `1m`：
 30m      <- 15m
 1H       <- 30m
 2H/4H/6H/12H/1D <- 1H
-2D/3D/5D/1W/2W/1M/3M <- 1D
+2D/5D/1W/2W/1M/3M <- 1D
 ```
 
 对每个配置的 timeframe：
@@ -509,6 +522,8 @@ MySQL 模式下，Go 会确保存在这些表：
 - `bar_history`
 - `kline_guardian_state`
 - `kline_guardian_event`
+- `kline_minute_audit_task`
+- `kline_minute_audit_cursor`
 
 `symbol_registry`：
 
@@ -520,7 +535,7 @@ MySQL 模式下，Go 会确保存在这些表：
 
 - 主键：`exchange, symbol, timeframe, start_ms`
 - 存 OHLCV、quote volume、contract volume、trade count、derived fields、`last_tick_ms`、`is_final`。
-- `UpsertBars` 使用 `INSERT ... ON DUPLICATE KEY UPDATE`，同一根 K 线可覆盖更新。
+- `UpsertBars` 使用 `INSERT ... ON DUPLICATE KEY UPDATE`；已保存 `verified_at_ms > 0` 的 `1m` 只能由显式官方校准路径修改。
 - `BarsInRange` 只返回 `is_final = 1` 的 bars，rollup 依赖这个查询。
 - `RecentBars` 按 `start_ms DESC LIMIT ?` 查最近 bars，再反转成时间升序返回。
 
@@ -550,6 +565,8 @@ final 1m received
 - 存 `gap_detected`、`missing_repair`、`mismatch_repair`、`rest_error`、`repair_error` 等事件。
 - `old_value_json` / `new_value_json` 用来记录修复前后的 bar 快照或错误信息。
 
+`kline_minute_audit_task` 保存分钟待核验范围、任务种类、租约和退避重试状态；日任务完成记录保留 7 天用于展示进度。`kline_minute_audit_cursor` 保存已经登记任务的水位，不代表这些任务已经核验成功。`bar_history.verified_at_ms` 随分钟线保留期清理；旧表新增该字段只允许 MySQL `ALGORITHM=INSTANT`，不回退到复制大表。
+
 ### Retention 和分区维护
 
 默认历史保留策略：
@@ -559,7 +576,7 @@ final 1m received
 | `1m` | 7 天 |
 | `5m` / `15m` / `30m` | 30 天 |
 | `1H` / `2H` / `4H` / `6H` / `12H` | 180 天 |
-| `1D` / `2D` / `3D` / `5D` / `1W` / `2W` / `1M` / `3M` | 每个 exchange + symbol + timeframe 最新 300 根 |
+| `1D` / `2D` / `5D` / `1W` / `2W` / `1M` / `3M` | 每个 exchange + symbol + timeframe 最新 300 根；旧 `3D` 历史仍使用相同保留策略 |
 
 清理命令默认是 dry-run，只统计将删除的行数：
 
@@ -641,7 +658,7 @@ go run ./cmd/backfill_klines \
   -exchanges=okx \
   -market-types=SWAP \
   -symbols=KORU-USDT-SWAP \
-  -timeframes=1m,5m,15m,30m,1H,2H,4H,6H,12H,1D,2D,3D,5D,1W,2W,1M,3M \
+  -timeframes=1m,5m,15m,30m,1H,2H,4H,6H,12H,1D,2D,5D,1W,2W,1M,3M \
   -start=2026-01-01 -limit=0 -respect-retention=false -adjustment=auto -clear-redis=false
 ```
 
@@ -679,6 +696,6 @@ livebar:{exchange}:{symbol}:{timeframe}
 - 没有 tick-level 最新价；ticker 来自 `1m` kline close。
 - 高周期 live WS 合成只对当前有订阅者的 channel 执行，避免全市场每次 kline update 都触发高周期查询；final 高周期入库仍由 `MARKET_TIMEFRAMES` 控制。
 - 进程重启后 live bar 丢失，直到下一条交易所 kline update 到达；final 历史仍在 MySQL。
-- Kline Guardian 会修复近窗口 final `1m` 缺口，并独立审计补齐官方 `1D`。超过分钟审计窗口的低周期历史仍需 backfill；一次性日线补写建议显式使用 `-replace-existing=false`，避免先删除数据后 REST/写入失败留下新缺口。
+- Kline Guardian 会修复近窗口 final `1m`，持久重试失败范围，并在隔日校准昨日分钟和独立审计官方 `1D`。上线前从未登记、也不在昨日范围内的历史仍需有范围的 backfill；一次性日线补写建议显式使用 `-replace-existing=false`，避免先删除数据后 REST/写入失败留下新缺口。
 - Binance static stream 的 symbol 刷新只发生在重连时；OKX 会在连接内定期刷新并同步订阅差异。
 - 如果没有先 backfill，HTTP 历史只包含服务启动后成功写入的 final bars。

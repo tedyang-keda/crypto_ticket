@@ -46,7 +46,6 @@ const timeframes = [
   "12H",
   "1D",
   "2D",
-  "3D",
   "5D",
   "1W",
   "2W",

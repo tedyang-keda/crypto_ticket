@@ -117,6 +117,23 @@ func startBackgroundWorkers(
 	registry *monitoring.Registry,
 	errCh chan<- error,
 ) {
+	if cfg.EnableSymbolSnapshots {
+		if snapshotStore, ok := store.(interface {
+			storage.SymbolSnapshotStore
+			ListSymbols(context.Context, string, *bool) ([]market.SymbolInfo, error)
+		}); ok {
+			sources := makeSymbolSnapshotSources(cfg.Exchanges, cfg.EnableCollector)
+			worker := collector.NewSymbolSnapshotWorker(sources, snapshotStore, time.Duration(cfg.SymbolSnapshotIntervalSeconds)*time.Second)
+			go func() {
+				if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+					errCh <- err
+				}
+			}()
+			log.Printf("official symbol snapshot worker started scopes=%d interval=%ds (including disabled subscription markets)", len(sources), cfg.SymbolSnapshotIntervalSeconds)
+		} else {
+			log.Printf("official symbol snapshot worker disabled: storage capability unavailable")
+		}
+	}
 	if cfg.EnableHealthMonitor {
 		go func() {
 			if err := monitorService.Run(ctx); err != nil && ctx.Err() == nil {
@@ -159,24 +176,31 @@ func startBackgroundWorkers(
 			return
 		}
 		worker := guardian.New(guardianStore, marketService, fetchers, guardian.Config{
-			Enabled:          true,
-			ObserveFinalBars: cfg.KlineGuardianObserveFinalBars,
-			AuditInterval:    time.Duration(cfg.KlineGuardianAuditIntervalSeconds) * time.Second,
-			AuditWindow:      time.Duration(cfg.KlineGuardianWindowMinutes) * time.Minute,
-			AuditDelay:       time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
-			SymbolsPerRun:    cfg.KlineGuardianSymbolsPerRun,
-			RequestDelay:     time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
+			Enabled:                true,
+			RequireSymbolSnapshots: true,
+			ObserveFinalBars:       cfg.KlineGuardianObserveFinalBars,
+			AuditInterval:          time.Duration(cfg.KlineGuardianAuditIntervalSeconds) * time.Second,
+			AuditWindow:            time.Duration(cfg.KlineGuardianWindowMinutes) * time.Minute,
+			AuditDelay:             time.Duration(cfg.KlineGuardianDelaySeconds) * time.Second,
+			SymbolsPerRun:          cfg.KlineGuardianSymbolsPerRun,
+			RequestDelay:           time.Duration(cfg.KlineGuardianRequestDelayMS) * time.Millisecond,
 			RequestIntervals: map[string]time.Duration{
 				"binance": requestInterval(cfg.KlineGuardianBinanceRPS),
 				"okx":     requestInterval(cfg.KlineGuardianOKXRPS),
 			},
-			SymbolMaxAge:           time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
-			Observer:               registry,
-			DailyAuditEnabled:      cfg.KlineGuardianDailyAuditEnabled,
-			DailyAuditInterval:     time.Duration(cfg.KlineGuardianDailyAuditSeconds) * time.Second,
-			DailyAuditDays:         cfg.KlineGuardianDailyAuditDays,
-			DailyAuditLookbackDays: cfg.KlineGuardianDailyLookbackDays,
-			MaxInflightPerExchange: cfg.KlineGuardianMaxInflightPerExchange,
+			SymbolMaxAge:             time.Duration(cfg.KlineGuardianSymbolMaxAgeSeconds) * time.Second,
+			Observer:                 registry,
+			DailyAuditEnabled:        cfg.KlineGuardianDailyAuditEnabled,
+			DailyAuditInterval:       time.Duration(cfg.KlineGuardianDailyAuditSeconds) * time.Second,
+			DailyAuditDays:           cfg.KlineGuardianDailyAuditDays,
+			DailyAuditLookbackDays:   cfg.KlineGuardianDailyLookbackDays,
+			RequireMinuteTaskStore:   true,
+			MinuteDayAuditEnabled:    cfg.KlineGuardianMinuteDayAuditEnabled,
+			MinuteDayAuditOffset:     time.Duration(cfg.KlineGuardianMinuteDayOffsetMinutes) * time.Minute,
+			MinuteDayRequestInterval: requestInterval(cfg.KlineGuardianMinuteDayRequestRPS),
+			MinuteRetryInterval:      time.Duration(cfg.KlineGuardianMinuteRetrySeconds) * time.Second,
+			MinuteRetention:          7 * 24 * time.Hour,
+			MaxInflightPerExchange:   cfg.KlineGuardianMaxInflightPerExchange,
 		})
 		if cfg.KlineGuardianObserveFinalBars {
 			marketService.AddFinalBarObserver(worker)
@@ -201,6 +225,9 @@ func startBackgroundWorkers(
 			cfg.KlineGuardianDailyAuditDays,
 			cfg.KlineGuardianDailyLookbackDays,
 		)
+		log.Printf("kline guardian durable minute audit enabled=true minute_day_enabled=%t minute_day_offset=%dm minute_day_rps=%d retry=%ds retention=7d",
+			cfg.KlineGuardianMinuteDayAuditEnabled, cfg.KlineGuardianMinuteDayOffsetMinutes,
+			cfg.KlineGuardianMinuteDayRequestRPS, cfg.KlineGuardianMinuteRetrySeconds)
 	}
 	if cfg.EnableCorporateAction {
 		corporateStore, ok := store.(corporateaction.Store)
@@ -292,6 +319,23 @@ func makeCollectorRuntimes(configs []config.ExchangeConfig, cfg config.Config) [
 		})
 	}
 	return runtimes
+}
+
+func makeSymbolSnapshotSources(configs []config.ExchangeConfig, collectorEnabled bool) []collector.SymbolSnapshotSource {
+	sources := make([]collector.SymbolSnapshotSource, 0, len(configs))
+	for _, cfg := range configs {
+		var fetcher collector.SymbolSnapshotFetcher
+		switch cfg.Name {
+		case "binance":
+			fetcher = exchange.NewBinanceFuturesAdapter(cfg.MarketType, cfg.RestURL, cfg.WSURL)
+		case "okx":
+			fetcher = exchange.NewOKXAdapter(cfg.MarketType, cfg.RestURL, cfg.WSURL)
+		}
+		if fetcher != nil {
+			sources = append(sources, collector.SymbolSnapshotSource{Fetcher: fetcher, SubscriptionEnabled: collectorEnabled && cfg.Enabled})
+		}
+	}
+	return sources
 }
 
 func makeKlineGuardianFetchers(configs []config.ExchangeConfig) []guardian.Fetcher {

@@ -23,3 +23,7 @@ web/dist/
 /marketd
 /health_watchdog
 *.tsbuildinfo
+._*
+/output/
+/outputs/
+/ops/
