@@ -182,7 +182,10 @@ func (g *Guardian) executeLeasedMinuteTask(ctx context.Context, task market.Minu
 	result, repairErr := g.repairTimeframeRange(requestCtx, fetcher, timeframeRepairRequest{
 		Exchange: task.Exchange, Symbol: task.Symbol, Timeframe: "1m",
 		StartMS: startMS, EndMS: task.EndMS, ExpectedStartMS: task.ExpectedStartMS,
-		ExpectData: task.ExpectData, ForceReplay: task.ForceReplay || task.Attempts > 0,
+		// The daily pass is also the bounded reconciliation pass for derived
+		// intraday buckets. Even when every official minute matches local data,
+		// a prior rollup write may have been missed; rebuild dependent buckets.
+		ExpectData: task.ExpectData, ForceReplay: task.ForceReplay || task.Attempts > 0 || task.Kind == "daily",
 		Reason: "minute_" + task.Kind,
 	})
 	outcome, nextMS, lastError := "completed", int64(0), ""

@@ -12,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"crypto-ticket/internal/app"
 	"crypto-ticket/internal/exchange"
 	"crypto-ticket/internal/market"
+	"crypto-ticket/internal/realtime"
 	"crypto-ticket/internal/storage"
 	"crypto-ticket/internal/timeframe"
 )
@@ -203,6 +205,44 @@ func TestMinuteDayAuditRechecksOfficialRevisionAndResumesRegistration(t *testing
 	summary, _ = store.MinuteAuditSummary(ctx, now.UnixMilli())
 	if summary.DailyCompleted != 1 || summary.DailyTotal != 1 || summary.Pending != 0 {
 		t.Fatalf("daily completion was not retained: %+v", summary)
+	}
+}
+
+func TestFirstMinuteDayAuditRebuildsMissingRollupsWithUnchangedMinutes(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryHistoricalStore()
+	now := time.Date(2026, 10, 30, 8, 0, 0, 0, time.UTC)
+	day := timeframe.FloorStartMS(now.UnixMilli(), "1D") - timeframe.DurationMS("1D")
+	minutes := completeMinuteRange(exchange.KlineRequest{StartMS: day, EndMS: day + timeframe.DurationMS("1D") - timeframe.MinuteMS})
+	if err := store.UpsertBars(ctx, minutes); err != nil {
+		t.Fatal(err)
+	}
+	target := setMinuteTestSymbol(t, store, now, day-timeframe.DurationMS("1D"))
+	fetcher := minuteFetcherFunc(func(_ context.Context, request exchange.KlineRequest) ([]market.Bar, error) {
+		return completeMinuteRange(request), nil
+	})
+	service := app.NewMarketService(store, realtime.NewHub(), []string{"1m", "15m", "30m", "1H"}, 300)
+	g := New(store, service, []Fetcher{fetcher}, Config{Enabled: true, RequireMinuteTaskStore: true})
+	g.now = func() time.Time { return now }
+	task := g.newMinuteTask(target, minutes[0].StartMS, minutes[len(minutes)-1].StartMS, "daily")
+	var err error
+	task.ID, err = store.EnqueueMinuteAuditTask(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := g.executeMinuteTask(ctx, task, fetcher)
+	if err != nil || result.Repaired != 0 {
+		t.Fatalf("unchanged daily source unexpectedly failed or changed: %+v %v", result, err)
+	}
+	for frame, expected := range map[string]int{"15m": 96, "30m": 48, "1H": 24} {
+		bars, err := store.BarsInRange(ctx, "binance", "BTCUSDT", frame, day, day+timeframe.DurationMS("1D")-1)
+		if err != nil || len(bars) != expected {
+			t.Fatalf("first daily minute pass left %s missing: bars=%d want=%d err=%v", frame, len(bars), expected, err)
+		}
+	}
+	summary, err := store.MinuteAuditSummary(ctx, now.UnixMilli())
+	if err != nil || summary.DailyCompleted != 1 {
+		t.Fatalf("successful derived reconciliation not completed: %+v %v", summary, err)
 	}
 }
 
