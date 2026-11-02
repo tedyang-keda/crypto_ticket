@@ -18,6 +18,13 @@ type IntegrityStore interface {
 	BarsInRange(ctx context.Context, exchange string, symbol string, timeframe string, startMS int64, endMS int64) ([]market.Bar, error)
 }
 
+type integritySymbolSnapshotStore interface {
+	ListSymbolSnapshots(ctx context.Context, exchange string) ([]market.SymbolSnapshot, error)
+	ListSymbolSnapshotSyncs(ctx context.Context) ([]market.SymbolSnapshotSync, error)
+}
+
+const integritySymbolSnapshotMaxAge = 10 * time.Minute
+
 type IntegrityConfig struct {
 	Enabled       bool
 	Exchanges     []string
@@ -143,6 +150,21 @@ func (a *IntegrityAuditor) targets(ctx context.Context) ([]market.SymbolInfo, er
 	active := true
 	seen := make(map[string]bool)
 	var out []market.SymbolInfo
+	snapshotStore, hasSnapshots := a.store.(integritySymbolSnapshotStore)
+	syncByScope := make(map[string]market.SymbolSnapshotSync)
+	snapshotScopes := make(map[string]bool)
+	if hasSnapshots {
+		syncs, err := snapshotStore.ListSymbolSnapshotSyncs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, syncState := range syncs {
+			exchangeName := strings.ToLower(strings.TrimSpace(syncState.Exchange))
+			scope := integritySnapshotScope(exchangeName, syncState.MarketType)
+			syncByScope[scope] = syncState
+			snapshotScopes[exchangeName] = true
+		}
+	}
 	for _, exchangeName := range a.cfg.Exchanges {
 		exchangeName = strings.ToLower(strings.TrimSpace(exchangeName))
 		if exchangeName == "" || seen[exchangeName] {
@@ -153,7 +175,29 @@ func (a *IntegrityAuditor) targets(ctx context.Context) ([]market.SymbolInfo, er
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, symbols...)
+		if !hasSnapshots || !snapshotScopes[exchangeName] {
+			out = append(out, symbols...)
+			continue
+		}
+		snapshots, err := snapshotStore.ListSymbolSnapshots(ctx, exchangeName)
+		if err != nil {
+			return nil, err
+		}
+		snapshotBySymbol := make(map[string]market.SymbolSnapshot, len(snapshots))
+		for _, snapshot := range snapshots {
+			snapshotBySymbol[integritySnapshotKey(snapshot.Exchange, snapshot.MarketType, snapshot.Symbol)] = snapshot
+		}
+		now := a.now()
+		for _, symbol := range symbols {
+			snapshot, ok := snapshotBySymbol[integritySnapshotKey(symbol.Exchange, symbol.MarketType, symbol.Symbol)]
+			state, hasState := syncByScope[integritySnapshotScope(symbol.Exchange, symbol.MarketType)]
+			if !ok || !hasState || state.LastSuccessMS != snapshot.CapturedAtMS ||
+				snapshot.RepairSkipReason(now, integritySymbolSnapshotMaxAge) != "" {
+				continue
+			}
+			symbol.ListedAtMS = snapshot.ListedAtMS
+			out = append(out, symbol)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Exchange != out[j].Exchange {
@@ -162,6 +206,14 @@ func (a *IntegrityAuditor) targets(ctx context.Context) ([]market.SymbolInfo, er
 		return out[i].Symbol < out[j].Symbol
 	})
 	return out, nil
+}
+
+func integritySnapshotScope(exchange string, marketType string) string {
+	return strings.ToLower(strings.TrimSpace(exchange)) + "\x00" + strings.ToLower(strings.TrimSpace(marketType))
+}
+
+func integritySnapshotKey(exchange string, marketType string, symbol string) string {
+	return integritySnapshotScope(exchange, marketType) + "\x00" + strings.ToUpper(strings.TrimSpace(symbol))
 }
 
 func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.SymbolInfo, tf string) ([]IntegrityIssue, error) {
@@ -175,6 +227,9 @@ func (a *IntegrityAuditor) auditSeries(ctx context.Context, target market.Symbol
 		bucketStart := start
 		for step := 0; step < i; step++ {
 			bucketStart = timeframe.PreviousStartMS(bucketStart, tf)
+		}
+		if target.ListedAtMS > 0 && bucketStart < target.ListedAtMS {
+			continue
 		}
 		bucketEnd := timeframe.EndMS(bucketStart, tf)
 		targetBars, queryErr := a.store.BarsInRange(ctx, target.Exchange, target.Symbol, tf, bucketStart, bucketStart)

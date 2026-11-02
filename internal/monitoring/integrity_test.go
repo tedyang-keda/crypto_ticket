@@ -147,6 +147,86 @@ func TestIntegrityAuditReportsIncompleteSources(t *testing.T) {
 	}
 }
 
+func TestIntegrityAuditUsesOfficialListingTime(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 28, 1, 2, 0, 0, time.UTC)
+	bucketStart := timeframe.FloorStartMS(now.Add(-17*time.Minute).UnixMilli(), "15m")
+	tests := []struct {
+		name             string
+		listedAtMS       int64
+		wantSourceIssues int
+	}{
+		{name: "skip listing bucket and earlier buckets", listedAtMS: bucketStart + 5*time.Minute.Milliseconds(), wantSourceIssues: 0},
+		{name: "still detect gaps after listing", listedAtMS: bucketStart - 15*time.Minute.Milliseconds(), wantSourceIssues: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := storage.NewMemoryHistoricalStore()
+			symbol := market.SymbolInfo{Exchange: "binance", Symbol: "NEWUSDT", MarketType: "um_futures", IsActive: true}
+			if err := store.UpsertSymbols(ctx, []market.SymbolInfo{symbol}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SaveSymbolSnapshot(ctx, market.SymbolSnapshotBatch{
+				Exchange: "binance", MarketType: "um_futures", CapturedAtMS: now.UnixMilli(),
+				Symbols: []market.SymbolSnapshot{{
+					Exchange: "binance", Symbol: symbol.Symbol, MarketType: symbol.MarketType,
+					Subscribed: true, OfficialStatus: "TRADING", OfficialActive: true,
+					Presence: "present", ListedAtMS: tt.listedAtMS, CapturedAtMS: now.UnixMilli(),
+				}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			registry := newRegistry(func() time.Time { return now })
+			auditor := NewIntegrityAuditor(store, registry, IntegrityConfig{
+				Enabled: true, Exchanges: []string{"binance"}, Timeframes: []string{"15m"},
+				SymbolsPerRun: 1, Buckets: 1,
+			})
+			auditor.now = func() time.Time { return now }
+			summary, err := auditor.AuditOnce(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.SourceIncomplete != tt.wantSourceIssues {
+				t.Fatalf("expected %d source-incomplete issues, got %+v", tt.wantSourceIssues, summary)
+			}
+		})
+	}
+}
+
+func TestIntegrityAuditSkipsSymbolsNotInCurrentSubscriptionSnapshot(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC)
+	store := storage.NewMemoryHistoricalStore()
+	symbol := market.SymbolInfo{Exchange: "binance", Symbol: "AVAXUSD_PERP", MarketType: "coin_futures", IsActive: true}
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{symbol}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSymbolSnapshot(ctx, market.SymbolSnapshotBatch{
+		Exchange: "binance", MarketType: "coin_futures", CapturedAtMS: now.UnixMilli(),
+		Symbols: []market.SymbolSnapshot{{
+			Exchange: "binance", Symbol: symbol.Symbol, MarketType: symbol.MarketType,
+			OfficialStatus: "TRADING", OfficialActive: true, Presence: "present",
+			Subscribed: false, SubscriptionReason: "market_disabled", ListedAtMS: 1,
+			CapturedAtMS: now.UnixMilli(),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry := newRegistry(func() time.Time { return now })
+	auditor := NewIntegrityAuditor(store, registry, IntegrityConfig{
+		Enabled: true, Exchanges: []string{"binance"}, Timeframes: []string{"15m"},
+		SymbolsPerRun: 1, Buckets: 1,
+	})
+	auditor.now = func() time.Time { return now }
+	summary, err := auditor.AuditOnce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.CheckedSymbols != 0 || len(summary.Issues) != 0 {
+		t.Fatalf("unsubscribed stale registry symbol should not be audited: %+v", summary)
+	}
+}
+
 func TestCompleteSourceHandlesUTCWeekBoundary(t *testing.T) {
 	start := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC).UnixMilli()
 	var bars []market.Bar
