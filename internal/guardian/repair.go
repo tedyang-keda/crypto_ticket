@@ -55,6 +55,19 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	if state != nil && state.Status == "repair_error" && request.StartMS <= state.LastCheckedEndMS && request.EndMS >= state.LastCheckedStartMS {
 		request.ForceReplay = true
 	}
+	// Keep the original range in the retry ledger. A successful clipped request
+	// also resolves its pre-listing prefix; persisting only the clipped range
+	// would leave an older, wider retry pending forever.
+	stateRequest := request
+	if tf == "1D" && request.ExpectedStartMS > 0 {
+		listingDay := timeframe.FloorStartMS(request.ExpectedStartMS, tf)
+		if request.EndMS < listingDay {
+			return repairResult{}, g.upsertTimeframeAuditState(ctx, stateRequest, "not_listed")
+		}
+		if request.StartMS < listingDay {
+			request.StartMS = listingDay
+		}
+	}
 	limit := 0
 	for start := request.StartMS; start <= request.EndMS; start = timeframe.NextStartMS(start, tf) {
 		limit++
@@ -65,12 +78,12 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		Adjustment: guardianAdjustment(request.Exchange),
 	})
 	if err != nil {
-		g.recordRepairFailure(ctx, request, "rest_error", err)
+		g.recordRepairFailure(ctx, stateRequest, "rest_error", err)
 		return repairResult{}, err
 	}
 	official, err = g.applyCorporateActionFactors(ctx, request.Exchange, request.Symbol, official)
 	if err != nil {
-		g.recordRepairFailure(ctx, request, "rest_error", err)
+		g.recordRepairFailure(ctx, stateRequest, "rest_error", err)
 		return repairResult{}, err
 	}
 	local, err := g.store.BarsInRange(ctx, request.Exchange, request.Symbol, tf, request.StartMS, request.EndMS)
@@ -82,17 +95,32 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	if rejected > 0 || (len(official) > 0 && len(validOfficial) == 0) {
 		responseErr = fmt.Errorf("invalid official %s response for %s:%s: accepted=%d rejected=%d", tf, request.Exchange, request.Symbol, len(validOfficial), rejected)
 	}
-	if len(validOfficial) == 0 {
+	var noTradeDays map[int64]bool
+	if tf == "1D" && responseErr == nil {
+		noTradeDays, err = g.confirmNoTradeDays(ctx, fetcher, request, validOfficial, local)
+		if err != nil {
+			g.recordRepairFailure(ctx, stateRequest, "rest_error", err)
+			return repairResult{}, err
+		}
+	}
+	if len(validOfficial) == 0 && len(noTradeDays) == 0 {
+		if tf == "1D" {
+			if responseErr == nil {
+				responseErr = fmt.Errorf("empty official 1D response for %s:%s without confirmed non-trading evidence", request.Exchange, request.Symbol)
+			}
+			g.recordRepairFailure(ctx, stateRequest, "empty_response", responseErr)
+			return repairResult{}, responseErr
+		}
 		if len(local) > 0 || request.ExpectData || request.ForceReplay || responseErr != nil {
 			if responseErr == nil {
 				responseErr = fmt.Errorf("empty official %s response for %s:%s with existing or expected data", tf, request.Exchange, request.Symbol)
 			}
-			g.recordRepairFailure(ctx, request, "empty_response", responseErr)
+			g.recordRepairFailure(ctx, stateRequest, "empty_response", responseErr)
 			return repairResult{}, responseErr
 		}
 		// Before listing and on non-trading days an empty official range can be
 		// legitimate, but it is not evidence that local market data is healthy.
-		if err := g.upsertTimeframeAuditState(ctx, request, "no_data"); err != nil {
+		if err := g.upsertTimeframeAuditState(ctx, stateRequest, "no_data"); err != nil {
 			return repairResult{}, err
 		}
 		if tf == "1m" {
@@ -100,13 +128,13 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		}
 		return repairResult{}, nil
 	}
-	if request.ExpectData {
+	if request.ExpectData || (tf == "1D" && request.ExpectedStartMS > 0) {
 		expectedStart := request.StartMS
 		if request.ExpectedStartMS > expectedStart {
 			expectedStart = timeframe.FloorStartMS(request.ExpectedStartMS, request.Timeframe)
 		}
 		for cursor := expectedStart; cursor <= request.EndMS; cursor = timeframe.NextStartMS(cursor, request.Timeframe) {
-			found := false
+			found := noTradeDays[cursor]
 			for _, bar := range validOfficial {
 				if bar.StartMS == cursor {
 					found = true
@@ -126,7 +154,7 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		// explicitly unchecked instead of reporting it as healthy.
 		expected := request.StartMS
 		for cursor := expected; cursor <= request.EndMS; cursor = timeframe.NextStartMS(cursor, request.Timeframe) {
-			found := false
+			found := noTradeDays[cursor]
 			for _, bar := range validOfficial {
 				if bar.StartMS == cursor {
 					found = true
@@ -144,12 +172,13 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		officialStarts[bar.StartMS] = true
 	}
 	for _, bar := range local {
-		if !officialStarts[bar.StartMS] {
+		if !officialStarts[bar.StartMS] && !noTradeDays[bar.StartMS] {
 			responseErr = fmt.Errorf("incomplete official %s response for %s:%s: missing existing start_ms=%d", tf, request.Exchange, request.Symbol, bar.StartMS)
 			break
 		}
 	}
 	result := g.diffTimeframeBars(request, validOfficial, local)
+	result.Events = append(result.Events, g.noTradeDayEvents(request, noTradeDays)...)
 	toRepair := make([]market.Bar, 0, len(validOfficial))
 	changed := make(map[int64]bool, len(result.Events))
 	for _, event := range result.Events {
@@ -168,20 +197,20 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	}
 	if verifier, ok := g.repairer.(VerifiedMinuteRepairer); tf == "1m" && ok {
 		if err := verifier.VerifyFinalBars(ctx, validOfficial, verifiedAtMS); err != nil {
-			g.recordRepairFailure(ctx, request, "repair_error", err)
+			g.recordRepairFailure(ctx, stateRequest, "repair_error", err)
 			return result, err
 		}
 		if request.ForceReplay {
 			if rollupRepairer, ok := g.repairer.(DerivedRollupRepairer); ok {
 				if err := rollupRepairer.RepairRollups(ctx, validOfficial); err != nil {
-					g.recordRepairFailure(ctx, request, "repair_error", err)
+					g.recordRepairFailure(ctx, stateRequest, "repair_error", err)
 					return result, err
 				}
 			}
 		}
 	} else if len(toRepair) > 0 {
 		if err := g.repairer.RepairFinalBars(ctx, toRepair); err != nil {
-			g.recordRepairFailure(ctx, request, "repair_error", err)
+			g.recordRepairFailure(ctx, stateRequest, "repair_error", err)
 			return result, err
 		}
 	}
@@ -189,13 +218,13 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 		return result, err
 	}
 	if responseErr != nil {
-		g.recordRepairFailure(ctx, request, "incomplete_response", responseErr)
+		g.recordRepairFailure(ctx, stateRequest, "incomplete_response", responseErr)
 		return result, responseErr
 	}
-	if request.Timeframe == "1D" {
+	if request.Timeframe == "1D" && len(validOfficial) > 0 {
 		if rollupRepairer, ok := g.repairer.(DerivedRollupRepairer); ok {
 			if err := rollupRepairer.RepairRollups(ctx, validOfficial); err != nil {
-				g.recordRepairFailure(ctx, request, "repair_error", err)
+				g.recordRepairFailure(ctx, stateRequest, "repair_error", err)
 				return result, err
 			}
 		}
@@ -206,12 +235,14 @@ func (g *Guardian) repairTimeframeRange(ctx context.Context, fetcher Fetcher, re
 	}
 	if unchecked {
 		status = "unchecked"
+	} else if len(noTradeDays) > 0 && (len(validOfficial) == 0 || (result.Repaired == 0 && !request.ForceReplay)) {
+		status = "confirmed_no_trades"
 	}
-	if err := g.upsertTimeframeAuditState(ctx, request, status); err != nil {
+	if err := g.upsertTimeframeAuditState(ctx, stateRequest, status); err != nil {
 		return result, err
 	}
 	if unchecked {
-		return result, fmt.Errorf("unchecked official %s range for %s:%s: missing minute keys without a confirmed listing or non-trading boundary", tf, request.Exchange, request.Symbol)
+		return result, fmt.Errorf("unchecked official %s range for %s:%s: missing candle keys without a confirmed listing or non-trading boundary", tf, request.Exchange, request.Symbol)
 	}
 	return result, nil
 }

@@ -285,7 +285,7 @@ func TestDailyAuditRunsWithObserverDisabled(t *testing.T) {
 	store := storage.NewMemoryHistoricalStore()
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	base := timeframe.FloorStartMS(now.Add(-24*time.Hour).UnixMilli(), "1D")
-	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base}}); err != nil {
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base, ListedAtMS: base}}); err != nil {
 		t.Fatal(err)
 	}
 	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}}
@@ -312,7 +312,7 @@ func TestDailyAuditWorkerRunsImmediatelyOnStartup(t *testing.T) {
 	store := storage.NewMemoryHistoricalStore()
 	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	base := timeframe.FloorStartMS(now.Add(-24*time.Hour).UnixMilli(), "1D")
-	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base}}); err != nil {
+	if err := store.UpsertSymbols(ctx, []market.SymbolInfo{{Exchange: "binance", Symbol: "BTCUSDT", MarketType: "um_futures", IsActive: true, LastSeenAtMS: now.UnixMilli(), FirstSeenAtMS: base, ListedAtMS: base}}); err != nil {
 		t.Fatal(err)
 	}
 	fetcher := &timeframeFetcher{name: "binance", marketType: "um_futures", bars: []market.Bar{dailyTestBar(base, 100, 110, 99, 105)}, called: make(chan struct{}, 1)}
@@ -351,6 +351,20 @@ func TestGuardianBoundsConcurrentAuditsPerExchange(t *testing.T) {
 		}
 	}
 	if err := store.UpsertSymbols(ctx, symbols); err != nil {
+		t.Fatal(err)
+	}
+	// Supply matching official/local daily bars: an empty response is now an
+	// unresolved audit, rather than a successful no-data interval. This test
+	// measures the shared concurrency budget, not missing-data behavior.
+	var dailyBars []market.Bar
+	for _, symbol := range symbols {
+		for daysAgo := 1; daysAgo <= 2; daysAgo++ {
+			bar := dailyTestBar(timeframe.FloorStartMS(now.Add(-time.Duration(daysAgo)*24*time.Hour).UnixMilli(), "1D"), 100, 101, 99, 100)
+			bar.Symbol = symbol.Symbol
+			dailyBars = append(dailyBars, bar)
+		}
+	}
+	if err := store.UpsertBars(ctx, dailyBars); err != nil {
 		t.Fatal(err)
 	}
 	fetcher := &inflightTrackingFetcher{delay: 20 * time.Millisecond}
@@ -477,12 +491,21 @@ func (r *recordingRoundTripper) RoundTrip(request *http.Request) (*http.Response
 
 func (f *inflightTrackingFetcher) Name() string       { return "binance" }
 func (f *inflightTrackingFetcher) MarketType() string { return "um_futures" }
-func (f *inflightTrackingFetcher) FetchKlines(_ context.Context, _ *http.Client, _ exchange.KlineRequest) ([]market.Bar, error) {
+func (f *inflightTrackingFetcher) FetchKlines(_ context.Context, _ *http.Client, request exchange.KlineRequest) ([]market.Bar, error) {
 	active := f.active.Add(1)
 	for current := f.max.Load(); active > current && !f.max.CompareAndSwap(current, active); current = f.max.Load() {
 	}
 	defer f.active.Add(-1)
 	time.Sleep(f.delay)
+	if request.Timeframe == "1D" {
+		var bars []market.Bar
+		for day := request.StartMS; day <= request.EndMS; day = timeframe.NextStartMS(day, "1D") {
+			bar := dailyTestBar(day, 100, 101, 99, 100)
+			bar.Symbol = request.Symbol
+			bars = append(bars, bar)
+		}
+		return bars, nil
+	}
 	return nil, nil
 }
 

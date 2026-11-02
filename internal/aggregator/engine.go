@@ -34,6 +34,18 @@ func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updat
 	}
 	ordered := append([]market.Bar(nil), bars...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].StartMS < ordered[j].StartMS })
+	firstPrice, lastPrice := 0, len(ordered)-1
+	hasTrades := false
+	for i, bar := range ordered {
+		if !hasTradeActivity(bar) {
+			continue
+		}
+		if !hasTrades {
+			firstPrice = i
+			hasTrades = true
+		}
+		lastPrice = i
+	}
 
 	startMS := timeframe.FloorStartMS(ordered[0].StartMS, tf)
 	rollup := market.Bar{
@@ -43,10 +55,10 @@ func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updat
 		Timeframe:   tf,
 		StartMS:     startMS,
 		EndMS:       timeframe.EndMS(startMS, tf),
-		OpenPrice:   ordered[0].OpenPrice,
-		HighPrice:   ordered[0].HighPrice,
-		LowPrice:    ordered[0].LowPrice,
-		ClosePrice:  ordered[len(ordered)-1].ClosePrice,
+		OpenPrice:   ordered[firstPrice].OpenPrice,
+		HighPrice:   ordered[firstPrice].HighPrice,
+		LowPrice:    ordered[firstPrice].LowPrice,
+		ClosePrice:  ordered[lastPrice].ClosePrice,
 		LastTickMS:  ordered[len(ordered)-1].LastTickMS,
 		IsFinal:     isFinal,
 		Source:      "rollup",
@@ -56,11 +68,16 @@ func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updat
 		QuoteUnit:   ordered[0].QuoteUnit,
 	}
 	for _, bar := range ordered {
-		if bar.HighPrice > rollup.HighPrice {
-			rollup.HighPrice = bar.HighPrice
-		}
-		if bar.LowPrice < rollup.LowPrice {
-			rollup.LowPrice = bar.LowPrice
+		// No-trade candles preserve time coverage, but their carried prices are
+		// not trades in this bucket. A wholly empty bucket retains the existing
+		// carry-forward OHLC behavior instead of producing an invalid zero bar.
+		if !hasTrades || hasTradeActivity(bar) {
+			if bar.HighPrice > rollup.HighPrice {
+				rollup.HighPrice = bar.HighPrice
+			}
+			if bar.LowPrice < rollup.LowPrice {
+				rollup.LowPrice = bar.LowPrice
+			}
 		}
 		rollup.Volume += bar.Volume
 		rollup.QuoteVolume += bar.QuoteVolume
@@ -71,6 +88,12 @@ func RollupBars(tf string, bars []market.Bar, isFinal bool, reason string, updat
 		}
 	}
 	return &rollup
+}
+
+func hasTradeActivity(bar market.Bar) bool {
+	// Some exchanges (including OKX) do not supply trade counts for candles.
+	// Any available positive volume therefore also establishes traded prices.
+	return bar.TradeCount > 0 || bar.Volume > 0 || bar.QuoteVolume > 0 || bar.ContractVolume > 0
 }
 
 func ApplyDerived(bar market.Bar, previousClose float64) market.Bar {

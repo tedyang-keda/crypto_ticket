@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -216,8 +217,18 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 		if startMS <= 0 || closeMS <= 0 || closeMS >= now {
 			continue
 		}
-		volume := floatValue(row[5])
-		quoteVolume := floatValue(row[7])
+		volume, err := parseKlineActivityFloat(a.Name(), symbol, tf, "volume", row[5])
+		if err != nil {
+			return nil, err
+		}
+		quoteVolume, err := parseKlineActivityFloat(a.Name(), symbol, tf, "quote_volume", row[7])
+		if err != nil {
+			return nil, err
+		}
+		tradeCount, err := parseKlineTradeCount(a.Name(), symbol, tf, row[8])
+		if err != nil {
+			return nil, err
+		}
 		volumeUnit := base
 		quoteUnit := quote
 		contractVolume := float64(0)
@@ -242,7 +253,7 @@ func (a *BinanceFuturesAdapter) fetchBinanceKlinePage(ctx context.Context, clien
 			QuoteVolume:    quoteVolume,
 			QuoteUnit:      quoteUnit,
 			ContractVolume: contractVolume,
-			TradeCount:     intValue(row[8]),
+			TradeCount:     tradeCount,
 			LastTickMS:     closeMS,
 			IsFinal:        true,
 			Source:         "rest",
@@ -380,7 +391,7 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 		Data [][]string `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("okx candles payload for %s %s (activity fields contract_volume, volume, quote_volume): %w", symbol, tf, err)
 	}
 	if payload.Code != "" && payload.Code != "0" {
 		if (adjustment == KlineAdjustmentForward || adjustment == KlineAdjustmentAuto) &&
@@ -411,15 +422,24 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 		if startMS <= 0 || endMS >= now {
 			continue
 		}
-		contractVolume := parseFloat(row[5])
-		volume := parseFloat(row[6])
-		quoteVolume := parseFloat(row[7])
+		contractVolume, err := parseKlineActivityFloat(a.Name(), symbol, tf, "contract_volume", row[5])
+		if err != nil {
+			return nil, err
+		}
+		volume, err := parseKlineActivityFloat(a.Name(), symbol, tf, "volume", row[6])
+		if err != nil {
+			return nil, err
+		}
+		quoteVolume, err := parseKlineActivityFloat(a.Name(), symbol, tf, "quote_volume", row[7])
+		if err != nil {
+			return nil, err
+		}
 		volumeUnit := base
 		quoteUnit := quote
 		if marginType == "coinmargin" {
+			quoteVolume = volume
 			volume = contractVolume
 			volumeUnit = "contract"
-			quoteVolume = parseFloat(row[6])
 			quoteUnit = base
 		}
 		bar := market.Bar{
@@ -451,6 +471,51 @@ func (a *OKXAdapter) fetchOKXKlinePage(ctx context.Context, client *http.Client,
 	}
 	sortBars(bars)
 	return bars, nil
+}
+
+func parseKlineActivityFloat(exchange, symbol, tf, field string, raw any) (float64, error) {
+	value, ok := klineActivityNumber(raw)
+	parsed, err := strconv.ParseFloat(value, 64)
+	// ParseFloat also accepts Go hexadecimal/underscore notation. Exchange
+	// activity is decimal; keep exponent digits separate from the mantissa
+	// when checking that an apparent zero did not underflow from a real trade.
+	for _, char := range value {
+		if (char < '0' || char > '9') && !strings.ContainsRune(".eE+-", char) {
+			ok = false
+			break
+		}
+	}
+	mantissa := value
+	if exponent := strings.IndexAny(mantissa, "eE"); exponent >= 0 {
+		mantissa = mantissa[:exponent]
+	}
+	if parsed == 0 && strings.ContainsAny(mantissa, "123456789") {
+		ok = false
+	}
+	if !ok || err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 {
+		return 0, fmt.Errorf("invalid %s REST candle activity %s for %s %s: expected a finite nonnegative number", exchange, field, symbol, tf)
+	}
+	return parsed, nil
+}
+
+func parseKlineTradeCount(exchange, symbol, tf string, raw any) (int64, error) {
+	value, ok := klineActivityNumber(raw)
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if !ok || err != nil || parsed < 0 {
+		return 0, fmt.Errorf("invalid %s REST candle activity trade_count for %s %s: expected a nonnegative int64", exchange, symbol, tf)
+	}
+	return parsed, nil
+}
+
+func klineActivityNumber(raw any) (string, bool) {
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value), true
+	case json.Number:
+		return value.String(), true
+	default:
+		return "", false
+	}
 }
 
 func binanceKlineInterval(tf string) (string, error) {

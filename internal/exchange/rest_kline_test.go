@@ -2,12 +2,14 @@ package exchange
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"crypto-ticket/internal/timeframe"
 )
@@ -93,6 +95,60 @@ func TestBinanceFetchKlinesUsesOfficialVolumeFields(t *testing.T) {
 	}
 }
 
+func TestBinanceFetchKlinesRejectsInvalidActivity(t *testing.T) {
+	invalid := []any{"", "not-a-number", "NaN", "+Inf", "-Inf", "-1", "1e9999", "1e-9999", "-1e-9999", "0x0p0", "0x1p-9999", "1_000", nil, true, map[string]any{}, []any{}}
+	for _, field := range []struct {
+		index int
+		name  string
+	}{{5, "volume"}, {7, "quote_volume"}, {8, "trade_count"}} {
+		values := append([]any(nil), invalid...)
+		if field.index == 8 {
+			values = append(values, "1.5", json.Number("1.5"), "9223372036854775808", json.Number("9223372036854775808"))
+		}
+		for _, value := range values {
+			t.Run(fmt.Sprintf("%s/%T/%v", field.name, value, value), func(t *testing.T) {
+				row := []any{3600000, "100", "110", "90", "105", "0.000", 7199999, "0.000", 0}
+				row[field.index] = value
+				payload, err := json.Marshal([][]any{row})
+				if err != nil {
+					t.Fatal(err)
+				}
+				client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return jsonResponse(string(payload)), nil
+				})}
+				adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+				bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TESTUSDT", Timeframe: "1H", Limit: 1})
+				if err == nil || len(bars) != 0 {
+					t.Fatalf("invalid activity was treated as a zero-activity candle: bars=%+v err=%v", bars, err)
+				}
+				for _, detail := range []string{"binance", "TESTUSDT", "1H", field.name} {
+					if !strings.Contains(err.Error(), detail) {
+						t.Fatalf("error lacks %q context: %v", detail, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBinanceFetchKlinesAcceptsExactZeroActivityAndInt64TradeCount(t *testing.T) {
+	for _, count := range []string{"0", "9223372036854775807"} {
+		t.Run(count, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return jsonResponse(`[[3600000,"100","110","90","105","0.00000000",7199999,"0.0",` + count + `]]`), nil
+			})}
+			adapter := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+			bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TESTUSDT", Timeframe: "1H", Limit: 1})
+			if err != nil || len(bars) != 1 || bars[0].Volume != 0 || bars[0].QuoteVolume != 0 {
+				t.Fatalf("valid decimal zero rejected: bars=%+v err=%v", bars, err)
+			}
+			if fmt.Sprint(bars[0].TradeCount) != count {
+				t.Fatalf("trade count lost integer precision: %+v", bars[0])
+			}
+		})
+	}
+}
+
 func TestBinanceFetchContinuousKlinesUsesTradFiEndpoint(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/fapi/v1/continuousKlines" {
@@ -148,6 +204,88 @@ func TestOKXFetchKlinesUsesBaseAndQuoteVolumeFields(t *testing.T) {
 	assertFloatEqual(t, bar.QuoteVolume, 129.570)
 	if bar.TradeCount != 0 {
 		t.Fatalf("okx REST candles do not provide trade count, got %d", bar.TradeCount)
+	}
+}
+
+func TestOKXFetchKlinesRejectsInvalidActivity(t *testing.T) {
+	for _, field := range []struct {
+		index int
+		name  string
+	}{{5, "contract_volume"}, {6, "volume"}, {7, "quote_volume"}} {
+		for _, value := range []any{"", "not-a-number", "NaN", "+Inf", "-Inf", "-1", "1e9999", "1e-9999", "-1e-9999", "0x0p0", "0x1p-9999", "1_000", nil, true, map[string]any{}, []any{}, 0} {
+			t.Run(fmt.Sprintf("%s/%T/%v", field.name, value, value), func(t *testing.T) {
+				row := []any{"3600000", "100", "110", "90", "105", "0.000", "0.000", "0.000", "1"}
+				row[field.index] = value
+				payload, err := json.Marshal(map[string]any{"code": "0", "data": [][]any{row}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return jsonResponse(string(payload)), nil
+				})}
+				adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+				bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TEST-USDT-SWAP", Timeframe: "1H", Limit: 1})
+				if err == nil || len(bars) != 0 {
+					t.Fatalf("invalid activity was treated as a zero-activity candle: bars=%+v err=%v", bars, err)
+				}
+				for _, detail := range []string{"okx", "TEST-USDT-SWAP", "1H", field.name} {
+					if !strings.Contains(err.Error(), detail) {
+						t.Fatalf("error lacks %q context: %v", detail, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestOKXFetchKlinesAcceptsDecimalZeroActivity(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(`{"code":"0","data":[["3600000","100","110","90","105","0.00000000","0.0","0","1"]]}`), nil
+	})}
+	adapter := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err := adapter.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TEST-USDT-SWAP", Timeframe: "1H", Limit: 1})
+	if err != nil || len(bars) != 1 || bars[0].Volume != 0 || bars[0].QuoteVolume != 0 || bars[0].ContractVolume != 0 {
+		t.Fatalf("valid decimal zero rejected: bars=%+v err=%v", bars, err)
+	}
+}
+
+func TestParseKlineActivityFloatPreservesExactZeroAndRejectsUnderflow(t *testing.T) {
+	for _, value := range []string{"0", "0.000", "0e-9999", "0e+9999", "-0.000E-9999", " 0.000e-12345 "} {
+		t.Run("zero/"+value, func(t *testing.T) {
+			got, err := parseKlineActivityFloat("okx", "TEST-USDT-SWAP", "1H", "volume", value)
+			if err != nil || got != 0 {
+				t.Fatalf("exact decimal zero rejected: value=%q got=%v err=%v", value, got, err)
+			}
+		})
+	}
+	for _, value := range []any{"1e-9999", "-1e-9999", "1.25E-9999", "-0.00001e-9999", "1e-324", "0x0p-9999", "0x1p-9999", json.Number("1e-9999")} {
+		t.Run(fmt.Sprintf("invalid/%T/%v", value, value), func(t *testing.T) {
+			if got, err := parseKlineActivityFloat("okx", "TEST-USDT-SWAP", "1H", "volume", value); err == nil {
+				t.Fatalf("non-decimal or nonzero underflow was accepted: value=%v got=%v", value, got)
+			}
+		})
+	}
+	if got, err := parseKlineActivityFloat("okx", "TEST-USDT-SWAP", "1H", "volume", "5e-324"); err != nil || got <= 0 {
+		t.Fatalf("representable nonzero subnormal rejected: got=%v err=%v", got, err)
+	}
+}
+
+func TestRESTKlinesStillIgnorePendingCandlesBeforeActivityValidation(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(r.URL.Path, "/fapi/") {
+			return jsonResponse(fmt.Sprintf(`[[3600000,"100","110","90","105","bad",%d,"bad","bad"]]`, time.Now().Add(time.Hour).UnixMilli())), nil
+		}
+		return jsonResponse(`{"code":"0","data":[["3600000","100","110","90","105","bad","bad","bad","0"]]}`), nil
+	})}
+	binance := NewBinanceFuturesAdapter("um_futures", "https://binance.test", "wss://example")
+	bars, err := binance.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TESTUSDT", Timeframe: "1H", Limit: 1})
+	if err != nil || len(bars) != 0 {
+		t.Fatalf("pending Binance candle validation changed: bars=%+v err=%v", bars, err)
+	}
+	okx := NewOKXAdapter("SWAP", "https://okx.test", "wss://example")
+	bars, err = okx.FetchKlines(context.Background(), client, KlineRequest{Symbol: "TEST-USDT-SWAP", Timeframe: "1H", Limit: 1})
+	if err != nil || len(bars) != 0 {
+		t.Fatalf("pending OKX candle validation changed: bars=%+v err=%v", bars, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -138,13 +139,7 @@ func (g *Guardian) dailyAuditOnce(ctx context.Context) error {
 					if r.EndMS < r.StartMS || ctx.Err() != nil {
 						continue
 					}
-					_, repairErr := g.repairTimeframeRange(ctx, target.Fetcher, timeframeRepairRequest{
-						Exchange: target.Exchange, Symbol: target.Symbol, Timeframe: "1D",
-						StartMS: r.StartMS, EndMS: r.EndMS, Reason: "daily_audit",
-						ExpectData:      target.FirstSeenAtMS > 0 && target.FirstSeenAtMS <= r.EndMS,
-						ExpectedStartMS: target.FirstSeenAtMS,
-						ForceReplay:     force[r],
-					})
+					repairErr := g.repairDailyAuditRange(ctx, target, r, force[r])
 					g.dailyAuditMu.Lock()
 					if repairErr != nil {
 						if g.dailyRetries[key] == nil {
@@ -161,6 +156,66 @@ func (g *Guardian) dailyAuditOnce(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
+	return firstErr
+}
+
+// A wider configured or persisted range must not repeatedly spend its hourly
+// evidence budget on only the first seven absent days. Split it into bounded
+// requests, while keeping the original range as the durable retry unit.
+func (g *Guardian) repairDailyAuditRange(ctx context.Context, target auditTarget, r dailyAuditRange, forceReplay bool) error {
+	request := timeframeRepairRequest{
+		Exchange: target.Exchange, Symbol: target.Symbol, Timeframe: "1D",
+		StartMS: r.StartMS, EndMS: r.EndMS, Reason: "daily_audit",
+		ExpectData:      target.ListedAtMS > 0 && timeframe.FloorStartMS(target.ListedAtMS, "1D") <= r.EndMS,
+		ExpectedStartMS: target.ListedAtMS,
+		ForceReplay:     forceReplay,
+	}
+	dayMS := timeframe.DurationMS("1D")
+	blockMS := int64(maxNoTradeDayChecksPerRange) * dayMS
+	if r.EndMS-r.StartMS < blockMS || (target.ListedAtMS > 0 && r.EndMS < timeframe.FloorStartMS(target.ListedAtMS, "1D")) {
+		_, err := g.repairTimeframeRange(ctx, target.Fetcher, request)
+		return err
+	}
+	var firstErr error
+	checked, repaired, excluded := 0, 0, 0
+	for start := r.StartMS; start <= r.EndMS; start += blockMS {
+		piece := request
+		piece.StartMS = start
+		piece.EndMS = start + blockMS - dayMS
+		if piece.EndMS > r.EndMS {
+			piece.EndMS = r.EndMS
+		}
+		result, err := g.repairTimeframeRange(ctx, target.Fetcher, piece)
+		checked += result.Checked
+		repaired += result.Repaired
+		for _, event := range result.Events {
+			if event.EventType == "confirmed_no_trades" {
+				excluded++
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if ctx.Err() != nil {
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			break
+		}
+	}
+	status := "ok"
+	if repaired > 0 || forceReplay {
+		status = "repaired"
+	}
+	if checked == 0 && excluded > 0 {
+		status = "confirmed_no_trades"
+	}
+	if firstErr != nil {
+		status = "incomplete_response"
+	}
+	if err := g.upsertTimeframeAuditState(ctx, request, status); err != nil {
+		return fmt.Errorf("persist daily audit range: %w (audit error: %v)", err, firstErr)
+	}
 	return firstErr
 }
 
@@ -203,7 +258,11 @@ func (g *Guardian) dailyAuditTargets(ctx context.Context) ([]auditTarget, error)
 			if symbol.LastSeenAtMS > 0 && nowMS-symbol.LastSeenAtMS > int64(30*24*time.Hour/time.Millisecond) {
 				continue
 			}
-			targets = append(targets, auditTarget{Exchange: normalizeExchange(symbol.Exchange), Symbol: normalizeSymbol(symbol.Symbol), MarketType: normalizeMarketType(symbol.MarketType), Fetcher: fetcher, FirstSeenAtMS: symbol.FirstSeenAtMS})
+			targets = append(targets, auditTarget{
+				Exchange: normalizeExchange(symbol.Exchange), Symbol: normalizeSymbol(symbol.Symbol),
+				MarketType: normalizeMarketType(symbol.MarketType), Fetcher: fetcher,
+				ListedAtMS: eligibility.listedAt(symbol),
+			})
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
